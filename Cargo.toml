@@ -1,0 +1,19 @@
+[package]
+name = "copyit"
+version = "0.1.0"
+edition = "2021"
+description = "A fast, lightweight tile-based library for your scripts and AI prompts."
+
+[dependencies]
+eframe = "0.27"
+egui = "0.27"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Small, fast-launching release binary
+[profile.release]
+opt-level = "z"     # optimize for size
+lto = true          # link-time optimization
+codegen-units = 1
+panic = "abort"
+strip = true        # strip symbols

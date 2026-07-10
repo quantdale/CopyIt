@@ -1,0 +1,38 @@
+[
+  {
+    "id": 6,
+    "title": "Session handoff / context transfer",
+    "category": "Prompt",
+    "body": "Export the full context of this session into a single self-contained block I can paste into a fresh chat to continue seamlessly. Include, verbatim where it matters:\n- Current objective\n- The narrative of what we've done\n- Decisions made (with rationale)\n- All artifacts in full\n- Open questions\n- Immediate next steps\n\nWrite it so a model with zero prior context can pick up exactly where we left off."
+  },
+  {
+    "id": 4,
+    "title": "Summarize this conversation",
+    "category": "Prompt",
+    "body": "Summarize our conversation so far into a concise brief. Include:\n1. The objective\n2. Key decisions and their rationale\n3. Any code/artifacts produced (reference by name)\n4. Open questions\n5. Concrete next steps\n\nUse tight bullet points. Omit small talk."
+  },
+  {
+    "id": 5,
+    "title": "Generate documentation",
+    "category": "Prompt",
+    "body": "You are a senior technical writer. Given the code/context below, produce clear documentation covering: purpose, prerequisites, setup/usage with examples, configuration options, and common pitfalls. Prefer prose with short code blocks. Do not invent behavior that isn't present in the source.\n\n---\n<paste code/context here>"
+  },
+  {
+    "id": 2,
+    "title": "Update all repos (bash)",
+    "category": "Git",
+    "body": "#!/usr/bin/env bash\n# Pull latest on every git repo under the current directory\nfind . -maxdepth 2 -type d -name .git | while read -r gitdir; do\n  repo=\"$(dirname \"$gitdir\")\"\n  echo \"== $repo ==\"\n  git -C \"$repo\" pull --ff-only\ndone"
+  },
+  {
+    "id": 1,
+    "title": "Update all repos (PowerShell)",
+    "category": "Git",
+    "body": "# Pull latest on every git repo one level under the current folder\r\nGet-ChildItem -Directory | Where-Object { Test-Path \"$($_.FullName)\\.git\" } | ForEach-Object {\r\n    Write-Host \"== $($_.Name) ==\" -ForegroundColor Cyan\r\n    git -C $_.FullName pull --ff-only\r\n}"
+  },
+  {
+    "id": 3,
+    "title": "Discard all local changes",
+    "category": "Git",
+    "body": "# Throw away uncommitted changes and untracked files (irreversible)\ngit reset --hard HEAD\ngit clean -fd"
+  }
+]
