@@ -1,0 +1,10 @@
+D:\Documents\tryPython\CopyIt\target\debug\deps\accesskit_consumer-6d32ea072733465b.d: C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\lib.rs C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\tree.rs C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\node.rs C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\filters.rs C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\iterators.rs C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\text.rs
+
+D:\Documents\tryPython\CopyIt\target\debug\deps\libaccesskit_consumer-6d32ea072733465b.rmeta: C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\lib.rs C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\tree.rs C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\node.rs C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\filters.rs C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\iterators.rs C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\text.rs
+
+C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\lib.rs:
+C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\tree.rs:
+C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\node.rs:
+C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\filters.rs:
+C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\iterators.rs:
+C:\Users\palac\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\accesskit_consumer-0.16.1\src\text.rs:

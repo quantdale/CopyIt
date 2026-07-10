@@ -623,10 +623,19 @@ impl eframe::App for CopyIt {
                 "New snippet"
             };
 
+            // Keep the modal on-screen even for very long snippets: cap the
+            // window height to a fraction of the viewport, and make only the
+            // Content editor scroll internally.
+            let screen_height = ctx.screen_rect().height();
+            let max_window_height = screen_height * 0.85;
+            let reserved_for_fixed = 170.0; // title/category row + label + buttons + spacing
+            let max_content_height = (max_window_height - reserved_for_fixed).max(120.0);
+
             egui::Window::new(title)
                 .collapsible(false)
                 .resizable(true)
                 .default_width(540.0)
+                .max_height(max_window_height)
                 .open(&mut window_open)
                 .show(ctx, |ui| {
                     // Keep the header row width-constrained so the window stays
@@ -690,12 +699,17 @@ impl eframe::App for CopyIt {
                     ui.add_space(6.0);
 
                     ui.label("Content");
-                    ui.add(
-                        egui::TextEdit::multiline(&mut ed.body)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(12)
-                            .font(egui::TextStyle::Monospace),
-                    );
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, true])
+                        .max_height(max_content_height)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut ed.body)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(12)
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                        });
                     ui.add_space(10.0);
 
                     ui.horizontal(|ui| {
@@ -1376,6 +1390,106 @@ mod layout_tests {
         assert_eq!(app.add_category("Werner"), "Werner"); // duplicate
         assert!(app.categories.contains(&"Werner".to_string()));
         assert_eq!(app.categories.len(), 3);
+    }
+
+    /// Regression test: a very long snippet body must not make the editor
+    /// window grow past the screen. Only the Content area should scroll.
+    #[test]
+    fn editor_window_height_is_clamped_for_long_content() {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1000.0, 700.0),
+        ));
+
+        let mut title = String::from("Long snippet");
+        let mut category = String::from("Git");
+        let mut body: String = (0..500)
+            .map(|i| {
+                format!(
+                    "Line {i}: Lorem ipsum dolor sit amet, consectetur adipiscing elit.\n"
+                )
+            })
+            .collect();
+
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |_ui| {
+                let screen_height = ctx.screen_rect().height();
+                let max_window_height = screen_height * 0.85;
+                let reserved_for_fixed = 170.0;
+                let max_content_height = (max_window_height - reserved_for_fixed).max(120.0);
+
+                let resp = egui::Window::new("New snippet")
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_width(540.0)
+                    .max_height(max_window_height)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label("Title");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut title)
+                                        .desired_width(280.0),
+                                );
+                            });
+
+                            ui.add_space(12.0);
+
+                            ui.vertical(|ui| {
+                                ui.label("Category");
+                                let mut selected = category.clone();
+                                egui::ComboBox::from_id_source("cat_select_test")
+                                    .width(180.0)
+                                    .selected_text(category.clone())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut selected,
+                                            "Git".to_string(),
+                                            "Git",
+                                        );
+                                    });
+                                category = selected;
+                            });
+                        });
+                        ui.add_space(6.0);
+
+                        ui.label("Content");
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, true])
+                            .max_height(max_content_height)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut body)
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(12)
+                                        .font(egui::TextStyle::Monospace),
+                                );
+                            });
+                        ui.add_space(10.0);
+
+                        ui.horizontal(|ui| {
+                            let _ = ui.button("Save");
+                            let _ = ui.button("Cancel");
+                        });
+                    });
+
+                let rect = resp.unwrap().response.rect;
+                assert!(
+                    rect.height() <= max_window_height + 1.0,
+                    "editor window height {} should not exceed max {}",
+                    rect.height(),
+                    max_window_height
+                );
+                assert!(
+                    rect.bottom() <= screen_height + 1.0,
+                    "editor window bottom {} should not exceed screen height {}",
+                    rect.bottom(),
+                    screen_height
+                );
+            });
+        });
     }
 }
 
