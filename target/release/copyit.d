@@ -1,1 +1,0 @@
-D:\Documents\tryPython\CopyIt\target\release\copyit.exe: D:\Documents\tryPython\CopyIt\src\app.rs D:\Documents\tryPython\CopyIt\src\main.rs D:\Documents\tryPython\CopyIt\src\model.rs D:\Documents\tryPython\CopyIt\src\seed.rs D:\Documents\tryPython\CopyIt\src\storage.rs D:\Documents\tryPython\CopyIt\src\theme.rs

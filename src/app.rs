@@ -18,6 +18,7 @@ pub struct CopyIt {
     drag: Option<DragState>,
     adding_header_category: bool,
     new_header_category: String,
+    save_error: Option<String>,
 }
 
 struct DragState {
@@ -87,28 +88,60 @@ struct CardWidgets {
     edit: egui::Response,
 }
 
+/// One-time recovery for users upgrading from earlier versions that stored
+/// `snippets.json`/`config.json` next to the .exe: if the new stable location
+/// doesn't have a file yet, pull in the first non-empty copy found in a
+/// legacy location (next to the exe, `target/debug`, `target/release`, cwd).
+fn migrate_legacy_file(new_path: &std::path::Path, filename: &str) {
+    if new_path.exists() {
+        return;
+    }
+    for dir in storage::legacy_candidate_dirs() {
+        let candidate = dir.join(filename);
+        if candidate == new_path {
+            continue;
+        }
+        if let Ok(data) = std::fs::read_to_string(&candidate) {
+            let trimmed = data.trim();
+            if trimmed.is_empty() || trimmed == "[]" || trimmed == "{}" {
+                continue;
+            }
+            let _ = std::fs::write(new_path, data);
+            return;
+        }
+    }
+}
+
 impl CopyIt {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let path = storage::data_path();
+        let config_path = storage::config_path();
+        migrate_legacy_file(&path, "snippets.json");
+        migrate_legacy_file(&config_path, "config.json");
+
         let mut snippets = storage::load(&path).unwrap_or_else(crate::seed::defaults);
         for s in &mut snippets {
             s.category = storage::normalize_category(&s.category);
         }
 
-        let config_path = storage::config_path();
         let mut config = storage::load_config(&config_path)
             .unwrap_or_else(|| Config::from_snippets(&snippets));
         for s in &snippets {
             config.add_category(&s.category);
         }
-        storage::save_config(&config_path, &config);
+        let mut save_error: Option<String> = None;
+        if let Err(e) = storage::save_config(&config_path, &config) {
+            save_error = Some(format!("Couldn't save settings: {e}"));
+        }
 
         let theme = config.theme.parse::<Theme>().unwrap_or(Theme::Dark);
         cc.egui_ctx.set_visuals(theme.visuals());
 
         let next_id = snippets.iter().map(|s| s.id).max().unwrap_or(0) + 1;
         if !path.exists() {
-            storage::save(&path, &snippets);
+            if let Err(e) = storage::save(&path, &snippets) {
+                save_error = Some(format!("Couldn't save snippets: {e}"));
+            }
         }
 
         Self {
@@ -125,19 +158,24 @@ impl CopyIt {
             drag: None,
             adding_header_category: false,
             new_header_category: String::new(),
+            save_error,
         }
     }
 
-    fn save_snippets(&self) {
-        storage::save(&self.path, &self.snippets);
+    fn save_snippets(&mut self) {
+        self.save_error = storage::save(&self.path, &self.snippets)
+            .err()
+            .map(|e| format!("Couldn't save snippets: {e}"));
     }
 
-    fn save_config(&self) {
+    fn save_config(&mut self) {
         let config = Config {
             categories: self.categories.clone(),
             theme: self.theme.to_string(),
         };
-        storage::save_config(&self.config_path, &config);
+        self.save_error = storage::save_config(&self.config_path, &config)
+            .err()
+            .map(|e| format!("Couldn't save settings: {e}"));
     }
 
     /// Normalizes `raw`, adds it to the canonical list if it isn't already
@@ -383,6 +421,13 @@ impl eframe::App for CopyIt {
                     }
                 });
             });
+            if let Some(err) = &self.save_error {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    ui.colored_label(egui::Color32::from_rgb(0xef, 0x44, 0x44), format!("\u{26A0} {err}"));
+                });
+            }
             ui.add_space(6.0);
         });
 
@@ -1024,6 +1069,7 @@ mod layout_tests {
             drag: None,
             adding_header_category: false,
             new_header_category: String::new(),
+            save_error: None,
         };
         let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -1183,6 +1229,7 @@ mod layout_tests {
             drag: None,
             adding_header_category: false,
             new_header_category: String::new(),
+            save_error: None,
         };
         let filtered: Vec<usize> = (0..app.snippets.len()).collect();
         let mut rects_out: Vec<egui::Rect> = Vec::new();
@@ -1384,6 +1431,7 @@ mod layout_tests {
             drag: None,
             adding_header_category: false,
             new_header_category: String::new(),
+            save_error: None,
         };
         assert_eq!(app.add_category("  git "), "Git"); // existing, case-insensitive
         assert_eq!(app.add_category("werner"), "Werner"); // new

@@ -12,7 +12,7 @@ native `.exe` with no runtime, no WebView, and no installer.
 - Category filter dropdown.
 - Seven selectable themes (Dark, Light, Nord, Dracula, Solarized Dark, Gruvbox Dark, Catppuccin Mocha).
 - Add / edit / delete snippets from inside the app.
-- Data stored as a plain, hand-editable `snippets.json` **next to the .exe** (portable — copy the folder anywhere).
+- Data stored as a plain, hand-editable `snippets.json` in a stable per-user folder (`%APPDATA%\CopyIt`), so it survives rebuilding, moving, or replacing the `.exe`.
 
 ## Build (on Windows)
 
@@ -29,18 +29,23 @@ native `.exe` with no runtime, no WebView, and no installer.
    target\release\copyit.exe
    ```
 
-   Copy that `.exe` anywhere you like. On first launch it creates `snippets.json`
-   beside itself, pre-seeded with a few Git scripts and AI prompts. Edit, add, or
-   delete freely — changes save automatically.
+   Run that `.exe` from wherever you like. On first launch it creates
+   `snippets.json` in `%APPDATA%\CopyIt\`, pre-seeded with a few Git scripts
+   and AI prompts. Edit, add, or delete freely — changes save automatically.
 
 Debug builds show a console window; the `--release` build is a clean windowless
 GUI app.
 
 ## Where's my data?
 
-`snippets.json` sits in the same folder as `copyit.exe`. Back it up, sync it,
-or edit it by hand — it's just JSON. Your canonical category list and chosen
-theme live in `config.json` beside it.
+`snippets.json` lives in `%APPDATA%\CopyIt\` — a stable folder tied to your
+Windows user account, not to wherever `copyit.exe` happens to be. That means
+recompiling, moving the `.exe`, or running a fresh build all see the same
+data. Back it up, sync it, or edit it by hand — it's just JSON. Your
+canonical category list and chosen theme live in `config.json` beside it.
+If you're upgrading from an older version that stored data next to the
+`.exe`, CopyIt automatically picks that data up the first time you run the
+new version.
 
 ```json
 [

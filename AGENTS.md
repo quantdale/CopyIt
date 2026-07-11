@@ -4,7 +4,7 @@ This file is a quick reference for AI agents working on the CopyIt project. It c
 
 ## Project overview
 
-CopyIt is a small, portable Windows desktop app for storing scripts and AI prompts as copyable tiles. It is a native GUI application written in Rust using `egui`/`eframe`. It compiles to a single `.exe` with no installer, no WebView, and no runtime dependencies. User data lives in plain `snippets.json` and `config.json` files next to the executable.
+CopyIt is a small Windows desktop app for storing scripts and AI prompts as copyable tiles. It is a native GUI application written in Rust using `egui`/`eframe`. It compiles to a single `.exe` with no installer, no WebView, and no runtime dependencies. User data lives in plain `snippets.json` and `config.json` files in a stable per-user directory (`%APPDATA%\CopyIt`), independent of wherever the `.exe` itself is run from.
 
 ## Technology stack
 
@@ -41,7 +41,7 @@ CopyIt is a small, portable Windows desktop app for storing scripts and AI promp
   - Modal editor for adding, editing, and deleting snippets.
   - Drag-and-drop reordering of snippet cards (pointer drag on a card body, not on its buttons).
 - `src/model.rs` — Defines `Snippet { id, title, category, body }`.
-- `src/storage.rs` — `data_path()`, `load()`, and `save()` for `snippets.json`; plus `config_path()`, `load_config()`, and `save_config()` for `config.json` (canonical categories and theme). Also contains `normalize_category()` for title-casing category strings.
+- `src/storage.rs` — `data_dir()` resolves the stable `%APPDATA%\CopyIt` directory (falling back to next-to-the-exe if `APPDATA` isn't set, e.g. non-Windows dev/test). `data_path()`, `load()`, and `save()` handle `snippets.json`; `config_path()`, `load_config()`, and `save_config()` handle `config.json` (canonical categories and theme). `legacy_candidate_dirs()` lists old next-to-exe locations used for one-time migration. Also contains `normalize_category()` for title-casing category strings.
 - `src/seed.rs` — Initial default snippets (Git helpers and reusable AI prompts).
 - `src/theme.rs` — `Theme` enum and custom `egui::Visuals` for seven selectable themes.
 
@@ -92,11 +92,12 @@ If you add tests, place unit tests in the relevant `src/*.rs` file under `#[cfg(
 
 ## Data and storage behavior
 
-- Data files live next to the executable:
+- Data files live in a stable per-user directory, `%APPDATA%\CopyIt\`, not next to the executable:
   - `snippets.json` stores the snippet library.
   - `config.json` stores the canonical category list and selected theme.
-- If the executable path cannot be determined, the app falls back to `snippets.json` / `config.json` in the current working directory.
-- On first launch, if `snippets.json` does not exist, the app seeds it with the defaults from `src/seed.rs` and writes the file.
+- This is deliberate: resolving storage relative to the running `.exe` meant `cargo run` (debug) and `cargo build --release` read/write different files, and `cargo clean` / git checkouts of the build folder could reset or destroy real data. `%APPDATA%\CopyIt` is immune to all of that.
+- If `APPDATA` isn't set (non-Windows dev/test environments), the app falls back to the previous next-to-the-exe behavior.
+- On first launch (or first launch after upgrading from an older version), the app checks legacy locations (next to the exe, `target/debug/`, `target/release/`, cwd) and migrates the first non-empty `snippets.json`/`config.json` it finds into the new location before falling back to the seeded defaults from `src/seed.rs`.
 - Both files are plain, hand-editable JSON:
 
   ```json
@@ -111,8 +112,8 @@ If you add tests, place unit tests in the relevant `src/*.rs` file under `#[cfg(
 ## Security considerations
 
 - No network access, no external secrets, and no encrypted storage.
-- `snippets.json` and `config.json` are stored unencrypted next to the executable. Do not store sensitive credentials in snippets.
-- `storage::save` and `storage::save_config` silently ignore write failures. If running from a read-only location, edits will appear to work but will not persist.
+- `snippets.json` and `config.json` are stored unencrypted in `%APPDATA%\CopyIt\`. Do not store sensitive credentials in snippets.
+- `storage::save` and `storage::save_config` return `io::Result<()>`; callers in `app.rs` surface failures via the `save_error` field, shown as a warning banner in the top bar, instead of silently discarding them.
 - Clipboard content is set through egui's `output_mut(|o| o.copied_text = text)`. It stays in the system clipboard until overwritten by something else.
 
 ## Deployment / distribution

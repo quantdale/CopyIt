@@ -1,0 +1,5 @@
+/target/
+
+# Local run artifacts if the app is ever launched from the repo root during dev.
+/snippets.json
+/config.json
