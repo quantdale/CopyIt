@@ -1,0 +1,38 @@
+# Policy: ignore an advisory here only if it (a) would otherwise fail the
+# build -- i.e. it is a *vulnerability*, not an unmaintained/warning-only
+# advisory -- AND (b) is verified excluded from the Windows target graph via
+# `cargo tree --target x86_64-pc-windows-msvc -i <crate>`. Everything else
+# (including Windows-irrelevant *warnings*) stays visible in `cargo audit`
+# output; unmaintained-crate warnings don't fail the build by default and we
+# don't hide them just because they happen to be Linux-only.
+#
+# NOTE: this file must live at `.cargo/audit.toml` (not the repo root) --
+# that's the only path `cargo-audit` actually reads. A prior pass placed the
+# ignore list at the repo root, where it was silently never applied (verified
+# empirically: with the file at the repo root, `cargo audit` still reported
+# "error: 2 vulnerabilities found!" for the two quick-xml IDs below; moved to
+# `.cargo/audit.toml`, the same content correctly suppresses them and
+# `cargo audit` exits 0).
+[advisories]
+ignore = [
+    # quick-xml: CopyIt itself parses no XML anywhere. This crate is only
+    # reachable via wayland-scanner -> smithay-client-toolkit ->
+    # winit/smithay-clipboard -> egui-winit -> eframe, a Linux/Wayland-only
+    # chain. Confirmed absent from the Windows graph via
+    # `cargo tree --target x86_64-pc-windows-msvc -i quick-xml` (empty output).
+    "RUSTSEC-2026-0194", # quick-xml: quadratic runtime on duplicate attribute names (vulnerability, 7.5 high)
+    "RUSTSEC-2026-0195", # quick-xml: unbounded namespace-declaration allocation / DoS (vulnerability, 7.5 high)
+]
+# Deliberately NOT ignored (all unmaintained-crate *warnings*, not
+# vulnerabilities, so none of these fail the build under cargo-audit's
+# defaults; kept visible rather than silenced):
+# - derivative  (RUSTSEC-2024-0388) -- drops out of the Windows graph
+#   (zbus -> accesskit_unix, Unix-only), but it's a warning, not a
+#   vulnerability, so it doesn't meet the ignore policy above.
+# - instant     (RUSTSEC-2024-0384) -- likewise drops out of the Windows
+#   graph, likewise a warning only.
+# - ttf-parser  (RUSTSEC-2026-0192) -- PERSISTS on Windows via
+#   ttf-parser -> owned_ttf_parser -> ab_glyph -> epaint -> egui -> copyit.
+# - paste       (RUSTSEC-2024-0436) -- PERSISTS on Windows via
+#   paste -> accesskit_windows -> accesskit_winit -> egui-winit -> eframe -> copyit.
+# See docs/dependency-audit-notes.md for the full per-crate cargo-tree output.
