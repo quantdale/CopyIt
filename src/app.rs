@@ -246,9 +246,6 @@ impl CopyIt {
             ui.set_opacity(0.4);
         }
 
-        let mut copy_resp: Option<egui::Response> = None;
-        let mut edit_resp: Option<egui::Response> = None;
-
         let frame = egui::Frame::group(ui.style())
             .rounding(egui::Rounding::same(8.0))
             .inner_margin(egui::Margin::same(10.0))
@@ -259,30 +256,33 @@ impl CopyIt {
 
                 ui.vertical(|ui| {
                     // Header: title (left) + copy button (top-right)
-                    ui.horizontal(|ui| {
-                        let recently = self
-                            .copied
-                            .is_some_and(|(cid, t)| cid == s.id && now - t < 1.2);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let resp = ui.button(if recently {
-                                "\u{2714} Copied"
-                            } else {
-                                "\u{29C9} Copy"
-                            });
-                            if resp.clicked() {
-                                actions.push(Action::Copy(s.id));
-                            }
-                            copy_resp = Some(resp);
-                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&s.title).strong().size(15.0),
-                                    )
-                                    .truncate(true),
-                                );
-                            });
-                        });
-                    });
+                    let copy_resp = ui
+                        .horizontal(|ui| {
+                            let recently = self
+                                .copied
+                                .is_some_and(|(cid, t)| cid == s.id && now - t < 1.2);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let resp = ui.button(if recently {
+                                    "\u{2714} Copied"
+                                } else {
+                                    "\u{29C9} Copy"
+                                });
+                                if resp.clicked() {
+                                    actions.push(Action::Copy(s.id));
+                                }
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&s.title).strong().size(15.0),
+                                        )
+                                        .truncate(true),
+                                    );
+                                });
+                                resp
+                            })
+                            .inner
+                        })
+                        .inner;
 
                     // Category badge
                     let badge_text = if ui.visuals().dark_mode {
@@ -305,29 +305,32 @@ impl CopyIt {
                     ui.add_space(6.0);
 
                     // Preview + Edit pinned to the bottom
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                        let resp = ui.small_button("Edit");
-                        if resp.clicked() {
-                            actions.push(Action::Edit(s.id));
-                        }
-                        edit_resp = Some(resp);
-                        ui.add_space(4.0);
-                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                            ui.label(egui::RichText::new(preview_text(&s.body, 220)).weak());
-                        });
-                    });
-                });
+                    let edit_resp = ui
+                        .with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                            let resp = ui.small_button("Edit");
+                            if resp.clicked() {
+                                actions.push(Action::Edit(s.id));
+                            }
+                            ui.add_space(4.0);
+                            ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                                ui.label(egui::RichText::new(preview_text(&s.body, 220)).weak());
+                            });
+                            resp
+                        })
+                        .inner;
+
+                    (copy_resp, edit_resp)
+                })
+                .inner
             });
 
         if is_dragged {
             ui.set_opacity(1.0);
         }
 
-        CardWidgets {
-            frame_rect: frame.response.rect,
-            copy: copy_resp.unwrap(),
-            edit: edit_resp.unwrap(),
-        }
+        let frame_rect = frame.response.rect;
+        let (copy, edit) = frame.inner;
+        CardWidgets { frame_rect, copy, edit }
     }
 }
 
