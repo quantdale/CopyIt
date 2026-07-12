@@ -18,6 +18,7 @@ pub struct CopyIt {
     drag: Option<DragState>,
     adding_header_category: bool,
     new_header_category: String,
+    category_error: Option<String>,
     save_error: Option<String>,
 }
 
@@ -158,6 +159,7 @@ impl CopyIt {
             drag: None,
             adding_header_category: false,
             new_header_category: String::new(),
+            category_error: None,
             save_error,
         }
     }
@@ -183,7 +185,7 @@ impl CopyIt {
     /// canonical form (or an existing match if one collides).
     fn add_category(&mut self, raw: &str) -> String {
         let cat = storage::normalize_category(raw);
-        if cat.is_empty() {
+        if cat.is_empty() || cat.eq_ignore_ascii_case("all") {
             return String::new();
         }
         if let Some(existing) = self
@@ -376,12 +378,14 @@ impl eframe::App for CopyIt {
                 if start_adding_category {
                     self.adding_header_category = true;
                     self.new_header_category.clear();
+                    self.category_error = None;
                 } else if filter_selected != self.category_filter
                     && filter_selected != "+ Add new category"
                 {
                     self.category_filter = filter_selected;
                     self.adding_header_category = false;
                     self.new_header_category.clear();
+                    self.category_error = None;
                 }
                 if self.adding_header_category {
                     ui.add(
@@ -392,14 +396,25 @@ impl eframe::App for CopyIt {
                     let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button("Add").clicked() || enter_pressed {
                         let raw = self.new_header_category.trim().to_string();
-                        if !raw.is_empty() {
+                        if raw.eq_ignore_ascii_case("all") {
+                            self.category_error =
+                                Some("\"All\" is reserved and can't be used as a category".to_string());
+                        } else if !raw.is_empty() {
                             let canonical = self.add_category(&raw);
                             if !canonical.is_empty() {
                                 self.category_filter = canonical;
+                                self.adding_header_category = false;
+                                self.new_header_category.clear();
+                                self.category_error = None;
                             }
+                        } else {
+                            self.adding_header_category = false;
+                            self.new_header_category.clear();
+                            self.category_error = None;
                         }
-                        self.adding_header_category = false;
-                        self.new_header_category.clear();
+                    }
+                    if let Some(err) = &self.category_error {
+                        ui.colored_label(egui::Color32::from_rgb(0xef, 0x44, 0x44), err);
                     }
                 }
 
@@ -1103,6 +1118,7 @@ mod layout_tests {
             drag: None,
             adding_header_category: false,
             new_header_category: String::new(),
+            category_error: None,
             save_error: None,
         };
         let _ = ctx.run(input, |ctx| {
@@ -1267,6 +1283,7 @@ mod layout_tests {
             drag: None,
             adding_header_category: false,
             new_header_category: String::new(),
+            category_error: None,
             save_error: None,
         };
         let filtered: Vec<usize> = (0..app.snippets.len()).collect();
@@ -1471,12 +1488,22 @@ mod layout_tests {
             drag: None,
             adding_header_category: false,
             new_header_category: String::new(),
+            category_error: None,
             save_error: None,
         };
         assert_eq!(app.add_category("  git "), "Git"); // existing, case-insensitive
         assert_eq!(app.add_category("werner"), "Werner"); // new
         assert_eq!(app.add_category("Werner"), "Werner"); // duplicate
         assert!(app.categories.contains(&"Werner".to_string()));
+        assert_eq!(app.categories.len(), 3);
+
+        assert_eq!(app.add_category("all"), "");
+        assert_eq!(app.add_category("All"), "");
+        assert_eq!(app.add_category("ALL"), "");
+        assert!(!app
+            .categories
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case("all")));
         assert_eq!(app.categories.len(), 3);
     }
 

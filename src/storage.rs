@@ -109,7 +109,7 @@ impl Config {
 
     pub fn add_category(&mut self, raw: &str) {
         let cat = normalize_category(raw);
-        if cat.is_empty() {
+        if cat.is_empty() || cat.eq_ignore_ascii_case("all") {
             return;
         }
         if self
