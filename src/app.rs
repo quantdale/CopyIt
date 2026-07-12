@@ -1040,6 +1040,38 @@ fn line_segment_rect(from: egui::Pos2, to: egui::Pos2, stroke_width: f32) -> egu
     )
 }
 
+fn draw_dashed_line(
+    painter: &egui::Painter,
+    from: egui::Pos2,
+    to: egui::Pos2,
+    dash_len: f32,
+    gap_len: f32,
+    stroke: egui::Stroke,
+) {
+    let vec = to - from;
+    let total = vec.length();
+    if total <= 0.0 {
+        return;
+    }
+    let dir = vec / total;
+    let mut pos = 0.0;
+    let mut drawing_dash = true;
+    while pos < total {
+        let seg_len = if drawing_dash {
+            dash_len.min(total - pos)
+        } else {
+            gap_len.min(total - pos)
+        };
+        if drawing_dash {
+            let a = from + dir * pos;
+            let b = from + dir * (pos + seg_len);
+            painter.line_segment([a, b], stroke);
+        }
+        pos += seg_len;
+        drawing_dash = !drawing_dash;
+    }
+}
+
 #[cfg(test)]
 mod layout_tests {
     use super::*;
@@ -1047,11 +1079,13 @@ mod layout_tests {
     #[test]
     fn real_card_rects_and_gaps() {
         let ctx = egui::Context::default();
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(egui::Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            egui::vec2(1000.0, 700.0),
-        ));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1000.0, 700.0),
+            )),
+            ..Default::default()
+        };
         let app = CopyIt {
             snippets: vec![
                 Snippet { id: 1, title: "One".into(), category: "Git".into(), body: "body one".into() },
@@ -1093,11 +1127,13 @@ mod layout_tests {
     #[test]
     fn grid_rects_and_gaps() {
         let ctx = egui::Context::default();
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(egui::Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            egui::vec2(1000.0, 700.0),
-        ));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1000.0, 700.0),
+            )),
+            ..Default::default()
+        };
         let mut cols_out = 0;
         let mut rects_out: Vec<egui::Rect> = Vec::new();
         let _ = ctx.run(input, |ctx| {
@@ -1205,11 +1241,13 @@ mod layout_tests {
     #[test]
     fn real_card_grid_rects_and_gaps() {
         let ctx = egui::Context::default();
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(egui::Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            egui::vec2(1000.0, 700.0),
-        ));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1000.0, 700.0),
+            )),
+            ..Default::default()
+        };
         let app = CopyIt {
             snippets: vec![
                 Snippet { id: 1, title: "One".into(), category: "Git".into(), body: "body one".into() },
@@ -1298,11 +1336,13 @@ mod layout_tests {
         // Replicates the exact grid layout and checks that gap_point / line math
         // produces a point centered in the gap with clearance from both cards.
         let ctx = egui::Context::default();
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(egui::Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            egui::vec2(1000.0, 700.0),
-        ));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1000.0, 700.0),
+            )),
+            ..Default::default()
+        };
         let mut rects: Vec<egui::Rect> = Vec::new();
         let mut cols = 0;
         let _ = ctx.run(input, |ctx| {
@@ -1445,11 +1485,13 @@ mod layout_tests {
     #[test]
     fn editor_window_height_is_clamped_for_long_content() {
         let ctx = egui::Context::default();
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(egui::Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            egui::vec2(1000.0, 700.0),
-        ));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1000.0, 700.0),
+            )),
+            ..Default::default()
+        };
 
         let mut title = String::from("Long snippet");
         let mut category = String::from("Git");
@@ -1538,37 +1580,5 @@ mod layout_tests {
                 );
             });
         });
-    }
-}
-
-fn draw_dashed_line(
-    painter: &egui::Painter,
-    from: egui::Pos2,
-    to: egui::Pos2,
-    dash_len: f32,
-    gap_len: f32,
-    stroke: egui::Stroke,
-) {
-    let vec = to - from;
-    let total = vec.length();
-    if total <= 0.0 {
-        return;
-    }
-    let dir = vec / total;
-    let mut pos = 0.0;
-    let mut drawing_dash = true;
-    while pos < total {
-        let seg_len = if drawing_dash {
-            dash_len.min(total - pos)
-        } else {
-            gap_len.min(total - pos)
-        };
-        if drawing_dash {
-            let a = from + dir * pos;
-            let b = from + dir * (pos + seg_len);
-            painter.line_segment([a, b], stroke);
-        }
-        pos += seg_len;
-        drawing_dash = !drawing_dash;
     }
 }
