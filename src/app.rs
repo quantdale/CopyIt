@@ -812,7 +812,7 @@ impl eframe::App for CopyIt {
                     let category = {
                         let canonical = self.add_category(&ed.category);
                         if canonical.is_empty() {
-                            "Uncategorized".to_string()
+                            self.add_category("Uncategorized")
                         } else {
                             canonical
                         }
@@ -1505,6 +1505,41 @@ mod layout_tests {
             .iter()
             .any(|c| c.eq_ignore_ascii_case("all")));
         assert_eq!(app.categories.len(), 3);
+    }
+
+    #[test]
+    fn uncategorized_fallback_is_registered_in_categories() {
+        let mut app = CopyIt {
+            snippets: vec![],
+            next_id: 1,
+            path: std::path::PathBuf::from("snippets.json"),
+            config_path: std::path::PathBuf::from("config.json"),
+            categories: vec![],
+            search: String::new(),
+            category_filter: "All".into(),
+            theme: Theme::Dark,
+            editor: None,
+            copied: None,
+            drag: None,
+            adding_header_category: false,
+            new_header_category: String::new(),
+            category_error: None,
+            save_error: None,
+        };
+        // Mirrors the Save-path category resolution in `update()`: a blank
+        // `ed.category` (reachable via `Editor::blank` when `categories` is
+        // empty) must fall back to "Uncategorized" AND register it.
+        let ed_category = "";
+        let category = {
+            let canonical = app.add_category(ed_category);
+            if canonical.is_empty() {
+                app.add_category("Uncategorized")
+            } else {
+                canonical
+            }
+        };
+        assert_eq!(category, "Uncategorized");
+        assert!(app.categories.contains(&"Uncategorized".to_string()));
     }
 
     /// Regression test: a very long snippet body must not make the editor
