@@ -43,7 +43,7 @@ CopyIt is a small Windows desktop app for storing scripts and AI prompts as copy
 - `src/model.rs` — Defines `Snippet { id, title, category, body }`.
 - `src/storage.rs` — `data_dir()` resolves the stable `%APPDATA%\CopyIt` directory (falling back to next-to-the-exe if `APPDATA` isn't set, e.g. non-Windows dev/test). `data_path()`, `load()`, and `save()` handle `snippets.json`; `config_path()`, `load_config()`, and `save_config()` handle `config.json` (canonical categories and theme). `legacy_candidate_dirs()` lists old next-to-exe locations used for one-time migration. Also contains `normalize_category()` for title-casing category strings.
 - `src/seed.rs` — Initial default snippets (Git helpers and reusable AI prompts).
-- `src/theme.rs` — `Theme` enum and custom `egui::Visuals` for seven selectable themes.
+- `src/theme.rs` — `Theme` enum and custom `egui::Visuals` for 37 selectable themes.
 
 ## Build and run commands
 

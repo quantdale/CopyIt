@@ -10,7 +10,7 @@ native `.exe` with no runtime, no WebView, and no installer.
 - One-click copy to the clipboard, with a brief "Copied" confirmation.
 - Instant search across title, body, and category.
 - Category filter dropdown.
-- Seven selectable themes (Dark, Light, Nord, Dracula, Solarized Dark, Gruvbox Dark, Catppuccin Mocha).
+- 37 selectable color themes (Dark, Light, Nord, Dracula, Solarized, Gruvbox, Catppuccin, Tokyo Night, One Dark/Light, Monokai, GitHub, Ayu, Rose Pine, Everforest, Material, Kanagawa, Night Owl, Zenburn, Synthwave '84, Cobalt2, Horizon, and more).
 - Add / edit / delete snippets from inside the app.
 - Data stored as a plain, hand-editable `snippets.json` in a stable per-user folder (`%APPDATA%\CopyIt`), so it survives rebuilding, moving, or replacing the `.exe`.
 
