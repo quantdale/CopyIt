@@ -180,6 +180,14 @@ impl CopyIt {
             .map(|e| format!("Couldn't save settings: {e}"));
     }
 
+    /// Clears the inline category warning as soon as the user starts editing
+    /// the category input, so the error doesn't linger while they correct it.
+    fn clear_category_error_on_input_change(&mut self, previous: &str) {
+        if self.new_header_category != previous {
+            self.category_error = None;
+        }
+    }
+
     /// Normalizes `raw`, adds it to the canonical list if it isn't already
     /// present (case-insensitive), persists the config, and returns the
     /// canonical form (or an existing match if one collides).
@@ -391,11 +399,13 @@ impl eframe::App for CopyIt {
                     self.category_error = None;
                 }
                 if self.adding_header_category {
+                    let previous_category = self.new_header_category.clone();
                     ui.add(
                         egui::TextEdit::singleline(&mut self.new_header_category)
                             .hint_text("New category")
                             .desired_width(120.0),
                     );
+                    self.clear_category_error_on_input_change(&previous_category);
                     let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button("Add").clicked() || enter_pressed {
                         let raw = self.new_header_category.trim().to_string();
@@ -1543,6 +1553,59 @@ mod layout_tests {
         };
         assert_eq!(category, "Uncategorized");
         assert!(app.categories.contains(&"Uncategorized".to_string()));
+    }
+
+    #[test]
+    fn category_error_clears_when_input_changes() {
+        let mut app = CopyIt {
+            snippets: vec![],
+            next_id: 1,
+            path: std::path::PathBuf::from("snippets.json"),
+            config_path: std::path::PathBuf::from("config.json"),
+            categories: vec!["Git".into()],
+            search: String::new(),
+            category_filter: "All".into(),
+            theme: Theme::Dark,
+            editor: None,
+            copied: None,
+            drag: None,
+            adding_header_category: true,
+            new_header_category: "al".into(),
+            category_error: Some(
+                "\"All\" is reserved and can't be used as a category".into(),
+            ),
+            save_error: None,
+        };
+        let previous = app.new_header_category.clone();
+        app.new_header_category.push('l');
+        app.clear_category_error_on_input_change(&previous);
+        assert!(app.category_error.is_none());
+    }
+
+    #[test]
+    fn category_error_lingers_when_input_unchanged() {
+        let mut app = CopyIt {
+            snippets: vec![],
+            next_id: 1,
+            path: std::path::PathBuf::from("snippets.json"),
+            config_path: std::path::PathBuf::from("config.json"),
+            categories: vec!["Git".into()],
+            search: String::new(),
+            category_filter: "All".into(),
+            theme: Theme::Dark,
+            editor: None,
+            copied: None,
+            drag: None,
+            adding_header_category: true,
+            new_header_category: "all".into(),
+            category_error: Some(
+                "\"All\" is reserved and can't be used as a category".into(),
+            ),
+            save_error: None,
+        };
+        let previous = app.new_header_category.clone();
+        app.clear_category_error_on_input_change(&previous);
+        assert!(app.category_error.is_some());
     }
 
     /// Regression test: a very long snippet body must not make the editor
