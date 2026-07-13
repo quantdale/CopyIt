@@ -645,7 +645,7 @@ impl eframe::App for CopyIt {
                                     ghost_rect,
                                     egui::Rounding::same(8.0),
                                     egui::Stroke::new(
-                                        2.0,
+                                        2.0_f32,
                                         egui::Color32::from_rgb(0x60, 0xb0, 0xff),
                                     ),
                                 );
@@ -975,7 +975,7 @@ fn draw_insertion_line(
     let pointer = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
 
     let color = egui::Color32::from_rgb(0x60, 0xb0, 0xff);
-    let stroke = egui::Stroke::new(2.0, color);
+    let stroke = egui::Stroke::new(2.0_f32, color);
     let clearance = 4.0_f32;
 
     let painter = ctx.layer_painter(egui::LayerId::new(
