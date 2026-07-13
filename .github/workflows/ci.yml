@@ -14,6 +14,9 @@ jobs:
       - run: cargo build --release
   audit:
     runs-on: ubuntu-latest       # cargo audit reads Cargo.lock (all-platform); cheap + identical here
+    permissions:
+      contents: read             # checkout the repository
+      checks: write              # rustsec/audit-check posts results as a check run
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
