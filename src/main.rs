@@ -12,8 +12,8 @@ use app::CopyIt;
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 700.0])
-            .with_min_inner_size([560.0, 400.0])
+            .with_inner_size([1000.0, 700.0])  // Default window size: wide enough for ~2-3 card columns
+            .with_min_inner_size([560.0, 400.0]) // Minimum size: ensures UI doesn't break on resize
             .with_title("CopyIt"),
         ..Default::default()
     };
