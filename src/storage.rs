@@ -3,12 +3,12 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::PathBuf;
 
-/// Stable per-user directory the library and config live in, independent of
-/// which build (debug/release) or copy of the .exe is currently running.
-/// Using `%APPDATA%` means recompiling, `cargo clean`, or a fresh git
-/// checkout of the build folder can never wipe user data.
-/// Falls back to "next to the running exe" when `APPDATA` isn't set (e.g.
-/// non-Windows dev/test environments).
+/// Resolves the stable per-user directory where snippets.json and config.json live.
+/// Uses `%APPDATA%\CopyIt` on Windows (preferred: survives git checkouts, cargo clean, etc.),
+/// falling back to the directory containing the running .exe on non-Windows or when APPDATA
+/// is unset (e.g., in dev/CI environments). This strategy decouples data persistence from
+/// build artifacts: users can freely update/rebuild the application without losing their
+/// saved snippets. The directory is created on first access if it doesn't exist.
 pub fn data_dir() -> PathBuf {
     if let Ok(appdata) = std::env::var("APPDATA") {
         let dir = PathBuf::from(appdata).join("CopyIt");
@@ -20,7 +20,7 @@ pub fn data_dir() -> PathBuf {
             return dir.to_path_buf();
         }
     }
-    PathBuf::from(".")
+    PathBuf::from(".") // Last-resort fallback: current working directory
 }
 
 pub fn data_path() -> PathBuf {
@@ -63,8 +63,11 @@ pub fn save(path: &PathBuf, snippets: &[Snippet]) -> io::Result<()> {
     std::fs::write(path, json)
 }
 
-/// Trim whitespace and normalize category casing to title-case.
-/// "  git " and "GIT" both become "Git".
+/// Normalizes a category name for canonical storage: trims whitespace, collapses multiple
+/// spaces into single spaces, and converts to title-case word-by-word. This ensures
+/// "  git ", "GIT", "Git", and "gIt" all round-trip to the same canonical "Git".
+/// Used during config initialization and category creation to prevent duplicates
+/// that differ only in whitespace or casing.
 pub fn normalize_category(s: &str) -> String {
     let s = s.trim();
     if s.is_empty() {
@@ -76,6 +79,7 @@ pub fn normalize_category(s: &str) -> String {
             match chars.next() {
                 None => String::new(),
                 Some(first) => {
+                    // Title-case: capitalize first letter, lowercase the rest
                     first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
                 }
             }
@@ -84,12 +88,16 @@ pub fn normalize_category(s: &str) -> String {
         .join(" ")
 }
 
+/// User configuration: canonical category list and the selected theme.
+/// Stored separately from snippets.json so that snippet data can remain stable
+/// across version upgrades; only the config file changes when features (categories, themes) evolve.
+/// Both fields use `#[serde(default)]` to handle missing fields gracefully in older config files.
 #[derive(Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
-    pub categories: Vec<String>,
+    pub categories: Vec<String>,  // Sorted, deduplicated list of all known categories
     #[serde(default)]
-    pub theme: String,
+    pub theme: String,            // Theme name (e.g., "Dark", "Nord"); defaults to "Dark" on first run
 }
 
 impl Config {

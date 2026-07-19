@@ -1,6 +1,9 @@
 use crate::model::Snippet;
 
-/// Default library created on first launch (when no snippets.json exists yet).
+/// Default library seeded on first launch when no snippets.json exists yet.
+/// Provides examples of common Git workflows and AI prompt templates to get users started.
+/// Each snippet has a unique sequential ID (1-based) for initial ordering.
+/// Users can edit, delete, or add to these snippets—they are just a starting point.
 pub fn defaults() -> Vec<Snippet> {
     let items: &[(&str, &str, &str)] = &[
         (

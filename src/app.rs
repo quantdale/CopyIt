@@ -22,21 +22,29 @@ pub struct CopyIt {
     save_error: Option<String>,
 }
 
+/// Tracks an in-progress drag operation. Initialized when the user clicks on a card,
+/// but remains in a "pre-drag" state until the pointer moves >4px (to avoid accidental
+/// drags from single clicks). Once `dragging` becomes true, visual feedback (insertion
+/// line and ghost box) appears to guide the user to a drop location.
 struct DragState {
     snippet_id: u64,     // which snippet is being dragged
     origin_index: usize, // its index in self.snippets at drag start
     start_pos: egui::Pos2,
-    dragging: bool,
+    dragging: bool,      // true only after pointer has moved >4px; prevents accidental drags
 }
 
+/// Modal editor state for creating or editing a snippet. The `adding_category` and
+/// `new_category` fields track an inline sub-form (entered via the category dropdown)
+/// that lets users add a category without closing the editor. The `confirm_delete`
+/// flag requires a second click to prevent accidental deletions.
 struct Editor {
-    id: Option<u64>, // None = creating a new snippet
+    id: Option<u64>, // None = creating a new snippet; Some(id) = editing existing
     title: String,
     category: String,
-    new_category: String,
-    adding_category: bool,
+    new_category: String,   // input for inline category creation
+    adding_category: bool,   // true when user clicked "+ Add new category" in the dropdown
     body: String,
-    confirm_delete: bool,
+    confirm_delete: bool,    // set to true on first "Delete" click; requires second "Confirm delete"
 }
 
 impl Editor {
@@ -93,22 +101,26 @@ struct CardWidgets {
 /// `snippets.json`/`config.json` next to the .exe: if the new stable location
 /// doesn't have a file yet, pull in the first non-empty copy found in a
 /// legacy location (next to the exe, `target/debug`, `target/release`, cwd).
+/// This migration runs once per file per session; after that, the stable location
+/// owns the data and legacy locations are ignored. Users who have data in multiple
+/// locations get the first non-empty match (search order: exe dir, debug, release, cwd).
 fn migrate_legacy_file(new_path: &std::path::Path, filename: &str) {
     if new_path.exists() {
-        return;
+        return; // Already migrated or was created fresh; don't search legacy locations
     }
     for dir in storage::legacy_candidate_dirs() {
         let candidate = dir.join(filename);
         if candidate == new_path {
-            continue;
+            continue; // Skip the new location itself (shouldn't happen, but be safe)
         }
         if let Ok(data) = std::fs::read_to_string(&candidate) {
             let trimmed = data.trim();
+            // Skip empty or dummy JSON (e.g. "[]" or "{}" from a failed write).
             if trimmed.is_empty() || trimmed == "[]" || trimmed == "{}" {
                 continue;
             }
             let _ = std::fs::write(new_path, data);
-            return;
+            return; // Success: migrate and stop searching
         }
     }
 }
@@ -209,6 +221,13 @@ impl CopyIt {
         cat
     }
 
+    /// Moves a snippet from origin_index to a new position in the full list.
+    /// The `target_filtered_gap` is a gap index into the *filtered* (visible after search/category filter)
+    /// subset, but self.snippets is the *full* unfiltered list. This function converts the filtered
+    /// gap to an absolute index in self.snippets, accounting for the fact that removing the origin
+    /// shifts indices of everything after it.
+    /// Edge cases: if `target_filtered_gap == filtered.len()`, the card is dropped after the last
+    /// visible card. The adjustment (`t > origin_index ? t - 1 : t`) handles the index shift.
     fn reorder(&mut self, origin_index: usize, target_filtered_gap: usize, filtered: &[usize]) {
         if filtered.is_empty() {
             return;
@@ -217,19 +236,20 @@ impl CopyIt {
         let target_abs = if target_filtered_gap == 0 {
             let mut t = filtered[0];
             if t > origin_index {
-                t -= 1;
+                t -= 1; // Adjust for removal of origin_index
             }
             t
         } else if target_filtered_gap < filtered.len() {
             let mut t = filtered[target_filtered_gap];
             if t > origin_index {
-                t -= 1;
+                t -= 1; // Adjust for removal of origin_index
             }
             t
         } else {
+            // Dropped after the last filtered card: insert after it
             let mut t = filtered[filtered.len() - 1];
             if t > origin_index {
-                t -= 1;
+                t -= 1; // Adjust for removal of origin_index
             }
             t + 1
         };
@@ -906,6 +926,12 @@ fn category_color(cat: &str) -> egui::Color32 {
     palette[h % palette.len()]
 }
 
+/// Finds the closest insertion gap (0 to n, inclusive) based on the pointer position.
+/// A "gap" is a logical position between cards in the filtered grid: gap 0 is before the first card,
+/// gap n is after the last card, and gaps in between are the spaces between adjacent cards (both
+/// vertical within a row and horizontal between rows). The function computes a representative
+/// point for each gap (via gap_point) and returns the index of the gap whose point is closest
+/// to the current pointer position. This guides the insertion line and drop target.
 fn nearest_gap(
     pointer: egui::Pos2,
     rects: &[egui::Rect],
@@ -933,6 +959,12 @@ fn nearest_gap(
     best
 }
 
+/// Computes a representative point for a given gap in the grid, used for distance-based
+/// gap selection. The grid is arranged in rows of `cols` cards each.
+/// - If g is a vertical gap (between cards in the same row), return the midpoint between them.
+/// - If g is a horizontal gap (between rows), return a point centered on the column nearest
+///   the pointer's x-coordinate. This ensures the insertion line aligns with the pointer's
+///   intended column even when dragging over empty space between rows.
 fn gap_point(
     g: usize,
     rects: &[egui::Rect],
@@ -943,14 +975,14 @@ fn gap_point(
 ) -> egui::Pos2 {
     let n = rects.len();
 
-    // Same-row vertical gap.
+    // Same-row vertical gap: return the point midway between the two adjacent cards.
     if g > 0 && g < n && !g.is_multiple_of(cols) {
         let x = (rects[g - 1].right() + rects[g].left()) * 0.5;
         let y = rects[g].center().y;
         return egui::pos2(x, y);
     }
 
-    // Row-boundary horizontal gap.
+    // Row-boundary horizontal gap: y-coordinate centered in the gap; x-coordinate follows pointer.
     let y = if g == 0 {
         rects[0].top() - spacing * 0.5
     } else if g == n {
@@ -959,7 +991,7 @@ fn gap_point(
         (rects[g - 1].bottom() + rects[g].top()) * 0.5
     };
 
-    // Center the horizontal line on the column of the nearest card.
+    // Find the card column whose x-center is closest to the pointer's x position.
     let nearest_x = rects
         .iter()
         .map(|r| r.center().x)
@@ -969,6 +1001,12 @@ fn gap_point(
     egui::pos2(nearest_x, y)
 }
 
+/// Renders a dashed insertion line indicating where the dragged card would be dropped.
+/// For vertical gaps (between cards in the same row), draws a short vertical dashed line centered
+/// between the two cards. For horizontal gaps (between rows), draws a horizontal dashed line
+/// centered on the column nearest the pointer's x-position. Both cases include clearance checks
+/// to ensure the line doesn't visually overlap with adjacent cards (which would be confusing).
+/// The line only draws if its computed length is non-zero and it won't intersect any cards.
 fn draw_insertion_line(
     ctx: &egui::Context,
     gap: usize,
@@ -986,7 +1024,7 @@ fn draw_insertion_line(
 
     let color = egui::Color32::from_rgb(0x60, 0xb0, 0xff);
     let stroke = egui::Stroke::new(2.0_f32, color);
-    let clearance = 4.0_f32;
+    let clearance = 4.0_f32; // Minimum distance the line must maintain from card edges
 
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Tooltip,
@@ -999,6 +1037,7 @@ fn draw_insertion_line(
         let b = &rects[gap];
         let x = (a.right() + b.left()) * 0.5;
         let y_center = a.center().y;
+        // Make the line span ~35% of the card height, but never extend past the card boundaries.
         let half_len = (card_h * 0.35).min(a.height() * 0.5 - clearance);
         let from = egui::pos2(x, y_center - half_len);
         let to = egui::pos2(x, y_center + half_len);
@@ -1007,7 +1046,7 @@ fn draw_insertion_line(
             draw_dashed_line(&painter, from, to, 6.0, 4.0, stroke);
         }
     } else {
-        // Horizontal dashed line at a row boundary.
+        // Horizontal dashed line at a row boundary (top, between rows, or bottom).
         let (y, gap_top, gap_bottom, above, below) = if gap == 0 {
             (
                 rects[0].top() - spacing * 0.5,
@@ -1034,7 +1073,7 @@ fn draw_insertion_line(
             )
         };
 
-        // Center the horizontal line on the column of the nearest card.
+        // Center the horizontal line on the column of the nearest card to guide the drop location.
         let nearest = rects
             .iter()
             .min_by(|a, b| (a.center().x - pointer.x).abs().partial_cmp(&(b.center().x - pointer.x).abs()).unwrap())
@@ -1044,6 +1083,7 @@ fn draw_insertion_line(
         let from = egui::pos2(x_center - half_len, y);
         let to = egui::pos2(x_center + half_len, y);
         let line_rect = line_segment_rect(from, to, stroke.width);
+        // Only draw if the line has positive length and maintains clearance from adjacent cards.
         let mut clear = half_len > 0.0
             && y > gap_top + clearance
             && y < gap_bottom - clearance;
@@ -1068,6 +1108,10 @@ fn line_segment_rect(from: egui::Pos2, to: egui::Pos2, stroke_width: f32) -> egu
     )
 }
 
+/// Draws a dashed line by rendering alternating solid segments (dashes) and transparent gaps.
+/// This creates a visual "dashed" effect without needing special stroke rendering. The line
+/// is drawn along the direction from `from` to `to`, and `dash_len` / `gap_len` control
+/// the length of each dash and the space between them (both in screen pixels).
 fn draw_dashed_line(
     painter: &egui::Painter,
     from: egui::Pos2,
@@ -1091,12 +1135,13 @@ fn draw_dashed_line(
             gap_len.min(total - pos)
         };
         if drawing_dash {
+            // Only draw the solid segment; skip gaps by not painting them.
             let a = from + dir * pos;
             let b = from + dir * (pos + seg_len);
             painter.line_segment([a, b], stroke);
         }
         pos += seg_len;
-        drawing_dash = !drawing_dash;
+        drawing_dash = !drawing_dash; // Alternate between drawing and skipping
     }
 }
 
