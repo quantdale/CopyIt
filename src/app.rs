@@ -192,22 +192,31 @@ impl CopyIt {
             .map(|e| format!("Couldn't save settings: {e}"));
     }
 
-    /// Clears the inline category warning as soon as the user starts editing
-    /// the category input, so the error doesn't linger while they correct it.
+    /// UX helper: clears a stale category error message as soon as the user begins typing.
+    /// When the user receives an error (e.g., "\"All\" is reserved"), we want the error
+    /// to disappear as soon as they start correcting the input—not linger until they
+    /// click "Add" or clear it manually. This function is called in the input handler
+    /// with the previous frame's value; if the value has changed, we assume the user
+    /// is actively correcting the error and clear the message.
     fn clear_category_error_on_input_change(&mut self, previous: &str) {
         if self.new_header_category != previous {
             self.category_error = None;
         }
     }
 
-    /// Normalizes `raw`, adds it to the canonical list if it isn't already
-    /// present (case-insensitive), persists the config, and returns the
-    /// canonical form (or an existing match if one collides).
+    /// Normalizes `raw` to canonical form, checks for duplicates (case-insensitive),
+    /// and adds it to self.categories if new. Returns the canonical form (either the
+    /// newly added category or an existing match). Special cases: rejects empty strings
+    /// and the reserved "All" keyword (returns empty string). Persists the updated list
+    /// to disk after insertion. This method is idempotent: calling it twice with the same
+    /// input returns the same canonical string without creating duplicates.
     fn add_category(&mut self, raw: &str) -> String {
         let cat = storage::normalize_category(raw);
+        // Reject empty and reserved names
         if cat.is_empty() || cat.eq_ignore_ascii_case("all") {
             return String::new();
         }
+        // Check for case-insensitive duplicate; return existing canonical form if found
         if let Some(existing) = self
             .categories
             .iter()
@@ -215,6 +224,7 @@ impl CopyIt {
         {
             return existing.clone();
         }
+        // New category: append, sort, and persist
         self.categories.push(cat.clone());
         self.categories.sort();
         self.save_config();
@@ -258,6 +268,12 @@ impl CopyIt {
         self.save_snippets();
     }
 
+    /// Renders a single card for a snippet. Fixed height (168px) with fixed width (`width` param),
+    /// laid out in a vertical stack: title row (copy button right-aligned), category badge,
+    /// preview text, and edit button. When is_dragged=true, the card is made semi-transparent
+    /// (opacity 0.4) to indicate it's being lifted. Copies are detected by checking if
+    /// self.copied contains this snippet's ID and the elapsed time is < 1.2 seconds;
+    /// when true, the copy button shows a checkmark instead of the copy icon for visual feedback.
     fn card(
         &self,
         ui: &mut egui::Ui,
@@ -271,7 +287,7 @@ impl CopyIt {
         let card_h = 168.0;
 
         if is_dragged {
-            ui.set_opacity(0.4);
+            ui.set_opacity(0.4); // Dim the card being dragged for visual feedback
         }
 
         let frame = egui::Frame::group(ui.style())
@@ -283,7 +299,7 @@ impl CopyIt {
                 ui.set_height(card_h);
 
                 ui.vertical(|ui| {
-                    // Header: title (left) + copy button (top-right)
+                    // Header: title (left) + copy button (top-right) with dynamic label feedback
                     let copy_resp = ui
                         .horizontal(|ui| {
                             let recently = self
@@ -363,8 +379,13 @@ impl CopyIt {
 }
 
 impl eframe::App for CopyIt {
+    /// Main UI loop. Rendered every frame by egui. Consists of:
+    /// 1. Top panel: search input, category filter dropdown, theme picker, "New" button
+    /// 2. Central grid: filtered/searched card layout with drag-and-drop reordering
+    /// 3. Editor modal (optional): add/edit/delete snippet in a floating window
+    /// Each phase handles its own state changes and persists to disk as needed.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let now = ctx.input(|i| i.time);
+        let now = ctx.input(|i| i.time); // Current time for copy-feedback animations
         let previous_theme = self.theme;
         ctx.set_visuals(self.theme.visuals());
 
@@ -896,28 +917,39 @@ impl eframe::App for CopyIt {
     }
 }
 
+/// Truncates a string to at most `max` characters (counted by Unicode grapheme count,
+/// not bytes), appending an ellipsis (…) if truncation occurred. Used for card titles
+/// that might be too long to fit in the fixed card width.
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() > max {
         let t: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{t}\u{2026}")
+        format!("{t}\u{2026}") // Leave room for the ellipsis
     } else {
         s.to_string()
     }
 }
 
+/// Prepares snippet body text for card preview: collapses all whitespace (newlines, tabs, etc.)
+/// into single spaces, then truncates to a maximum character count with ellipsis.
+/// This prevents multi-line bodies from breaking the card layout and makes long content readable at a glance.
 fn preview_text(body: &str, max: usize) -> String {
     let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_chars(&collapsed, max)
 }
 
+/// Assigns a color to a category badge deterministically based on its name.
+/// Uses a simple hash function (multiply-by-31 rolling hash) to map category names
+/// to colors in a palette of 6 distinct hues. Deterministic means the same category
+/// always gets the same color, improving visual recognition at a glance.
+/// The palette is designed to have good contrast and readability in both light and dark themes.
 fn category_color(cat: &str) -> egui::Color32 {
     let palette = [
-        egui::Color32::from_rgb(0x3b, 0x82, 0xf6),
-        egui::Color32::from_rgb(0x8b, 0x5c, 0xf6),
-        egui::Color32::from_rgb(0x10, 0xb9, 0x81),
-        egui::Color32::from_rgb(0xf5, 0x9e, 0x0b),
-        egui::Color32::from_rgb(0xef, 0x44, 0x44),
-        egui::Color32::from_rgb(0x06, 0xb6, 0xd4),
+        egui::Color32::from_rgb(0x3b, 0x82, 0xf6), // Blue
+        egui::Color32::from_rgb(0x8b, 0x5c, 0xf6), // Purple
+        egui::Color32::from_rgb(0x10, 0xb9, 0x81), // Teal
+        egui::Color32::from_rgb(0xf5, 0x9e, 0x0b), // Amber
+        egui::Color32::from_rgb(0xef, 0x44, 0x44), // Red
+        egui::Color32::from_rgb(0x06, 0xb6, 0xd4), // Cyan
     ];
     let mut h: usize = 0;
     for b in cat.bytes() {
@@ -1099,9 +1131,12 @@ fn draw_insertion_line(
     }
 }
 
-/// Tight bounding rect of a line segment, including its stroke thickness.
+/// Computes the tight axis-aligned bounding rectangle of a line segment, accounting for
+/// stroke thickness. Used to check whether an insertion line would visually collide with
+/// a card rect (via `intersects()`). By including the stroke width in the bounding rect,
+/// we ensure that even thin lines (2px) have a buffer and won't appear to touch adjacent cards.
 fn line_segment_rect(from: egui::Pos2, to: egui::Pos2, stroke_width: f32) -> egui::Rect {
-    let half = stroke_width * 0.5;
+    let half = stroke_width * 0.5; // Expand by half the stroke width on all sides
     egui::Rect::from_min_max(
         (from.min(to)) - egui::vec2(half, half),
         (from.max(to)) + egui::vec2(half, half),
@@ -1150,6 +1185,10 @@ mod layout_tests {
     use super::*;
 
     #[test]
+    /// Verifies that a two-card horizontal layout produces the correct frame rects
+    /// (each card 320x188 px: 300px content + 20px margin) with 12px gap between them.
+    /// This test ensures our card size calculations and spacing constants are correct
+    /// in the actual rendered context.
     fn real_card_rects_and_gaps() {
         let ctx = egui::Context::default();
         let input = egui::RawInput {
@@ -1199,6 +1238,10 @@ mod layout_tests {
     }
 
     #[test]
+    /// Verifies that a multi-card grid layout with calculated column count produces
+    /// correct spacing. Tests both within-row gaps (12px vertically between adjacent cards)
+    /// and between-row gaps (12px horizontally). This ensures the grid layout algorithm
+    /// correctly accounts for available width and produces a responsive layout.
     fn grid_rects_and_gaps() {
         let ctx = egui::Context::default();
         let input = egui::RawInput {
@@ -1407,6 +1450,11 @@ mod layout_tests {
     }
 
     #[test]
+    /// Critical test for drag-and-drop UX: verifies that insertion lines are positioned
+    /// at the true center of gaps and maintain at least 4px clearance from adjacent cards.
+    /// Fails if lines would visually touch or overlap cards, which would confuse the user
+    /// about where the drop would occur. Tests both vertical gaps (between cards in a row)
+    /// and horizontal gaps (between rows).
     fn insertion_line_positions_are_centered_and_clear() {
         // Replicates the exact grid layout and checks that gap_point / line math
         // produces a point centered in the gap with clearance from both cards.
@@ -1566,6 +1614,10 @@ mod layout_tests {
     }
 
     #[test]
+    /// Ensures that when a snippet is saved with an empty category (edge case from
+    /// Editor::blank when categories is empty), the fallback to "Uncategorized" is
+    /// properly registered in the canonical category list. This prevents orphaned
+    /// snippets with undefined categories.
     fn uncategorized_fallback_is_registered_in_categories() {
         let mut app = CopyIt {
             snippets: vec![],
