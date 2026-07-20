@@ -1,8 +1,15 @@
+/// Color themes and visual styling for CopyIt.
+/// Provides 37 selectable color themes, each with custom egui::Visuals for background,
+/// text, panels, buttons, and accent colors. Themes are persisted in config.json
+/// and applied every frame via update().
+
 use eframe::egui;
 use std::fmt;
 use std::str::FromStr;
 
 /// Selectable color themes for CopyIt.
+/// Each theme builds custom egui::Visuals by specifying base colors (background, panel, text, accent)
+/// and using helper functions (mix, themed_widgets, build_visuals) to compute all derived colors consistently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Theme {
     Dark,
@@ -223,6 +230,8 @@ impl FromStr for Theme {
     }
 }
 
+/// Linearly interpolates between two colors. t=0 returns a, t=1 returns b.
+/// Used to compute derived colors (hover, active states) from base colors.
 fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     let r = (a.r() as f32 * (1.0 - t) + b.r() as f32 * t) as u8;
     let g = (a.g() as f32 * (1.0 - t) + b.g() as f32 * t) as u8;
@@ -230,6 +239,9 @@ fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     egui::Color32::from_rgb(r, g, bl)
 }
 
+/// Builds the Widgets style (buttons, text edits, checkboxes) from base colors.
+/// Computes hover and active states by mixing the surface and accent colors,
+/// and ensures interactive elements have consistent visual feedback.
 fn themed_widgets(
     base: &egui::Visuals,
     surface: egui::Color32,
@@ -265,6 +277,10 @@ fn themed_widgets(
     w
 }
 
+/// Constructs a complete egui::Visuals from a theme's base colors.
+/// Takes dark/light mode flag and five colors (background, panel, extreme, accent, text),
+/// then computes all UI element colors (buttons, strokes, selection, hyperlinks) using mix() for consistency.
+/// This is the core builder used by all individual theme functions.
 fn build_visuals(
     dark: bool,
     bg: egui::Color32,
@@ -293,6 +309,11 @@ fn build_visuals(
     v.widgets = themed_widgets(&v, panel, bg, accent, text);
     v
 }
+
+/// Individual theme builders. Each encapsulates a cohesive color palette
+/// (e.g., Nord: polar night + frost + snow storm; Dracula: dark purples + bright accents).
+/// All follow the same pattern: call build_visuals() with dark/light mode and five RGB colors.
+/// Theme colors are sourced from official palette definitions to ensure visual fidelity.
 
 fn dark_theme() -> egui::Visuals {
     build_visuals(

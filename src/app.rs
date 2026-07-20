@@ -4,22 +4,26 @@ use crate::theme::Theme;
 use eframe::egui;
 use std::path::PathBuf;
 
+/// Main application state and UI coordinator.
+/// Maintains the full snippet library, handles search/filter/category logic,
+/// manages the editor modal, drag-and-drop reordering, clipboard operations,
+/// and persists all changes to disk automatically after mutations.
 pub struct CopyIt {
-    snippets: Vec<Snippet>,
-    next_id: u64,
-    path: PathBuf,
-    config_path: PathBuf,
-    categories: Vec<String>,
-    search: String,
-    category_filter: String, // "All" or a specific category
-    theme: Theme,
-    editor: Option<Editor>,
-    copied: Option<(u64, f64)>, // (id, time) for the transient "Copied" state
-    drag: Option<DragState>,
-    adding_header_category: bool,
-    new_header_category: String,
-    category_error: Option<String>,
-    save_error: Option<String>,
+    snippets: Vec<Snippet>,                        // Full snippet library; order is preserved and user-draggable
+    next_id: u64,                                  // Next ID to assign to a new snippet; incremented on creation
+    path: PathBuf,                                 // Path to snippets.json in the stable data directory
+    config_path: PathBuf,                          // Path to config.json (categories + theme selection)
+    categories: Vec<String>,                       // Sorted, deduplicated list of all known categories
+    search: String,                                // Active search query; filters snippets by title/body/category
+    category_filter: String,                       // "All" or a specific category; filters visible snippets
+    theme: Theme,                                  // Currently selected theme; applied to egui visuals each frame
+    editor: Option<Editor>,                        // Modal editor state; None when no editor is open
+    copied: Option<(u64, f64)>,                    // (id, time) for the transient "Copied" feedback (1.2s visibility)
+    drag: Option<DragState>,                       // In-progress drag operation; None when idle
+    adding_header_category: bool,                  // True when the user is typing a new category in the top bar
+    new_header_category: String,                   // Input buffer for the new category name in the top bar
+    category_error: Option<String>,                // Validation error for the new category (e.g., "All" is reserved)
+    save_error: Option<String>,                    // File I/O error message to display at the top
 }
 
 /// Tracks an in-progress drag operation. Initialized when the user clicks on a card,
@@ -126,6 +130,10 @@ fn migrate_legacy_file(new_path: &std::path::Path, filename: &str) {
 }
 
 impl CopyIt {
+    /// Creates a new CopyIt instance on app launch.
+    /// Loads snippets and config from disk (with one-time migration from legacy locations),
+    /// seeds defaults if snippets.json doesn't exist, normalizes all categories, and applies
+    /// the saved theme. Reports any file I/O errors in save_error for display in the UI.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let path = storage::data_path();
         let config_path = storage::config_path();
@@ -176,12 +184,17 @@ impl CopyIt {
         }
     }
 
+    /// Persists the full snippet library to snippets.json in the stable data directory.
+    /// Updates save_error if an I/O error occurs; the error is shown in the top bar.
     fn save_snippets(&mut self) {
         self.save_error = storage::save(&self.path, &self.snippets)
             .err()
             .map(|e| format!("Couldn't save snippets: {e}"));
     }
 
+    /// Persists the config (categories and theme selection) to config.json.
+    /// Separated from snippets.json so snippet data stays backward-compatible.
+    /// Updates save_error if an I/O error occurs.
     fn save_config(&mut self) {
         let config = Config {
             categories: self.categories.clone(),
@@ -258,6 +271,10 @@ impl CopyIt {
         self.save_snippets();
     }
 
+    /// Renders a single snippet card with title, category badge, preview text, Copy and Edit buttons.
+    /// The Copy button shows a "Copied" confirmation for 1.2 seconds after the user clicks it.
+    /// If is_dragged is true, the card is faded out to provide visual feedback during drag-and-drop.
+    /// Returns the frame rect and button responses for drag/click detection.
     fn card(
         &self,
         ui: &mut egui::Ui,
@@ -363,6 +380,11 @@ impl CopyIt {
 }
 
 impl eframe::App for CopyIt {
+    /// Main UI render loop called once per frame.
+    /// Renders the top bar (search, category filter, theme selector, new button),
+    /// the responsive grid of snippet cards, and the editor modal if open.
+    /// Handles all user input: search/filter/category management, copy/edit/delete actions,
+    /// drag-and-drop reordering with visual insertion lines, and theme switching.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let now = ctx.input(|i| i.time);
         let previous_theme = self.theme;
@@ -896,6 +918,8 @@ impl eframe::App for CopyIt {
     }
 }
 
+/// Truncates a string to a maximum number of characters, adding an ellipsis if truncated.
+/// Counts Unicode characters, not bytes, to correctly handle multi-byte characters.
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() > max {
         let t: String = s.chars().take(max.saturating_sub(1)).collect();
@@ -905,11 +929,15 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
+/// Collapses a snippet body into a single-line preview: splits on whitespace, joins with single spaces,
+/// and truncates to max characters. Used to display a short preview in each card.
 fn preview_text(body: &str, max: usize) -> String {
     let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_chars(&collapsed, max)
 }
 
+/// Deterministically maps a category name to a color from a 6-color palette via hashing.
+/// Same category name always maps to the same color. Used to visually distinguish categories in badges.
 fn category_color(cat: &str) -> egui::Color32 {
     let palette = [
         egui::Color32::from_rgb(0x3b, 0x82, 0xf6),
@@ -1099,7 +1127,8 @@ fn draw_insertion_line(
     }
 }
 
-/// Tight bounding rect of a line segment, including its stroke thickness.
+/// Computes a tight bounding rect of a line segment, including its stroke thickness on all sides.
+/// Used to check for visual overlap between the insertion line and adjacent cards during drag-and-drop.
 fn line_segment_rect(from: egui::Pos2, to: egui::Pos2, stroke_width: f32) -> egui::Rect {
     let half = stroke_width * 0.5;
     egui::Rect::from_min_max(
