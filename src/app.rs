@@ -26,32 +26,38 @@ pub struct CopyIt {
     save_error: Option<String>,                    // File I/O error message to display at the top
 }
 
-/// Tracks an in-progress drag operation. Initialized when the user clicks on a card,
+/// Tracks an in-progress drag operation. Initialized when the user clicks and holds on a card,
 /// but remains in a "pre-drag" state until the pointer moves >4px (to avoid accidental
 /// drags from single clicks). Once `dragging` becomes true, visual feedback (insertion
-/// line and ghost box) appears to guide the user to a drop location.
+/// line, ghost box) appears to guide the user to a drop location. The threshold prevents
+/// accidental reordering when the user simply clicks a card to interact with its buttons.
 struct DragState {
-    snippet_id: u64,     // which snippet is being dragged
-    origin_index: usize, // its index in self.snippets at drag start
-    start_pos: egui::Pos2,
-    dragging: bool,      // true only after pointer has moved >4px; prevents accidental drags
+    snippet_id: u64,     // The snippet being dragged (stable ID across reordering)
+    origin_index: usize, // Its index in self.snippets at drag start; used to compute reorder target
+    start_pos: egui::Pos2, // Pointer position at drag initiation; tracks distance for threshold
+    dragging: bool,      // true only after pointer has moved >4px; prevents accidental drags on click
 }
 
 /// Modal editor state for creating or editing a snippet. The `adding_category` and
 /// `new_category` fields track an inline sub-form (entered via the category dropdown)
 /// that lets users add a category without closing the editor. The `confirm_delete`
-/// flag requires a second click to prevent accidental deletions.
+/// flag requires a second click to prevent accidental deletions. This separation of concerns
+/// allows the editor to support category creation inline while keeping the main app's category
+/// list management separate, improving UX for workflows where the user invents a new category mid-edit.
 struct Editor {
-    id: Option<u64>, // None = creating a new snippet; Some(id) = editing existing
+    id: Option<u64>, // None = creating a new snippet; Some(id) = editing existing with this stable ID
     title: String,
     category: String,
-    new_category: String,   // input for inline category creation
+    new_category: String,   // input buffer for inline category creation; cleared when user confirms
     adding_category: bool,   // true when user clicked "+ Add new category" in the dropdown
     body: String,
-    confirm_delete: bool,    // set to true on first "Delete" click; requires second "Confirm delete"
+    confirm_delete: bool,    // set to true on first "Delete" click; requires second "Confirm delete" to prevent accidents
 }
 
 impl Editor {
+    /// Creates a new blank editor state for adding a new snippet.
+    /// Initializes with empty title and body, the first category (or empty string if no categories exist),
+    /// and disables inline category creation and delete confirmation.
     fn blank(categories: &[String]) -> Self {
         Editor {
             id: None,
@@ -64,6 +70,10 @@ impl Editor {
         }
     }
 
+    /// Creates an editor state pre-populated from an existing snippet for editing.
+    /// Loads the snippet's title, body, and category; ensures the category matches one
+    /// from the canonical list (case-insensitive), falling back to the original if no match found.
+    /// Used when the user clicks Edit on a card.
     fn from_snippet(s: &Snippet, categories: &[String]) -> Self {
         let category = categories
             .iter()
@@ -82,23 +92,31 @@ impl Editor {
     }
 }
 
+/// User action triggered from card interaction (Copy or Edit button click).
+/// Used to defer action handling until after UI rendering to avoid borrowing conflicts.
 enum Action {
-    Copy(u64),
-    Edit(u64),
+    Copy(u64),   // User clicked Copy button on a snippet; copy its body to clipboard
+    Edit(u64),   // User clicked Edit button on a snippet; open editor modal
 }
 
+/// Result of the editor modal interaction: whether to save, delete, cancel, or add a new category.
+/// The editor modal handles inline category creation, so AddCategory is returned when the user
+/// creates a new category within the editor and then the main app adds it to the canonical list.
 enum EditorResult {
-    None,
-    Save,
-    Cancel,
-    Delete,
-    AddCategory(String),
+    None,                     // No action (editor still open); keep editor visible
+    Save,                     // User clicked Save in editor; persist changes and close editor
+    Cancel,                   // User clicked Cancel or closed the window; discard changes
+    Delete,                   // User confirmed deletion (second click); remove the snippet
+    AddCategory(String),      // User created a new category in the editor; add to canonical list
 }
 
+/// Layout and response data returned from rendering a single snippet card.
+/// Separates the card frame's bounding rect from the button responses, used for
+/// drag-and-drop interaction detection and click handling.
 struct CardWidgets {
-    frame_rect: egui::Rect,
-    copy: egui::Response,
-    edit: egui::Response,
+    frame_rect: egui::Rect,   // Bounding rectangle of the entire card frame (includes padding)
+    copy: egui::Response,     // Response from the Copy button; checked for clicks
+    edit: egui::Response,     // Response from the Edit button; checked for clicks
 }
 
 /// One-time recovery for users upgrading from earlier versions that stored
@@ -234,13 +252,14 @@ impl CopyIt {
         cat
     }
 
-    /// Moves a snippet from origin_index to a new position in the full list.
+    /// Moves a snippet from origin_index to a new position in the full list, respecting the drag-and-drop
+    /// user's intended placement within the *filtered* (visible) subset.
     /// The `target_filtered_gap` is a gap index into the *filtered* (visible after search/category filter)
     /// subset, but self.snippets is the *full* unfiltered list. This function converts the filtered
     /// gap to an absolute index in self.snippets, accounting for the fact that removing the origin
-    /// shifts indices of everything after it.
-    /// Edge cases: if `target_filtered_gap == filtered.len()`, the card is dropped after the last
-    /// visible card. The adjustment (`t > origin_index ? t - 1 : t`) handles the index shift.
+    /// shifts indices of everything after it. Edge cases: if `target_filtered_gap == filtered.len()`,
+    /// the card is dropped after the last visible card. The adjustment (`t > origin_index ? t - 1 : t`)
+    /// handles the index shift caused by removal. Automatically persists the reordered list to disk.
     fn reorder(&mut self, origin_index: usize, target_filtered_gap: usize, filtered: &[usize]) {
         if filtered.is_empty() {
             return;
@@ -271,10 +290,13 @@ impl CopyIt {
         self.save_snippets();
     }
 
-    /// Renders a single snippet card with title, category badge, preview text, Copy and Edit buttons.
-    /// The Copy button shows a "Copied" confirmation for 1.2 seconds after the user clicks it.
-    /// If is_dragged is true, the card is faded out to provide visual feedback during drag-and-drop.
-    /// Returns the frame rect and button responses for drag/click detection.
+    /// Renders a single snippet card with all visual elements: title (strong, truncated), category badge
+    /// (color-coded), preview text (collapsed to single line), and action buttons (Copy, Edit).
+    /// The Copy button shows a "Copied" confirmation checkmark for 1.2 seconds after the user clicks it.
+    /// If is_dragged is true, the card is faded out (40% opacity) to provide clear visual feedback that
+    /// it is being dragged. The card is 300x168 pixels plus 20px frame padding on each side.
+    /// Returns the frame rect and button responses for subsequent drag/click detection and action dispatch.
+    /// Actions are added to the actions vector (deferred processing) rather than handled immediately.
     fn card(
         &self,
         ui: &mut egui::Ui,
@@ -960,6 +982,7 @@ fn category_color(cat: &str) -> egui::Color32 {
 /// vertical within a row and horizontal between rows). The function computes a representative
 /// point for each gap (via gap_point) and returns the index of the gap whose point is closest
 /// to the current pointer position. This guides the insertion line and drop target.
+/// Returns 0 if the card list is empty (edge case: no cards to reorder against).
 fn nearest_gap(
     pointer: egui::Pos2,
     rects: &[egui::Rect],
