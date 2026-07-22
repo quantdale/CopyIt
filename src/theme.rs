@@ -52,6 +52,7 @@ pub enum Theme {
 }
 
 impl Theme {
+    /// Returns a static slice of all available themes in order. Used to populate the theme selector dropdown.
     pub fn all() -> &'static [Theme] {
         &[
             Theme::Dark,
@@ -94,6 +95,7 @@ impl Theme {
         ]
     }
 
+    /// Generates the complete egui::Visuals color scheme for this theme. Applied to egui context each frame.
     pub fn visuals(self) -> egui::Visuals {
         match self {
             Theme::Dark => dark_theme(),
@@ -137,6 +139,7 @@ impl Theme {
     }
 }
 
+/// Converts a theme to its human-readable display string (e.g., "Solarized Dark"). Used in UI dropdowns and config serialization.
 impl fmt::Display for Theme {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -181,6 +184,7 @@ impl fmt::Display for Theme {
     }
 }
 
+/// Parses a theme name from config.json (case-insensitive, handles underscores/spaces). Returns Err(()) on unknown theme.
 impl FromStr for Theme {
     type Err = ();
 
