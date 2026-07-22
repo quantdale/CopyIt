@@ -23,6 +23,7 @@ pub fn data_dir() -> PathBuf {
     PathBuf::from(".") // Last-resort fallback: current working directory
 }
 
+/// Returns the full path to snippets.json in the stable data directory.
 pub fn data_path() -> PathBuf {
     data_dir().join("snippets.json")
 }
@@ -52,11 +53,13 @@ pub fn legacy_candidate_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// Loads the snippet library from a JSON file. Returns None if the file doesn't exist or is invalid JSON.
 pub fn load(path: &PathBuf) -> Option<Vec<Snippet>> {
     let data = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
 }
 
+/// Persists the snippet library to a JSON file (pretty-printed for human readability).
 pub fn save(path: &PathBuf, snippets: &[Snippet]) -> io::Result<()> {
     let json = serde_json::to_string_pretty(snippets)
         .map_err(io::Error::other)?;
@@ -101,6 +104,8 @@ pub struct Config {
 }
 
 impl Config {
+    /// Initializes config from an existing snippet library: extracts all unique, normalized categories
+    /// and sets the theme to "Dark" by default.
     pub fn from_snippets(snippets: &[Snippet]) -> Self {
         let mut cats: Vec<String> = snippets
             .iter()
@@ -115,6 +120,8 @@ impl Config {
         }
     }
 
+    /// Adds a category to the canonical list if it isn't already present (case-insensitive).
+    /// Normalizes the input, rejects empty strings and "All" (reserved), and keeps the list sorted.
     pub fn add_category(&mut self, raw: &str) {
         let cat = normalize_category(raw);
         if cat.is_empty() || cat.eq_ignore_ascii_case("all") {
@@ -132,11 +139,13 @@ impl Config {
     }
 }
 
+/// Loads user config (categories and theme) from JSON. Returns None if the file doesn't exist or is invalid.
 pub fn load_config(path: &PathBuf) -> Option<Config> {
     let data = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
 }
 
+/// Persists user config (categories and theme) to a JSON file (pretty-printed).
 pub fn save_config(path: &PathBuf, config: &Config) -> io::Result<()> {
     let json = serde_json::to_string_pretty(config)
         .map_err(io::Error::other)?;
