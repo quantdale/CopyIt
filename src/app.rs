@@ -526,6 +526,7 @@ impl eframe::App for CopyIt {
         // ---- Main grid ----
         egui::CentralPanel::default().show(ctx, |ui| {
             let q = self.search.to_lowercase();
+            // Filter snippets by category (if not "All") and search query (case-insensitive across title/body/category)
             let filtered: Vec<usize> = self
                 .snippets
                 .iter()
@@ -552,12 +553,14 @@ impl eframe::App for CopyIt {
             let mut drag_start: Option<(u64, usize, egui::Pos2)> = None;
             let mut hover_cursor: Option<egui::CursorIcon> = None;
 
+            // Card layout: inner content (300x168) + frame padding (20px total) = visible card size
             let card_inner_w = 300.0_f32;
             let card_inner_h = 168.0_f32;
             // The group frame around each card has 10 px inner margin on each side.
             let card_frame_margin = 20.0_f32;
             let card_w = card_inner_w + card_frame_margin;
             let card_h = card_inner_h + card_frame_margin;
+            // Spacing between cards and rows; margin for horizontal scroll area padding
             let spacing = 12.0_f32;
             let top_space = 4.0_f32;
             let margin_x = 18.0_f32;
@@ -606,6 +609,7 @@ impl eframe::App for CopyIt {
                                         let pointer_over_buttons = widgets.copy.hovered()
                                             || widgets.edit.hovered();
 
+                                        // Initiate drag only if: pointer is not over buttons, no active drag, and drag sensor triggered
                                         if drag_resp.drag_started()
                                             && !pointer_over_buttons
                                             && self.drag.is_none()
@@ -749,6 +753,7 @@ impl eframe::App for CopyIt {
                 });
 
         // ---- Editor window (new / edit / delete) ----
+        // Modal editor for creating or modifying snippets; supports inline category creation via the dropdown
         if self.editor.is_some() {
             let mut ed = self.editor.take().unwrap();
             let categories = self.categories.clone();
@@ -886,6 +891,7 @@ impl eframe::App for CopyIt {
 
             match result {
                 EditorResult::Save => {
+                    // Normalize category: ensure it's canonical, fall back to "Uncategorized" if empty
                     let category = {
                         let canonical = self.add_category(&ed.category);
                         if canonical.is_empty() {
@@ -1197,6 +1203,9 @@ fn draw_dashed_line(
     }
 }
 
+/// Unit tests for grid layout and drag-and-drop logic.
+/// Validates that card positioning, gap detection, and insertion line rendering work correctly
+/// across different grid configurations (single and multi-card layouts).
 #[cfg(test)]
 mod layout_tests {
     use super::*;
