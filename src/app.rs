@@ -4,6 +4,14 @@ use crate::theme::Theme;
 use eframe::egui;
 use std::path::PathBuf;
 
+/// Prefix of the banner message for a failed `snippets.json` write. Shared so a later
+/// successful snippet save can retire exactly its own error and nothing else.
+const SNIPPETS_SAVE_ERROR: &str = "Couldn't save snippets";
+/// Prefix of the banner message for a failed `config.json` write.
+const CONFIG_SAVE_ERROR: &str = "Couldn't save settings";
+/// Red used for the warning banner and the delete-confirmation button.
+const WARNING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xef, 0x44, 0x44);
+
 /// Main application state and UI coordinator.
 /// Maintains the full snippet library, handles search/filter/category logic,
 /// manages the editor modal, drag-and-drop reordering, clipboard operations,
@@ -31,11 +39,15 @@ pub struct CopyIt {
 /// drags from single clicks). Once `dragging` becomes true, visual feedback (insertion
 /// line, ghost box) appears to guide the user to a drop location. The threshold prevents
 /// accidental reordering when the user simply clicks a card to interact with its buttons.
+///
+/// Only the stable `snippet_id` is retained — never the index the card had at drag
+/// start. An index captured then and used at drop time would be stale if the library
+/// changed in between (a delete would move the wrong card, or panic on a
+/// now-out-of-bounds `Vec::remove`).
 struct DragState {
-    snippet_id: u64,     // The snippet being dragged (stable ID across reordering)
-    origin_index: usize, // Its index in self.snippets at drag start; used to compute reorder target
+    snippet_id: u64, // The snippet being dragged (stable ID across reordering)
     start_pos: egui::Pos2, // Pointer position at drag initiation; tracks distance for threshold
-    dragging: bool,      // true only after pointer has moved >4px; prevents accidental drags on click
+    dragging: bool, // true only after pointer has moved >4px; prevents accidental drags on click
 }
 
 /// Modal editor state for creating or editing a snippet. The `adding_category` and
@@ -147,6 +159,21 @@ fn migrate_legacy_file(new_path: &std::path::Path, filename: &str) {
     }
 }
 
+/// Builds the banner text for a data file that exists but couldn't be parsed, moving the
+/// original aside first so it is never silently replaced by the seeded defaults.
+fn describe_corrupt_file(path: &std::path::Path, filename: &str, error: &str) -> String {
+    match storage::backup_corrupt(path) {
+        Ok(backup) => format!(
+            "{filename} couldn't be read ({error}). It was kept as {} and the default library was loaded.",
+            backup.display()
+        ),
+        Err(e) => format!(
+            "{filename} couldn't be read ({error}) and couldn't be backed up ({e}). \
+             The default library was loaded — copy the file elsewhere before making changes."
+        ),
+    }
+}
+
 impl CopyIt {
     /// Creates a new CopyIt instance on app launch.
     /// Loads snippets and config from disk (with one-time migration from legacy locations),
@@ -158,28 +185,50 @@ impl CopyIt {
         migrate_legacy_file(&path, "snippets.json");
         migrate_legacy_file(&config_path, "config.json");
 
-        let mut snippets = storage::load(&path).unwrap_or_else(crate::seed::defaults);
+        let mut save_error: Option<String> = None;
+
+        // A file that exists but doesn't parse is *not* a first launch: preserve it
+        // before the seeded defaults claim its name, and tell the user where it went.
+        let (mut snippets, seeded) = match storage::load(&path) {
+            storage::Load::Loaded(snippets) => (snippets, false),
+            storage::Load::Missing => (crate::seed::defaults(), true),
+            storage::Load::Corrupt(e) => {
+                save_error = Some(describe_corrupt_file(&path, "snippets.json", &e));
+                (crate::seed::defaults(), true)
+            }
+        };
         for s in &mut snippets {
-            s.category = storage::normalize_category(&s.category);
+            s.category = storage::canonical_category(&s.category);
         }
 
-        let mut config = storage::load_config(&config_path)
-            .unwrap_or_else(|| Config::from_snippets(&snippets));
+        let mut config = match storage::load_config(&config_path) {
+            storage::Load::Loaded(config) => config,
+            storage::Load::Missing => Config::from_snippets(&snippets),
+            storage::Load::Corrupt(e) => {
+                // Always move the unreadable file aside, even when the banner ends up
+                // showing the snippet-library notice instead of this one.
+                let note = describe_corrupt_file(&config_path, "config.json", &e);
+                // The snippet library is the more important loss; don't bury its notice.
+                if save_error.is_none() {
+                    save_error = Some(note);
+                }
+                Config::from_snippets(&snippets)
+            }
+        };
         for s in &snippets {
             config.add_category(&s.category);
         }
-        let mut save_error: Option<String> = None;
         if let Err(e) = storage::save_config(&config_path, &config) {
-            save_error = Some(format!("Couldn't save settings: {e}"));
+            save_error = Some(format!("{CONFIG_SAVE_ERROR}: {e}"));
         }
 
         let theme = config.theme.parse::<Theme>().unwrap_or(Theme::Dark);
         cc.egui_ctx.set_visuals(theme.visuals());
 
         let next_id = snippets.iter().map(|s| s.id).max().unwrap_or(0) + 1;
-        if !path.exists() {
+        if seeded {
             if let Err(e) = storage::save(&path, &snippets) {
-                save_error = Some(format!("Couldn't save snippets: {e}"));
+                save_error = Some(format!("{SNIPPETS_SAVE_ERROR}: {e}"));
             }
         }
 
@@ -205,9 +254,10 @@ impl CopyIt {
     /// Persists the full snippet library to snippets.json in the stable data directory.
     /// Updates save_error if an I/O error occurs; the error is shown in the top bar.
     fn save_snippets(&mut self) {
-        self.save_error = storage::save(&self.path, &self.snippets)
-            .err()
-            .map(|e| format!("Couldn't save snippets: {e}"));
+        match storage::save(&self.path, &self.snippets) {
+            Ok(()) => self.clear_save_error(SNIPPETS_SAVE_ERROR),
+            Err(e) => self.save_error = Some(format!("{SNIPPETS_SAVE_ERROR}: {e}")),
+        }
     }
 
     /// Persists the config (categories and theme selection) to config.json.
@@ -218,9 +268,23 @@ impl CopyIt {
             categories: self.categories.clone(),
             theme: self.theme.to_string(),
         };
-        self.save_error = storage::save_config(&self.config_path, &config)
-            .err()
-            .map(|e| format!("Couldn't save settings: {e}"));
+        match storage::save_config(&self.config_path, &config) {
+            Ok(()) => self.clear_save_error(CONFIG_SAVE_ERROR),
+            Err(e) => self.save_error = Some(format!("{CONFIG_SAVE_ERROR}: {e}")),
+        }
+    }
+
+    /// Retires the warning banner only when it is reporting a failure of the kind that
+    /// just succeeded. Clearing it unconditionally let an incidental config write (say,
+    /// switching themes) hide the fact that the snippet library still isn't on disk.
+    fn clear_save_error(&mut self, prefix: &str) {
+        if self
+            .save_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(prefix))
+        {
+            self.save_error = None;
+        }
     }
 
     /// Clears the inline category warning as soon as the user starts editing
@@ -236,13 +300,13 @@ impl CopyIt {
     /// canonical form (or an existing match if one collides).
     fn add_category(&mut self, raw: &str) -> String {
         let cat = storage::normalize_category(raw);
-        if cat.is_empty() || cat.eq_ignore_ascii_case("all") {
+        if storage::is_reserved_category(&cat) {
             return String::new();
         }
         if let Some(existing) = self
             .categories
             .iter()
-            .find(|c| c.eq_ignore_ascii_case(&cat))
+            .find(|c| storage::same_category(c, &cat))
         {
             return existing.clone();
         }
@@ -252,18 +316,24 @@ impl CopyIt {
         cat
     }
 
-    /// Moves a snippet from origin_index to a new position in the full list, respecting the drag-and-drop
-    /// user's intended placement within the *filtered* (visible) subset.
+    /// Moves the snippet identified by `snippet_id` to a new position in the full list, respecting
+    /// the drag-and-drop user's intended placement within the *filtered* (visible) subset.
     /// The `target_filtered_gap` is a gap index into the *filtered* (visible after search/category filter)
     /// subset, but self.snippets is the *full* unfiltered list. This function converts the filtered
     /// gap to an absolute index in self.snippets, accounting for the fact that removing the origin
     /// shifts indices of everything after it. Edge cases: if `target_filtered_gap == filtered.len()`,
     /// the card is dropped after the last visible card. The adjustment (`t > origin_index ? t - 1 : t`)
     /// handles the index shift caused by removal. Automatically persists the reordered list to disk.
-    fn reorder(&mut self, origin_index: usize, target_filtered_gap: usize, filtered: &[usize]) {
+    ///
+    /// The origin is looked up by id at drop time rather than trusting an index captured at
+    /// drag start, so a library that changed mid-drag reorders the right card or nothing at all.
+    fn reorder(&mut self, snippet_id: u64, target_filtered_gap: usize, filtered: &[usize]) {
         if filtered.is_empty() {
             return;
         }
+        let Some(origin_index) = self.snippets.iter().position(|s| s.id == snippet_id) else {
+            return; // The dragged snippet is gone (e.g. deleted mid-drag); nothing to move.
+        };
         let snippet = self.snippets.remove(origin_index);
         let target_abs = if target_filtered_gap == 0 {
             let mut t = filtered[0];
@@ -464,13 +534,17 @@ impl eframe::App for CopyIt {
                 }
                 if self.adding_header_category {
                     let previous_category = self.new_header_category.clone();
-                    ui.add(
+                    let input = ui.add(
                         egui::TextEdit::singleline(&mut self.new_header_category)
                             .hint_text("New category")
                             .desired_width(120.0),
                     );
                     self.clear_category_error_on_input_change(&previous_category);
-                    let enter_pressed = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    // Only treat Enter as "submit" when it was typed into *this* field.
+                    // A bare `key_pressed(Enter)` also fired for Enter pressed in the
+                    // search box or the editor modal, submitting behind the user's back.
+                    let enter_pressed =
+                        input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button("Add").clicked() || enter_pressed {
                         let raw = self.new_header_category.trim().to_string();
                         if raw.eq_ignore_ascii_case("all") {
@@ -491,7 +565,7 @@ impl eframe::App for CopyIt {
                         }
                     }
                     if let Some(err) = &self.category_error {
-                        ui.colored_label(egui::Color32::from_rgb(0xef, 0x44, 0x44), err);
+                        ui.colored_label(WARNING_COLOR, err);
                     }
                 }
 
@@ -513,11 +587,20 @@ impl eframe::App for CopyIt {
                     }
                 });
             });
-            if let Some(err) = &self.save_error {
+            if let Some(err) = self.save_error.clone() {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.add_space(16.0);
-                    ui.colored_label(egui::Color32::from_rgb(0xef, 0x44, 0x44), format!("\u{26A0} {err}"));
+                    ui.colored_label(WARNING_COLOR, format!("\u{26A0} {err}"));
+                    // Startup notices (e.g. a recovered corrupt file) are not tied to a
+                    // later successful save, so give the user a way to acknowledge them.
+                    if ui
+                        .small_button("\u{2715}")
+                        .on_hover_text("Dismiss")
+                        .clicked()
+                    {
+                        self.save_error = None;
+                    }
                 });
             }
             ui.add_space(6.0);
@@ -525,7 +608,8 @@ impl eframe::App for CopyIt {
 
         // ---- Main grid ----
         egui::CentralPanel::default().show(ctx, |ui| {
-            let q = self.search.to_lowercase();
+            // Trim so a query of only spaces behaves like an empty one.
+            let q = self.search.trim().to_lowercase();
             // Filter snippets by category (if not "All") and search query (case-insensitive across title/body/category)
             let filtered: Vec<usize> = self
                 .snippets
@@ -542,6 +626,11 @@ impl eframe::App for CopyIt {
                 .collect();
 
             if filtered.is_empty() {
+                // No cards are on screen, so there is nothing to drop onto and the
+                // drag-handling code below is skipped entirely. Abandon any drag now;
+                // leaving one live would wedge `self.drag` as `Some` forever and block
+                // every future drag.
+                self.drag = None;
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| {
                     ui.label(egui::RichText::new("No snippets match.").weak());
@@ -550,7 +639,7 @@ impl eframe::App for CopyIt {
             }
 
             let mut actions: Vec<Action> = Vec::new();
-            let mut drag_start: Option<(u64, usize, egui::Pos2)> = None;
+            let mut drag_start: Option<(u64, egui::Pos2)> = None;
             let mut hover_cursor: Option<egui::CursorIcon> = None;
 
             // Card layout: inner content (300x168) + frame padding (20px total) = visible card size
@@ -615,8 +704,7 @@ impl eframe::App for CopyIt {
                                             && self.drag.is_none()
                                         {
                                             if let Some(pos) = drag_resp.interact_pointer_pos() {
-                                                drag_start =
-                                                    Some((self.snippets[idx].id, idx, pos));
+                                                drag_start = Some((self.snippets[idx].id, pos));
                                             }
                                         }
 
@@ -658,24 +746,21 @@ impl eframe::App for CopyIt {
                     }
 
                     // Start a new drag if requested.
-                    if let Some((id, origin, pos)) = drag_start {
+                    if let Some((id, pos)) = drag_start {
                         self.drag = Some(DragState {
                             snippet_id: id,
-                            origin_index: origin,
                             start_pos: pos,
                             dragging: false,
                         });
                     }
 
-                    // Convert content rects to screen-space for drag visuals / drop testing.
-                    let content_to_screen =
-                        (scroll_output.inner_rect.min - scroll_output.state.offset).to_vec2();
-                    let card_screen_rects: Vec<egui::Rect> = scroll_output
-                        .inner
-                        .1
-                        .iter()
-                        .map(|r| r.translate(content_to_screen))
-                        .collect();
+                    // Card rects collected inside a ScrollArea are ALREADY in screen space:
+                    // the scroll area places its content Ui at `inner_rect.min - offset`, so
+                    // every widget rect below it is absolute and scroll-adjusted. Translating
+                    // them again (by that same origin) shifted all drop geometry down by the
+                    // height of the top bar, and further off with every pixel scrolled — the
+                    // insertion line and the chosen drop slot no longer matched the cursor.
+                    let card_screen_rects: &[egui::Rect] = &scroll_output.inner.1;
                     let grid_area = scroll_output.inner_rect;
                     let cols = scroll_output.inner.0;
 
@@ -689,8 +774,8 @@ impl eframe::App for CopyIt {
                     }
 
                     // Draw drag visuals and handle drop.
-                    let drag_state = self.drag.as_ref().map(|d| (d.dragging, d.origin_index));
-                    if let Some((dragging, origin_index)) = drag_state {
+                    let drag_state = self.drag.as_ref().map(|d| (d.dragging, d.snippet_id));
+                    if let Some((dragging, snippet_id)) = drag_state {
                         let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
                         let pointer_released = ctx.input(|i| i.pointer.primary_released());
                         let pointer_moved = ctx.input(|i| i.pointer.delta().length_sq() > 0.0);
@@ -699,11 +784,11 @@ impl eframe::App for CopyIt {
                             hover_cursor = Some(egui::CursorIcon::Grabbing);
 
                             if let Some(pointer) = pointer_pos {
-                                let gap = nearest_gap(pointer, &card_screen_rects, cols, spacing, card_w);
+                                let gap = nearest_gap(pointer, card_screen_rects, cols, spacing, card_w);
                                 draw_insertion_line(
                                     ctx,
                                     gap,
-                                    &card_screen_rects,
+                                    card_screen_rects,
                                     cols,
                                     spacing,
                                     card_w,
@@ -733,8 +818,8 @@ impl eframe::App for CopyIt {
                                 if let Some(pointer) = pointer_pos {
                                     if grid_area.contains(pointer) {
                                         let gap =
-                                            nearest_gap(pointer, &card_screen_rects, cols, spacing, card_w);
-                                        self.reorder(origin_index, gap, &filtered);
+                                            nearest_gap(pointer, card_screen_rects, cols, spacing, card_w);
+                                        self.reorder(snippet_id, gap, &filtered);
                                     }
                                 }
                                 self.drag = None;
@@ -877,7 +962,7 @@ impl eframe::App for CopyIt {
                                     } else if ui
                                         .button(
                                             egui::RichText::new("\u{26A0} Confirm delete")
-                                                .color(egui::Color32::from_rgb(0xef, 0x44, 0x44)),
+                                                .color(WARNING_COLOR),
                                         )
                                         .clicked()
                                     {
@@ -1049,10 +1134,11 @@ fn gap_point(
     };
 
     // Find the card column whose x-center is closest to the pointer's x position.
+    // `total_cmp` keeps this from panicking if a coordinate is ever NaN.
     let nearest_x = rects
         .iter()
         .map(|r| r.center().x)
-        .min_by(|a, b| (a - pointer.x).abs().partial_cmp(&(b - pointer.x).abs()).unwrap())
+        .min_by(|a, b| (a - pointer.x).abs().total_cmp(&(b - pointer.x).abs()))
         .unwrap_or(rects[0].center().x);
 
     egui::pos2(nearest_x, y)
@@ -1133,7 +1219,11 @@ fn draw_insertion_line(
         // Center the horizontal line on the column of the nearest card to guide the drop location.
         let nearest = rects
             .iter()
-            .min_by(|a, b| (a.center().x - pointer.x).abs().partial_cmp(&(b.center().x - pointer.x).abs()).unwrap())
+            .min_by(|a, b| {
+                (a.center().x - pointer.x)
+                    .abs()
+                    .total_cmp(&(b.center().x - pointer.x).abs())
+            })
             .unwrap_or(&rects[0]);
         let x_center = nearest.center().x;
         let half_len = (card_w * 0.35).min(nearest.width() * 0.5 - clearance);
@@ -1210,25 +1300,19 @@ fn draw_dashed_line(
 mod layout_tests {
     use super::*;
 
-    #[test]
-    fn real_card_rects_and_gaps() {
-        let ctx = egui::Context::default();
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::pos2(0.0, 0.0),
-                egui::vec2(1000.0, 700.0),
-            )),
-            ..Default::default()
-        };
-        let app = CopyIt {
-            snippets: vec![
-                Snippet { id: 1, title: "One".into(), category: "Git".into(), body: "body one".into() },
-                Snippet { id: 2, title: "Two".into(), category: "Git".into(), body: "body two".into() },
-            ],
-            next_id: 3,
-            path: std::path::PathBuf::from("snippets.json"),
-            config_path: std::path::PathBuf::from("config.json"),
-            categories: vec!["Git".into()],
+    /// Builds an app whose data files live in a throwaway temp directory, so tests that
+    /// exercise the auto-save paths never write into the repository or clobber real user data.
+    fn test_app(name: &str, snippets: Vec<Snippet>, categories: Vec<String>) -> CopyIt {
+        let dir = std::env::temp_dir().join(format!("copyit-app-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp data dir");
+        let next_id = snippets.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+        CopyIt {
+            snippets,
+            next_id,
+            path: dir.join("snippets.json"),
+            config_path: dir.join("config.json"),
+            categories,
             search: String::new(),
             category_filter: "All".into(),
             theme: Theme::Dark,
@@ -1239,7 +1323,38 @@ mod layout_tests {
             new_header_category: String::new(),
             category_error: None,
             save_error: None,
+        }
+    }
+
+    fn snippet(id: u64, category: &str) -> Snippet {
+        Snippet {
+            id,
+            title: format!("Snippet {id}"),
+            category: category.to_string(),
+            body: format!("body {id}"),
+        }
+    }
+
+    /// Snippet ids in stored order — the thing drag-and-drop reordering has to get right.
+    fn ids(app: &CopyIt) -> Vec<u64> {
+        app.snippets.iter().map(|s| s.id).collect()
+    }
+
+    #[test]
+    fn real_card_rects_and_gaps() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1000.0, 700.0),
+            )),
+            ..Default::default()
         };
+        let app = test_app(
+            "card-rects",
+            vec![snippet(1, "Git"), snippet(2, "Git")],
+            vec!["Git".into()],
+        );
         let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -1333,14 +1448,7 @@ mod layout_tests {
                             .inner
                     });
                 cols_out = scroll.inner.0;
-                let content_to_screen =
-                    (scroll.inner_rect.min - scroll.state.offset).to_vec2();
-                rects_out = scroll
-                    .inner
-                    .1
-                    .iter()
-                    .map(|r| r.translate(content_to_screen))
-                    .collect();
+                rects_out = scroll.inner.1.clone();
             });
         });
 
@@ -1383,28 +1491,16 @@ mod layout_tests {
             )),
             ..Default::default()
         };
-        let app = CopyIt {
-            snippets: vec![
-                Snippet { id: 1, title: "One".into(), category: "Git".into(), body: "body one".into() },
-                Snippet { id: 2, title: "Two".into(), category: "Git".into(), body: "body two".into() },
-                Snippet { id: 3, title: "Three".into(), category: "Prompt".into(), body: "body three".into() },
-                Snippet { id: 4, title: "Four".into(), category: "Prompt".into(), body: "body four".into() },
+        let app = test_app(
+            "card-grid",
+            vec![
+                snippet(1, "Git"),
+                snippet(2, "Git"),
+                snippet(3, "Prompt"),
+                snippet(4, "Prompt"),
             ],
-            next_id: 5,
-            path: std::path::PathBuf::from("snippets.json"),
-            config_path: std::path::PathBuf::from("config.json"),
-            categories: vec!["Git".into(), "Prompt".into()],
-            search: String::new(),
-            category_filter: "All".into(),
-            theme: Theme::Dark,
-            editor: None,
-            copied: None,
-            drag: None,
-            adding_header_category: false,
-            new_header_category: String::new(),
-            category_error: None,
-            save_error: None,
-        };
+            vec!["Git".into(), "Prompt".into()],
+        );
         let filtered: Vec<usize> = (0..app.snippets.len()).collect();
         let mut rects_out: Vec<egui::Rect> = Vec::new();
         let _ = ctx.run(input, |ctx| {
@@ -1445,9 +1541,7 @@ mod layout_tests {
                             })
                             .inner
                     });
-                let content_to_screen =
-                    (scroll.inner_rect.min - scroll.state.offset).to_vec2();
-                rects_out = scroll.inner.1.iter().map(|r| r.translate(content_to_screen)).collect();
+                rects_out = scroll.inner.1.clone();
                 assert_eq!(scroll.inner.0, 2);
             });
         });
@@ -1527,9 +1621,7 @@ mod layout_tests {
                         (c, rs)
                     });
                 cols = scroll.inner.0;
-                let content_to_screen =
-                    (scroll.inner_rect.min - scroll.state.offset).to_vec2();
-                rects = scroll.inner.1.iter().map(|r| r.translate(content_to_screen)).collect();
+                rects = scroll.inner.1.clone();
             });
         });
 
@@ -1593,23 +1685,11 @@ mod layout_tests {
 
     #[test]
     fn add_category_normalizes_and_dedups() {
-        let mut app = CopyIt {
-            snippets: vec![],
-            next_id: 1,
-            path: std::path::PathBuf::from("snippets.json"),
-            config_path: std::path::PathBuf::from("config.json"),
-            categories: vec!["Git".into(), "Prompt".into()],
-            search: String::new(),
-            category_filter: "All".into(),
-            theme: Theme::Dark,
-            editor: None,
-            copied: None,
-            drag: None,
-            adding_header_category: false,
-            new_header_category: String::new(),
-            category_error: None,
-            save_error: None,
-        };
+        let mut app = test_app(
+            "add-category",
+            vec![],
+            vec!["Git".into(), "Prompt".into()],
+        );
         assert_eq!(app.add_category("  git "), "Git"); // existing, case-insensitive
         assert_eq!(app.add_category("werner"), "Werner"); // new
         assert_eq!(app.add_category("Werner"), "Werner"); // duplicate
@@ -1628,23 +1708,7 @@ mod layout_tests {
 
     #[test]
     fn uncategorized_fallback_is_registered_in_categories() {
-        let mut app = CopyIt {
-            snippets: vec![],
-            next_id: 1,
-            path: std::path::PathBuf::from("snippets.json"),
-            config_path: std::path::PathBuf::from("config.json"),
-            categories: vec![],
-            search: String::new(),
-            category_filter: "All".into(),
-            theme: Theme::Dark,
-            editor: None,
-            copied: None,
-            drag: None,
-            adding_header_category: false,
-            new_header_category: String::new(),
-            category_error: None,
-            save_error: None,
-        };
+        let mut app = test_app("uncategorized", vec![], vec![]);
         // Mirrors the Save-path category resolution in `update()`: a blank
         // `ed.category` (reachable via `Editor::blank` when `categories` is
         // empty) must fall back to "Uncategorized" AND register it.
@@ -1663,25 +1727,11 @@ mod layout_tests {
 
     #[test]
     fn category_error_clears_when_input_changes() {
-        let mut app = CopyIt {
-            snippets: vec![],
-            next_id: 1,
-            path: std::path::PathBuf::from("snippets.json"),
-            config_path: std::path::PathBuf::from("config.json"),
-            categories: vec!["Git".into()],
-            search: String::new(),
-            category_filter: "All".into(),
-            theme: Theme::Dark,
-            editor: None,
-            copied: None,
-            drag: None,
-            adding_header_category: true,
-            new_header_category: "al".into(),
-            category_error: Some(
-                "\"All\" is reserved and can't be used as a category".into(),
-            ),
-            save_error: None,
-        };
+        let mut app = test_app("category-error-clears", vec![], vec!["Git".into()]);
+        app.adding_header_category = true;
+        app.new_header_category = "al".into();
+        app.category_error = Some("\"All\" is reserved and can't be used as a category".into());
+
         let previous = app.new_header_category.clone();
         app.new_header_category.push('l');
         app.clear_category_error_on_input_change(&previous);
@@ -1690,28 +1740,258 @@ mod layout_tests {
 
     #[test]
     fn category_error_lingers_when_input_unchanged() {
-        let mut app = CopyIt {
-            snippets: vec![],
-            next_id: 1,
-            path: std::path::PathBuf::from("snippets.json"),
-            config_path: std::path::PathBuf::from("config.json"),
-            categories: vec!["Git".into()],
-            search: String::new(),
-            category_filter: "All".into(),
-            theme: Theme::Dark,
-            editor: None,
-            copied: None,
-            drag: None,
-            adding_header_category: true,
-            new_header_category: "all".into(),
-            category_error: Some(
-                "\"All\" is reserved and can't be used as a category".into(),
-            ),
-            save_error: None,
-        };
+        let mut app = test_app("category-error-lingers", vec![], vec!["Git".into()]);
+        app.adding_header_category = true;
+        app.new_header_category = "all".into();
+        app.category_error = Some("\"All\" is reserved and can't be used as a category".into());
+
         let previous = app.new_header_category.clone();
         app.clear_category_error_on_input_change(&previous);
         assert!(app.category_error.is_some());
+    }
+
+    /// Regression test for the drag-and-drop hit-testing bug.
+    ///
+    /// Rects harvested from inside a `ScrollArea` are already absolute screen
+    /// coordinates with the scroll offset applied. The drag code used to translate them
+    /// again by `inner_rect.min - state.offset`, so every gap the drop logic compared the
+    /// cursor against sat one top-bar-height too low — and drifted further with every
+    /// pixel scrolled. This pins the coordinate space in both scroll positions.
+    #[test]
+    fn scroll_area_card_rects_are_already_in_screen_space() {
+        let spacing = 12.0_f32;
+        let top_space = 4.0_f32;
+        let margin_x = 18.0_f32;
+
+        for scroll_offset in [0.0_f32, 150.0_f32] {
+            let ctx = egui::Context::default();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1000.0, 400.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                // A top panel makes the CentralPanel start well below y = 0, which is
+                // exactly what the bogus translation was silently adding back in.
+                egui::TopBottomPanel::top("top_probe").show(ctx, |ui| {
+                    ui.add_space(6.0);
+                    ui.heading("CopyIt");
+                    ui.add_space(6.0);
+                });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let scroll = egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .vertical_scroll_offset(scroll_offset)
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                            ui.add_space(top_space);
+                            egui::Frame::none()
+                                .inner_margin(egui::Margin::symmetric(margin_x, 0.0))
+                                .show(ui, |ui| {
+                                    let mut rects = Vec::new();
+                                    for _ in 0..6 {
+                                        let resp = egui::Frame::group(ui.style())
+                                            .inner_margin(egui::Margin::same(10.0))
+                                            .show(ui, |ui| {
+                                                ui.set_width(300.0);
+                                                ui.set_height(168.0);
+                                            });
+                                        rects.push(resp.response.rect);
+                                        ui.add_space(spacing);
+                                    }
+                                    rects
+                                })
+                                .inner
+                        });
+
+                    let rects = &scroll.inner;
+                    assert_eq!(scroll.state.offset.y, scroll_offset);
+
+                    // The untranslated rect already accounts for the panel origin, the
+                    // frame margins, and the scroll offset.
+                    let expected_first = egui::pos2(
+                        scroll.inner_rect.min.x + margin_x,
+                        scroll.inner_rect.min.y + top_space - scroll_offset,
+                    );
+                    assert!(
+                        rects[0].min.distance(expected_first) < 0.1,
+                        "offset {scroll_offset}: first card at {:?}, expected {expected_first:?}",
+                        rects[0].min,
+                    );
+                    // Applying the old translation would have moved the cards away from
+                    // where they are actually painted.
+                    let stale_shift = (scroll.inner_rect.min - scroll.state.offset).to_vec2();
+                    assert!(
+                        stale_shift.length() > 1.0,
+                        "the scenario must be one where the old translation was non-trivial"
+                    );
+                    assert!(
+                        rects[0].translate(stale_shift).min.distance(expected_first) > 1.0,
+                        "offset {scroll_offset}: translating again must be wrong"
+                    );
+
+                    // A pointer parked in the gap between cards 1 and 2 must select gap 2.
+                    let cols = 1;
+                    let pointer = egui::pos2(
+                        rects[0].center().x,
+                        (rects[1].bottom() + rects[2].top()) * 0.5,
+                    );
+                    assert_eq!(
+                        nearest_gap(pointer, rects, cols, spacing, 320.0),
+                        2,
+                        "offset {scroll_offset}: drop target must match the cursor"
+                    );
+
+                    // With the old translation the insertion line was always painted
+                    // `stale_shift` away from the gap it claimed to mark. Once that shift
+                    // exceeds half a row's pitch — which happens as soon as the grid is
+                    // scrolled — the *chosen drop slot* moves too, and the card lands in
+                    // the wrong place.
+                    let shifted: Vec<egui::Rect> =
+                        rects.iter().map(|r| r.translate(stale_shift)).collect();
+                    let row_pitch = rects[1].top() - rects[0].top();
+                    let stale_gap = nearest_gap(pointer, &shifted, cols, spacing, 320.0);
+                    if stale_shift.y.abs() > row_pitch * 0.5 {
+                        assert_ne!(
+                            stale_gap, 2,
+                            "offset {scroll_offset}: the old translation must land on the wrong gap"
+                        );
+                    }
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn reorder_moves_the_dragged_card_within_the_full_list() {
+        let mut app = test_app(
+            "reorder-all",
+            vec![
+                snippet(1, "Git"),
+                snippet(2, "Git"),
+                snippet(3, "Git"),
+                snippet(4, "Git"),
+            ],
+            vec!["Git".into()],
+        );
+        let filtered: Vec<usize> = (0..4).collect();
+
+        // Drop the first card into the gap between cards 2 and 3.
+        app.reorder(1, 2, &filtered);
+        assert_eq!(ids(&app), vec![2, 1, 3, 4]);
+
+        // Drop it past the end.
+        app.reorder(1, 4, &filtered);
+        assert_eq!(ids(&app), vec![2, 3, 4, 1]);
+
+        // Drop it back at the front.
+        app.reorder(1, 0, &filtered);
+        assert_eq!(ids(&app), vec![1, 2, 3, 4]);
+
+        // A gap adjacent to the dragged card itself is a no-op, not an off-by-one.
+        app.reorder(2, 1, &filtered);
+        assert_eq!(ids(&app), vec![1, 2, 3, 4]);
+        app.reorder(2, 2, &filtered);
+        assert_eq!(ids(&app), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn reorder_respects_a_filtered_view_of_the_library() {
+        // Visible cards are ids 1, 3, 5 (indices 0, 2, 4 of the full list).
+        let mut app = test_app(
+            "reorder-filtered",
+            vec![
+                snippet(1, "Git"),
+                snippet(2, "Prompt"),
+                snippet(3, "Git"),
+                snippet(4, "Prompt"),
+                snippet(5, "Git"),
+            ],
+            vec!["Git".into(), "Prompt".into()],
+        );
+        let filtered = vec![0usize, 2, 4];
+
+        // Drag the first visible card (id 1) into the last visible gap.
+        app.reorder(1, 3, &filtered);
+        assert_eq!(ids(&app), vec![2, 3, 4, 5, 1]);
+        // Hidden snippets keep their relative position to their visible neighbours.
+        let visible: Vec<u64> = app
+            .snippets
+            .iter()
+            .filter(|s| s.category == "Git")
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(visible, vec![3, 5, 1]);
+    }
+
+    /// A drag holds only the snippet id, so a library that changed mid-drag can't make the
+    /// drop move the wrong card — or panic on an out-of-bounds `Vec::remove`.
+    #[test]
+    fn reorder_ignores_a_snippet_that_disappeared_mid_drag() {
+        let mut app = test_app(
+            "reorder-missing",
+            vec![snippet(1, "Git"), snippet(2, "Git")],
+            vec!["Git".into()],
+        );
+        app.reorder(99, 0, &[0, 1]);
+        assert_eq!(ids(&app), vec![1, 2]);
+
+        // An empty filtered view has no gaps to drop into either.
+        app.reorder(1, 0, &[]);
+        assert_eq!(ids(&app), vec![1, 2]);
+    }
+
+    /// A successful config write (switching themes, say) must not retire a banner that is
+    /// still reporting an unsaved snippet library.
+    #[test]
+    fn a_successful_save_only_clears_its_own_error() {
+        let mut app = test_app("save-error-scope", vec![snippet(1, "Git")], vec!["Git".into()]);
+
+        app.save_error = Some(format!("{SNIPPETS_SAVE_ERROR}: disk full"));
+        app.save_config();
+        assert_eq!(
+            app.save_error.as_deref(),
+            Some("Couldn't save snippets: disk full"),
+            "a config write must not hide a snippet-save failure"
+        );
+
+        app.save_snippets();
+        assert!(app.save_error.is_none(), "the snippet save clears its own error");
+
+        // Startup notices about recovered data files survive until dismissed.
+        app.save_error = Some("snippets.json couldn't be read".to_string());
+        app.save_snippets();
+        app.save_config();
+        assert!(app.save_error.is_some());
+    }
+
+    /// Saves must be crash-safe: a failed write leaves the previous file intact.
+    #[test]
+    fn saving_replaces_the_library_atomically() {
+        let mut app = test_app(
+            "atomic-save",
+            vec![snippet(1, "Git"), snippet(2, "Git")],
+            vec!["Git".into()],
+        );
+        app.save_snippets();
+        assert!(app.save_error.is_none());
+
+        let dir = app.path.parent().unwrap().to_path_buf();
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+
+        match storage::load(&app.path) {
+            storage::Load::Loaded(snippets) => {
+                assert_eq!(snippets.iter().map(|s| s.id).collect::<Vec<_>>(), vec![1, 2]);
+            }
+            _ => panic!("saved library should load back"),
+        }
     }
 
     /// Regression test: a very long snippet body must not make the editor
