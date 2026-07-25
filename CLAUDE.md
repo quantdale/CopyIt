@@ -15,7 +15,7 @@ cargo build --release   # release exe -> target\release\copyit.exe (windowless G
 cargo run               # debug build; shows a console for println! debugging
 cargo check
 cargo clippy
-cargo test              # runs clean; no automated tests exist yet
+cargo test              # unit tests in src/*.rs (layout, drag/reorder, storage, themes)
 ```
 
 ## Architecture
@@ -37,6 +37,8 @@ Persistence rule: keep UI in `app.rs`, data types in `model.rs`, persistence in 
 - **Running CopyIt locks `target\release\copyit.exe` on Windows.** `cargo clean` / `cargo build --release` then fail with `Access is denied (os error 5)` or `LNK1104`. Close the app first — `Get-Process copyit | Stop-Process` if the window is hidden.
 - **egui is pinned to 0.27.** Do not upgrade without checking for breaking API changes.
 - **Card drag-and-drop** uses an `ui.interact` drag sensor on the whole card. Don't let the copy/edit buttons consume that drag area or clicks will conflict with drag initiation.
+- **Rects gathered inside a `ScrollArea` are already in absolute screen coordinates** (the scroll offset is baked into the content `Ui`'s origin). Never re-translate them by `inner_rect.min - state.offset` — that double-shifts all drag/drop hit-testing. See `AGENTS.md` for the full note.
+- **Data files are written atomically** via `storage::write_atomic`. Don't replace it with `fs::write`, and keep `load`'s `Missing` and `Corrupt` cases distinct — merging them makes seeded defaults silently overwrite a library that merely failed to parse.
 
 ## Storage note
 

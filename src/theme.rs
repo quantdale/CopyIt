@@ -1,7 +1,8 @@
-/// Color themes and visual styling for CopyIt.
-/// Provides 37 selectable color themes, each with custom egui::Visuals for background,
-/// text, panels, buttons, and accent colors. Themes are persisted in config.json
-/// and applied every frame via update().
+//! Color themes and visual styling for CopyIt.
+//!
+//! Provides 37 selectable color themes, each with custom egui::Visuals for background,
+//! text, panels, buttons, and accent colors. Themes are persisted in config.json
+//! and applied every frame via update().
 
 use eframe::egui;
 use std::fmt;
@@ -314,10 +315,10 @@ fn build_visuals(
     v
 }
 
-/// Individual theme builders. Each encapsulates a cohesive color palette
-/// (e.g., Nord: polar night + frost + snow storm; Dracula: dark purples + bright accents).
-/// All follow the same pattern: call build_visuals() with dark/light mode and five RGB colors.
-/// Theme colors are sourced from official palette definitions to ensure visual fidelity.
+// Individual theme builders. Each encapsulates a cohesive color palette
+// (e.g., Nord: polar night + frost + snow storm; Dracula: dark purples + bright accents).
+// All follow the same pattern: call build_visuals() with dark/light mode and five RGB colors.
+// Theme colors are sourced from official palette definitions to ensure visual fidelity.
 
 fn dark_theme() -> egui::Visuals {
     build_visuals(

@@ -41,7 +41,9 @@ CopyIt is a small Windows desktop app for storing scripts and AI prompts as copy
   - Modal editor for adding, editing, and deleting snippets.
   - Drag-and-drop reordering of snippet cards (pointer drag on a card body, not on its buttons).
 - `src/model.rs` — Defines `Snippet { id, title, category, body }`.
-- `src/storage.rs` — `data_dir()` resolves the stable `%APPDATA%\CopyIt` directory (falling back to next-to-the-exe if `APPDATA` isn't set, e.g. non-Windows dev/test). `data_path()`, `load()`, and `save()` handle `snippets.json`; `config_path()`, `load_config()`, and `save_config()` handle `config.json` (canonical categories and theme). `legacy_candidate_dirs()` lists old next-to-exe locations used for one-time migration. Also contains `normalize_category()` for title-casing category strings.
+- `src/storage.rs` — `data_dir()` resolves the stable `%APPDATA%\CopyIt` directory (falling back to next-to-the-exe if `APPDATA` isn't set, e.g. non-Windows dev/test). `data_path()`, `load()`, and `save()` handle `snippets.json`; `config_path()`, `load_config()`, and `save_config()` handle `config.json` (canonical categories and theme). `legacy_candidate_dirs()` lists old next-to-exe locations used for one-time migration. Also contains the category helpers: `normalize_category()` (title-cases), `same_category()` (case-insensitive comparison), `is_reserved_category()` (rejects blank and the reserved `All`), and `canonical_category()` (maps unusable names to `UNCATEGORIZED`).
+  - Both loaders return `Load<T>` — `Loaded` / `Missing` / `Corrupt` — rather than an `Option`. Keep those three cases distinct: collapsing `Corrupt` into `Missing` makes the app seed defaults over a file it merely failed to parse and destroy the user's library on the next save.
+  - Both savers write through `write_atomic()` (temp file in the same directory → `sync_all` → rename). Never write a data file with a plain `fs::write`; a crash mid-write would truncate it.
 - `src/seed.rs` — Initial default snippets (Git helpers and reusable AI prompts).
 - `src/theme.rs` — `Theme` enum and custom `egui::Visuals` for 37 selectable themes.
 
@@ -82,13 +84,15 @@ cargo clippy
 
 ## Testing instructions
 
-The project currently has no automated tests. The standard Cargo test command runs cleanly:
-
 ```powershell
 cargo test
 ```
 
-If you add tests, place unit tests in the relevant `src/*.rs` file under `#[cfg(test)] mod tests`. Consider extracting pure helper functions (search/filter, serialization round-trips, text truncation, category normalization) for testability.
+Unit tests live in the relevant `src/*.rs` file under `#[cfg(test)] mod tests` (`mod layout_tests` in `app.rs`). Coverage today: grid/gap geometry and the scroll-area coordinate space, drag-and-drop reordering (including filtered views and a snippet that vanishes mid-drag), save-error reporting, atomic writes, corrupt-file recovery, category normalization, and theme name round-trips.
+
+Tests that touch the save paths must point `path`/`config_path` at a throwaway temp directory — use the `test_app()` helper in `app.rs`, which does this. A test that leaves them as bare relative filenames writes `snippets.json` into the repository root.
+
+`CI` runs `cargo clippy --all-targets -- -D warnings`, so any new clippy warning fails the build.
 
 ## Data and storage behavior
 
@@ -106,8 +110,9 @@ If you add tests, place unit tests in the relevant `src/*.rs` file under `#[cfg(
   ]
   ```
 
-- Saves are automatic after every add, edit, delete, or drag-and-drop reorder.
-- Categories are normalized to title-case (e.g., `git` and `GIT` both become `Git`) and stored as a sorted, deduplicated list in `config.json`.
+- Saves are automatic after every add, edit, delete, or drag-and-drop reorder, and are atomic: the JSON is written to a temporary file in the same directory, flushed, and only then renamed over the real one. A crash, power loss, or full disk part-way through a save leaves the previous file intact instead of a truncated one.
+- A data file that exists but doesn't parse is **not** treated as a first launch. It is renamed to `<name>.corrupt` (preserving the bytes for hand-recovery), the defaults are loaded, and the warning banner tells the user where the original went. An empty (zero-byte) file counts as absent, since it holds nothing to lose.
+- Categories are normalized to title-case (e.g., `git` and `GIT` both become `Git`) and stored as a sorted, deduplicated list in `config.json`. Blank categories and the reserved `All` are mapped to `Uncategorized` on load, so a hand-edited `"category": ""` can't produce a badge that no filter entry selects.
 
 ## Security considerations
 
@@ -135,4 +140,6 @@ If you add tests, place unit tests in the relevant `src/*.rs` file under `#[cfg(
 
 - `CopyIt` implements `eframe::App`, which already defines a `save(&mut self, _storage: &mut dyn Storage)` method. Do not add an inherent method named `save` on `CopyIt`; it will shadow the trait method and break compilation. Use descriptive names such as `save_snippets` and `save_config` for application-level persistence, as the current code does.
 - Card drag-and-drop is handled by an `ui.interact` drag sensor on the whole card. Be careful not to make the copy or edit buttons consume that drag area, or drag initiation will conflict with button clicks.
+- **Widget rects collected inside a `ScrollArea` are already absolute screen coordinates**, with the scroll offset baked in — `ScrollArea` places its content `Ui` at `inner_rect.min - state.offset`, so everything below inherits that origin. Do **not** translate them by `inner_rect.min - state.offset` to "convert them to screen space": that double-counts the origin and shifts all drop geometry by the height of the top bar, drifting further with every pixel scrolled. Compare them against `ctx.input(|i| i.pointer.interact_pos())` directly. `layout_tests::scroll_area_card_rects_are_already_in_screen_space` pins this down.
+- The drag state stores only the dragged snippet's stable `id`, never the index its card had at drag start. `reorder()` resolves the index by id at drop time, so a library that changed mid-drag reorders the right card or nothing at all instead of moving the wrong one (or panicking in `Vec::remove`).
 - **Running CopyIt locks the release executable on Windows.** A release build hardlinks `target\release\deps\copyit.exe` to `target\release\copyit.exe`. While CopyIt is running, Windows keeps that executable image locked, so `cargo clean` or `cargo build --release` may fail with `Access is denied. (os error 5)` or `LINK : fatal error LNK1104: cannot open file '...\target\release\deps\copyit.exe'`. Close any running CopyIt window before rebuilding. If the window is hidden or minimized, find the process in Task Manager or with `Get-Process copyit | Stop-Process` in PowerShell, then retry the build.
