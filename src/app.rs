@@ -11,6 +11,88 @@ const SNIPPETS_SAVE_ERROR: &str = "Couldn't save snippets";
 const CONFIG_SAVE_ERROR: &str = "Couldn't save settings";
 /// Red used for the warning banner and the delete-confirmation button.
 const WARNING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xef, 0x44, 0x44);
+/// Characters of a snippet body shown in a card's preview line.
+const PREVIEW_CHARS: usize = 220;
+
+// ---- Card grid geometry ----
+// The grid is uniform, and both the renderer and the drag-and-drop hit-testing derive
+// card positions from these numbers, so they live in one place.
+/// Width of a card's inner content area.
+const CARD_INNER_W: f32 = 300.0;
+/// Height of a card's inner content area.
+const CARD_INNER_H: f32 = 168.0;
+/// The group frame around each card adds 10 px of inner margin on each side.
+const CARD_FRAME_MARGIN: f32 = 20.0;
+/// Full visible width of a card, frame included.
+const CARD_W: f32 = CARD_INNER_W + CARD_FRAME_MARGIN;
+/// Full visible height of a card, frame included.
+const CARD_H: f32 = CARD_INNER_H + CARD_FRAME_MARGIN;
+/// Gap between neighbouring cards, horizontally and vertically.
+const CARD_SPACING: f32 = 12.0;
+/// Vertical distance from the top of one row of cards to the top of the next.
+const ROW_PITCH: f32 = CARD_H + CARD_SPACING;
+/// Blank space above the first row inside the scroll area.
+const GRID_TOP_SPACE: f32 = 4.0;
+/// Horizontal padding on both sides of the grid.
+const GRID_MARGIN_X: f32 = 18.0;
+
+/// Per-snippet data derived from the snippet's own text: the lowercase forms the
+/// search filter matches against, and the collapsed one-line card preview.
+///
+/// These used to be recomputed inside the render loop, which meant lowercasing
+/// every snippet body and re-collapsing every visible preview on *every* frame —
+/// egui repaints on each mouse move, so a large library re-walked all of its text
+/// dozens of times a second. They only change when a snippet changes, so they are
+/// cached here and rebuilt by [`CopyIt::rebuild_derived`].
+struct Derived {
+    title_lower: String,
+    category_lower: String,
+    body_lower: String,
+    preview: String,
+}
+
+impl Derived {
+    fn new(s: &Snippet) -> Self {
+        Derived {
+            title_lower: s.title.to_lowercase(),
+            category_lower: s.category.to_lowercase(),
+            body_lower: s.body.to_lowercase(),
+            preview: preview_text(&s.body, PREVIEW_CHARS),
+        }
+    }
+
+    /// True when the snippet matches an already-lowercased, already-trimmed query.
+    fn matches(&self, query_lower: &str) -> bool {
+        self.title_lower.contains(query_lower)
+            || self.body_lower.contains(query_lower)
+            || self.category_lower.contains(query_lower)
+    }
+}
+
+/// Memoized result of the search/category filter: the indices into `snippets` of
+/// the cards that are currently visible, plus the inputs they were computed from.
+///
+/// The filter only has to run when the query, the category selection, or the
+/// library itself changes. Without this the grid rebuilt the whole index list —
+/// scanning every snippet's title, body and category — on every repaint.
+#[derive(Default)]
+struct FilterCache {
+    indices: Vec<usize>,
+    search: String,
+    category: String,
+    generation: u64,
+    valid: bool,
+}
+
+impl FilterCache {
+    /// True when the cached indices still describe the given inputs.
+    fn is_current(&self, search: &str, category: &str, generation: u64) -> bool {
+        self.valid
+            && self.generation == generation
+            && self.search == search
+            && self.category == category
+    }
+}
 
 /// Main application state and UI coordinator.
 /// Maintains the full snippet library, handles search/filter/category logic,
@@ -18,6 +100,9 @@ const WARNING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xef, 0x44, 0x44);
 /// and persists all changes to disk automatically after mutations.
 pub struct CopyIt {
     snippets: Vec<Snippet>,                        // Full snippet library; order is preserved and user-draggable
+    derived: Vec<Derived>,                         // Cached lowercase text + card preview, one entry per snippet (same order)
+    generation: u64,                               // Bumped whenever `snippets`/`derived` change; invalidates the filter cache
+    filter: FilterCache,                           // Memoized indices of the snippets visible under the current search/category
     next_id: u64,                                  // Next ID to assign to a new snippet; incremented on creation
     path: PathBuf,                                 // Path to snippets.json in the stable data directory
     config_path: PathBuf,                          // Path to config.json (categories + theme selection)
@@ -215,9 +300,7 @@ impl CopyIt {
                 Config::from_snippets(&snippets)
             }
         };
-        for s in &snippets {
-            config.add_category(&s.category);
-        }
+        config.add_categories(snippets.iter().map(|s| s.category.as_str()));
         if let Err(e) = storage::save_config(&config_path, &config) {
             save_error = Some(format!("{CONFIG_SAVE_ERROR}: {e}"));
         }
@@ -232,8 +315,13 @@ impl CopyIt {
             }
         }
 
+        let derived = snippets.iter().map(Derived::new).collect();
+
         Self {
             snippets,
+            derived,
+            generation: 0,
+            filter: FilterCache::default(),
             next_id,
             path,
             config_path,
@@ -249,6 +337,78 @@ impl CopyIt {
             category_error: None,
             save_error,
         }
+    }
+
+    /// Recomputes the per-snippet derived text caches and invalidates the filter cache.
+    /// Called from [`Self::snippets_changed`] after every mutation of `snippets`, which is
+    /// what keeps `derived` index-aligned with `snippets`.
+    fn rebuild_derived(&mut self) {
+        self.derived.clear();
+        self.derived.reserve(self.snippets.len());
+        self.derived.extend(self.snippets.iter().map(Derived::new));
+        self.generation = self.generation.wrapping_add(1);
+        self.filter.valid = false;
+    }
+
+    /// The single entry point for "the library changed": refreshes the derived caches
+    /// and persists the new library. Every add/edit/delete/reorder goes through here, so
+    /// `derived` can never drift out of sync with `snippets`.
+    fn snippets_changed(&mut self) {
+        self.rebuild_derived();
+        self.save_snippets();
+    }
+
+    /// Returns the indices of the snippets visible under the current search and
+    /// category filter, recomputing them only when one of the inputs (or the library)
+    /// has changed. Ownership of the buffer is handed to the caller for the rest of the
+    /// frame so the render loop can borrow `self` mutably; [`Self::restore_filtered`]
+    /// puts it back, keeping its allocation for the next frame.
+    fn take_filtered(&mut self) -> Vec<usize> {
+        if !self
+            .filter
+            .is_current(&self.search, &self.category_filter, self.generation)
+        {
+            // Trim so a query of only spaces behaves like an empty one.
+            let query = self.search.trim().to_lowercase();
+            let all_categories = self.category_filter == "All";
+            let category = self.category_filter.as_str();
+            let snippets = &self.snippets;
+
+            let mut indices = std::mem::take(&mut self.filter.indices);
+            indices.clear();
+            indices.extend(
+                self.derived
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, d)| {
+                        (all_categories || snippets[*i].category == category)
+                            && (query.is_empty() || d.matches(&query))
+                    })
+                    .map(|(i, _)| i),
+            );
+
+            self.filter.indices = indices;
+            self.filter.search.clear();
+            self.filter.search.push_str(&self.search);
+            self.filter.category.clear();
+            self.filter.category.push_str(&self.category_filter);
+            self.filter.generation = self.generation;
+        }
+        // The cache is only trusted while it actually holds the buffer: marking it
+        // invalid on the way out means a second `take_filtered` before the matching
+        // restore recomputes, instead of handing back an empty (i.e. "no cards") list.
+        self.filter.valid = false;
+        std::mem::take(&mut self.filter.indices)
+    }
+
+    /// Returns the buffer handed out by [`Self::take_filtered`] so its allocation is
+    /// reused next frame. A mutation later in the same frame bumps `generation`, which
+    /// makes the restored indices stale-checked (not trusted) on the following frame.
+    fn restore_filtered(&mut self, filtered: Vec<usize>) {
+        self.filter.indices = filtered;
+        // Trustworthy again — `is_current` still re-checks the query, the category and
+        // the generation, so a mutation made later in this frame invalidates it anyway.
+        self.filter.valid = true;
     }
 
     /// Persists the full snippet library to snippets.json in the stable data directory.
@@ -357,7 +517,7 @@ impl CopyIt {
         };
         let target_abs = target_abs.min(self.snippets.len());
         self.snippets.insert(target_abs, snippet);
-        self.save_snippets();
+        self.snippets_changed();
     }
 
     /// Renders a single snippet card with all visual elements: title (strong, truncated), category badge
@@ -377,7 +537,20 @@ impl CopyIt {
         is_dragged: bool,
     ) -> CardWidgets {
         let s = &self.snippets[idx];
-        let card_h = 168.0;
+        let card_h = CARD_INNER_H;
+
+        // The preview is cached per snippet; fall back to computing it only if the
+        // caches somehow got out of step, so a stale index can never panic or blank
+        // a card in a release build.
+        debug_assert_eq!(self.derived.len(), self.snippets.len());
+        let fallback_preview;
+        let preview: &str = match self.derived.get(idx) {
+            Some(d) => &d.preview,
+            None => {
+                fallback_preview = preview_text(&s.body, PREVIEW_CHARS);
+                &fallback_preview
+            }
+        };
 
         if is_dragged {
             ui.set_opacity(0.4);
@@ -450,7 +623,7 @@ impl CopyIt {
                             }
                             ui.add_space(4.0);
                             ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                                ui.label(egui::RichText::new(preview_text(&s.body, 220)).weak());
+                                ui.label(egui::RichText::new(preview).weak());
                             });
                             resp
                         })
@@ -469,6 +642,123 @@ impl CopyIt {
         let (copy, edit) = frame.inner;
         CardWidgets { frame_rect, copy, edit }
     }
+
+    /// Lays out the responsive card grid inside the scroll area and returns the column
+    /// count together with the screen-space rect of *every* filtered card.
+    ///
+    /// Only the rows that intersect the viewport (plus one row of overscan) are actually
+    /// built; the rest are replaced by blank space of exactly the same height. A library
+    /// of hundreds of snippets used to construct every card — text layout, galleys,
+    /// interaction ids — on every repaint, including the ones scrolled far out of sight.
+    ///
+    /// The returned rects cover the skipped cards too: the grid is uniform, so their
+    /// geometry is computed from the grid origin rather than harvested from the layout.
+    /// Drag-and-drop therefore still sees the whole grid and can drop onto an off-screen
+    /// gap exactly as before. Card rects are already in absolute screen space (see the
+    /// note in `update`), so they need no further translation.
+    ///
+    /// Collected interactions are appended to `actions` / `drag_start` / `hover_cursor`
+    /// instead of being applied here, so the caller can act on them once the grid's
+    /// borrow of `self` has ended.
+    fn card_grid(
+        &self,
+        ui: &mut egui::Ui,
+        filtered: &[usize],
+        now: f64,
+        actions: &mut Vec<Action>,
+        drag_start: &mut Option<(u64, egui::Pos2)>,
+        hover_cursor: &mut Option<egui::CursorIcon>,
+    ) -> (usize, Vec<egui::Rect>) {
+        egui::Frame::none()
+            .inner_margin(egui::Margin::symmetric(GRID_MARGIN_X, 0.0))
+            .show(ui, |ui| {
+                let avail = ui.available_width();
+                let cols = ((avail / (CARD_W + CARD_SPACING)).floor() as usize).max(1);
+
+                let origin = ui.cursor().min;
+                let rows = filtered.len().div_ceil(cols);
+                let card_rects: Vec<egui::Rect> = (0..filtered.len())
+                    .map(|i| grid_card_rect(i, cols, origin, CARD_W, CARD_H, CARD_SPACING))
+                    .collect();
+
+                let (first_row, last_row) =
+                    visible_rows(ui.clip_rect(), origin.y, ROW_PITCH, rows);
+                // Reserve the height of the rows above the viewport.
+                if first_row > 0 {
+                    ui.add_space(first_row as f32 * ROW_PITCH);
+                }
+
+                for row_start in (first_row..=last_row).map(|r| r * cols) {
+                    let row_end = (row_start + cols).min(filtered.len());
+                    let row = &filtered[row_start..row_end];
+                    // Key each row's widget ids on the row itself. egui otherwise derives
+                    // them from a per-parent counter, which would make every id inside the
+                    // grid depend on how many rows above the viewport were skipped — so a
+                    // card's buttons would change identity as the user scrolled.
+                    ui.push_id(row_start, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                            for (row_offset, &idx) in row.iter().enumerate() {
+                                let is_dragged = self.drag.as_ref().is_some_and(|d| {
+                                    d.dragging && d.snippet_id == self.snippets[idx].id
+                                });
+
+                                let drag_id = ui.id().with("card_drag").with(idx);
+                                let expected_rect = egui::Rect::from_min_size(
+                                    ui.cursor().min,
+                                    egui::vec2(CARD_W, CARD_H),
+                                );
+                                let drag_resp =
+                                    ui.interact(expected_rect, drag_id, egui::Sense::drag());
+
+                                let widgets =
+                                    self.card(ui, idx, CARD_INNER_W, now, actions, is_dragged);
+
+                                debug_assert!(
+                                    card_rects
+                                        .get(row_start + row_offset)
+                                        .is_some_and(|r| r.min.distance(widgets.frame_rect.min)
+                                            < 0.5),
+                                    "computed card rect must match the rendered one"
+                                );
+
+                                let pointer_over_buttons =
+                                    widgets.copy.hovered() || widgets.edit.hovered();
+
+                                // Initiate drag only if: pointer is not over buttons, no active drag, and drag sensor triggered
+                                if drag_resp.drag_started()
+                                    && !pointer_over_buttons
+                                    && self.drag.is_none()
+                                {
+                                    if let Some(pos) = drag_resp.interact_pointer_pos() {
+                                        *drag_start = Some((self.snippets[idx].id, pos));
+                                    }
+                                }
+
+                                if drag_resp.hovered()
+                                    && self.drag.is_none()
+                                    && !pointer_over_buttons
+                                {
+                                    *hover_cursor = Some(egui::CursorIcon::Grab);
+                                }
+
+                                ui.add_space(CARD_SPACING);
+                            }
+                        });
+                    });
+                    ui.add_space(CARD_SPACING);
+                }
+
+                // Reserve the height of the rows below the viewport, so the scrollbar
+                // still spans the whole library.
+                if last_row + 1 < rows {
+                    ui.add_space((rows - 1 - last_row) as f32 * ROW_PITCH);
+                }
+
+                (cols, card_rects)
+            })
+            .inner
+    }
 }
 
 impl eframe::App for CopyIt {
@@ -480,7 +770,10 @@ impl eframe::App for CopyIt {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let now = ctx.input(|i| i.time);
         let previous_theme = self.theme;
-        ctx.set_visuals(self.theme.visuals());
+        // The visuals are *not* rebuilt here every frame: `Theme::visuals()` constructs a
+        // whole `egui::Visuals` (and `set_visuals` clones the context style) for a value
+        // that only changes when the user picks a different theme. `CopyIt::new` applies
+        // the loaded theme once, and the theme selector below re-applies it on change.
 
         // ---- Top bar: search, category filter, theme selector, new ----
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -503,7 +796,7 @@ impl eframe::App for CopyIt {
                 let mut filter_selected = self.category_filter.clone();
                 let mut start_adding_category = false;
                 egui::ComboBox::from_id_source("cat_filter")
-                    .selected_text(self.category_filter.clone())
+                    .selected_text(self.category_filter.as_str())
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut filter_selected, "All".to_string(), "All");
                         for c in &self.categories {
@@ -571,13 +864,17 @@ impl eframe::App for CopyIt {
 
                 ui.add_space(12.0);
                 egui::ComboBox::from_id_source("theme_select")
-                    .selected_text(self.theme.to_string())
+                    .selected_text(self.theme.name())
                     .show_ui(ui, |ui| {
                         for t in Theme::all() {
-                            ui.selectable_value(&mut self.theme, *t, t.to_string());
+                            ui.selectable_value(&mut self.theme, *t, t.name());
                         }
                     });
                 if self.theme != previous_theme {
+                    ctx.set_visuals(self.theme.visuals());
+                    // The top bar above has already been painted with the old visuals, so
+                    // ask for one more frame to redraw everything with the new ones.
+                    ctx.request_repaint();
                     self.save_config();
                 }
 
@@ -587,8 +884,11 @@ impl eframe::App for CopyIt {
                     }
                 });
             });
-            if let Some(err) = self.save_error.clone() {
+            // Borrow the message instead of cloning it every frame; the dismiss click is
+            // recorded in a local and applied after the closure releases the borrow.
+            if let Some(err) = self.save_error.as_deref() {
                 ui.add_space(4.0);
+                let mut dismissed = false;
                 ui.horizontal(|ui| {
                     ui.add_space(16.0);
                     ui.colored_label(WARNING_COLOR, format!("\u{26A0} {err}"));
@@ -599,32 +899,23 @@ impl eframe::App for CopyIt {
                         .on_hover_text("Dismiss")
                         .clicked()
                     {
-                        self.save_error = None;
+                        dismissed = true;
                     }
                 });
+                if dismissed {
+                    self.save_error = None;
+                }
             }
             ui.add_space(6.0);
         });
 
         // ---- Main grid ----
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Trim so a query of only spaces behaves like an empty one.
-            let q = self.search.trim().to_lowercase();
-            // Filter snippets by category (if not "All") and search query (case-insensitive across title/body/category)
-            let filtered: Vec<usize> = self
-                .snippets
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| {
-                    (self.category_filter == "All" || s.category == self.category_filter)
-                        && (q.is_empty()
-                            || s.title.to_lowercase().contains(&q)
-                            || s.body.to_lowercase().contains(&q)
-                            || s.category.to_lowercase().contains(&q))
-                })
-                .map(|(i, _)| i)
-                .collect();
+        // Visible-card indices come from the memoized filter: the scan over every
+        // snippet's title/body/category only reruns when the query, the category
+        // selection, or the library itself changes — not on every repaint.
+        let filtered = self.take_filtered();
 
+        egui::CentralPanel::default().show(ctx, |ui| {
             if filtered.is_empty() {
                 // No cards are on screen, so there is nothing to drop onto and the
                 // drag-handling code below is skipped entirely. Abandon any drag now;
@@ -642,88 +933,19 @@ impl eframe::App for CopyIt {
             let mut drag_start: Option<(u64, egui::Pos2)> = None;
             let mut hover_cursor: Option<egui::CursorIcon> = None;
 
-            // Card layout: inner content (300x168) + frame padding (20px total) = visible card size
-            let card_inner_w = 300.0_f32;
-            let card_inner_h = 168.0_f32;
-            // The group frame around each card has 10 px inner margin on each side.
-            let card_frame_margin = 20.0_f32;
-            let card_w = card_inner_w + card_frame_margin;
-            let card_h = card_inner_h + card_frame_margin;
-            // Spacing between cards and rows; margin for horizontal scroll area padding
-            let spacing = 12.0_f32;
-            let top_space = 4.0_f32;
-            let margin_x = 18.0_f32;
-
             let scroll_output = egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                    ui.add_space(top_space);
-
-                    egui::Frame::none()
-                        .inner_margin(egui::Margin::symmetric(margin_x, 0.0))
-                        .show(ui, |ui| {
-                            let avail = ui.available_width();
-                            let cols =
-                                ((avail / (card_w + spacing)).floor() as usize).max(1);
-
-                            let mut card_content_rects: Vec<egui::Rect> =
-                                Vec::with_capacity(filtered.len());
-
-                            for row in filtered.chunks(cols) {
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                                    for &idx in row.iter() {
-                                        let is_dragged = self.drag.as_ref().is_some_and(|d| {
-                                            d.dragging && d.snippet_id == self.snippets[idx].id
-                                        });
-
-                                        let drag_id = ui.id().with("card_drag").with(idx);
-                                        let expected_rect = egui::Rect::from_min_size(
-                                            ui.cursor().min,
-                                            egui::vec2(card_w, card_h),
-                                        );
-                                        let drag_resp = ui.interact(
-                                            expected_rect,
-                                            drag_id,
-                                            egui::Sense::drag(),
-                                        );
-
-                                        let widgets = self.card(
-                                            ui, idx, card_inner_w, now, &mut actions, is_dragged,
-                                        );
-
-                                        card_content_rects.push(widgets.frame_rect);
-
-                                        let pointer_over_buttons = widgets.copy.hovered()
-                                            || widgets.edit.hovered();
-
-                                        // Initiate drag only if: pointer is not over buttons, no active drag, and drag sensor triggered
-                                        if drag_resp.drag_started()
-                                            && !pointer_over_buttons
-                                            && self.drag.is_none()
-                                        {
-                                            if let Some(pos) = drag_resp.interact_pointer_pos() {
-                                                drag_start = Some((self.snippets[idx].id, pos));
-                                            }
-                                        }
-
-                                        if drag_resp.hovered()
-                                            && self.drag.is_none()
-                                            && !pointer_over_buttons
-                                        {
-                                            hover_cursor = Some(egui::CursorIcon::Grab);
-                                        }
-
-                                        ui.add_space(spacing);
-                                    }
-                                });
-                                ui.add_space(spacing);
-                            }
-
-                            (cols, card_content_rects)
-                        })
-                        .inner
+                    ui.add_space(GRID_TOP_SPACE);
+                    self.card_grid(
+                        ui,
+                        &filtered,
+                        now,
+                        &mut actions,
+                        &mut drag_start,
+                        &mut hover_cursor,
+                    )
                 });
 
                     // Process normal click actions.
@@ -784,21 +1006,21 @@ impl eframe::App for CopyIt {
                             hover_cursor = Some(egui::CursorIcon::Grabbing);
 
                             if let Some(pointer) = pointer_pos {
-                                let gap = nearest_gap(pointer, card_screen_rects, cols, spacing, card_w);
+                                let gap = nearest_gap(pointer, card_screen_rects, cols, CARD_SPACING, CARD_W);
                                 draw_insertion_line(
                                     ctx,
                                     gap,
                                     card_screen_rects,
                                     cols,
-                                    spacing,
-                                    card_w,
-                                    card_h,
+                                    CARD_SPACING,
+                                    CARD_W,
+                                    CARD_H,
                                 );
 
                                 // Hollow ghost box following the cursor.
                                 let ghost_rect = egui::Rect::from_min_size(
                                     pointer + egui::vec2(8.0, 8.0),
-                                    egui::vec2(card_w, card_h),
+                                    egui::vec2(CARD_W, CARD_H),
                                 );
                                 let painter = ctx.layer_painter(egui::LayerId::new(
                                     egui::Order::Tooltip,
@@ -818,7 +1040,7 @@ impl eframe::App for CopyIt {
                                 if let Some(pointer) = pointer_pos {
                                     if grid_area.contains(pointer) {
                                         let gap =
-                                            nearest_gap(pointer, card_screen_rects, cols, spacing, card_w);
+                                            nearest_gap(pointer, card_screen_rects, cols, CARD_SPACING, CARD_W);
                                         self.reorder(snippet_id, gap, &filtered);
                                     }
                                 }
@@ -837,11 +1059,16 @@ impl eframe::App for CopyIt {
                     }
                 });
 
+        // Hand the index buffer back so its allocation is reused next frame.
+        self.restore_filtered(filtered);
+
         // ---- Editor window (new / edit / delete) ----
         // Modal editor for creating or modifying snippets; supports inline category creation via the dropdown
         if self.editor.is_some() {
             let mut ed = self.editor.take().unwrap();
-            let categories = self.categories.clone();
+            // Borrowed, not cloned: the whole category list used to be duplicated on
+            // every frame the editor was open.
+            let categories = &self.categories;
             let mut window_open = true;
             let mut result = EditorResult::None;
             let title = if ed.id.is_some() {
@@ -891,7 +1118,7 @@ impl eframe::App for CopyIt {
                                 .width(180.0)
                                 .selected_text(display)
                                 .show_ui(ui, |ui| {
-                                    for c in &categories {
+                                    for c in categories {
                                         ui.selectable_value(&mut selected, c.clone(), c);
                                     }
                                     ui.selectable_value(
@@ -990,7 +1217,9 @@ impl eframe::App for CopyIt {
                         if let Some(s) = self.snippets.iter_mut().find(|s| s.id == id) {
                             s.title = title;
                             s.category = category;
-                            s.body = ed.body.clone();
+                            // The editor is closing, so its buffer can be moved
+                            // instead of copied — snippet bodies can be large.
+                            s.body = std::mem::take(&mut ed.body);
                         }
                     } else {
                         let id = self.next_id;
@@ -999,15 +1228,15 @@ impl eframe::App for CopyIt {
                             id,
                             title,
                             category,
-                            body: ed.body.clone(),
+                            body: std::mem::take(&mut ed.body),
                         });
                     }
-                    self.save_snippets();
+                    self.snippets_changed();
                 }
                 EditorResult::Delete => {
                     if let Some(id) = ed.id {
                         self.snippets.retain(|s| s.id != id);
-                        self.save_snippets();
+                        self.snippets_changed();
                     }
                 }
                 EditorResult::Cancel => {}
@@ -1035,8 +1264,9 @@ impl eframe::App for CopyIt {
 /// Counts Unicode characters, not bytes, to correctly handle multi-byte characters.
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() > max {
-        let t: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{t}\u{2026}")
+        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+        t.push('\u{2026}');
+        t
     } else {
         s.to_string()
     }
@@ -1044,9 +1274,76 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 /// Collapses a snippet body into a single-line preview: splits on whitespace, joins with single spaces,
 /// and truncates to max characters. Used to display a short preview in each card.
+///
+/// Collapsing stops as soon as enough characters have been gathered to fill the preview,
+/// so a megabyte-long body costs the same as a one-line one instead of being copied whole.
 fn preview_text(body: &str, max: usize) -> String {
-    let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut collapsed = String::new();
+    let mut chars = 0usize;
+    for word in body.split_whitespace() {
+        if !collapsed.is_empty() {
+            collapsed.push(' ');
+            chars += 1;
+        }
+        collapsed.push_str(word);
+        chars += word.chars().count();
+        // One char past the limit is all `truncate_chars` needs to know it must trim.
+        if chars > max {
+            break;
+        }
+    }
     truncate_chars(&collapsed, max)
+}
+
+/// Position of the card at index `i` of the filtered grid, computed from the grid's
+/// origin rather than from layout. The grid is uniform — `cols` cards of `card_w` x
+/// `card_h` per row, separated by `spacing` — so off-screen cards still have exact
+/// rects for drag-and-drop hit-testing without being laid out or painted.
+fn grid_card_rect(
+    i: usize,
+    cols: usize,
+    origin: egui::Pos2,
+    card_w: f32,
+    card_h: f32,
+    spacing: f32,
+) -> egui::Rect {
+    let cols = cols.max(1);
+    let col = i % cols;
+    let row = i / cols;
+    egui::Rect::from_min_size(
+        origin
+            + egui::vec2(
+                col as f32 * (card_w + spacing),
+                row as f32 * (card_h + spacing),
+            ),
+        egui::vec2(card_w, card_h),
+    )
+}
+
+/// Inclusive range of grid rows that intersect `clip` (the visible part of the scroll
+/// area), with one row of overscan on each side so a row entering the viewport is
+/// already laid out and edge rounding can't reveal a gap. Rows outside the range are
+/// replaced by blank space of the same height, so scrolling and card positions are
+/// unaffected. Falls back to "every row" if the geometry isn't finite.
+fn visible_rows(clip: egui::Rect, origin_y: f32, row_pitch: f32, rows: usize) -> (usize, usize) {
+    let max_row = rows.saturating_sub(1);
+    if rows == 0 {
+        return (0, 0);
+    }
+    if !row_pitch.is_finite()
+        || row_pitch <= 0.0
+        || !origin_y.is_finite()
+        || !clip.top().is_finite()
+        || !clip.bottom().is_finite()
+    {
+        return (0, max_row);
+    }
+    let first = (((clip.top() - origin_y) / row_pitch).floor() - 1.0).max(0.0);
+    let last = (((clip.bottom() - origin_y) / row_pitch).ceil() + 1.0).max(0.0);
+    // `as usize` saturates, so an absurd clip rect clamps instead of wrapping.
+    let first = (first as usize).min(max_row);
+    let last = (last as usize).clamp(first, max_row);
+    (first, last)
 }
 
 /// Deterministically maps a category name to a color from a 6-color palette via hashing.
@@ -1307,8 +1604,11 @@ mod layout_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp data dir");
         let next_id = snippets.iter().map(|s| s.id).max().unwrap_or(0) + 1;
-        CopyIt {
+        let mut app = CopyIt {
             snippets,
+            derived: Vec::new(),
+            generation: 0,
+            filter: FilterCache::default(),
             next_id,
             path: dir.join("snippets.json"),
             config_path: dir.join("config.json"),
@@ -1323,7 +1623,9 @@ mod layout_tests {
             new_header_category: String::new(),
             category_error: None,
             save_error: None,
-        }
+        };
+        app.rebuild_derived();
+        app
     }
 
     fn snippet(id: u64, category: &str) -> Snippet {
@@ -1681,6 +1983,397 @@ mod layout_tests {
                 assert!(p.y < b.top() - clearance + stroke_width * 0.5);
             }
         }
+    }
+
+    /// Runs a single frame of the real card grid in a 1000x700 window at the given
+    /// scroll offset. Returns the number of paint shapes the frame emitted (a proxy for
+    /// how many cards were actually built), the rects the grid reported for every card,
+    /// the scroll area's content size, and the column count.
+    fn run_grid(
+        app: &CopyIt,
+        scroll_offset: f32,
+    ) -> (usize, Vec<egui::Rect>, egui::Vec2, usize) {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1000.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let filtered: Vec<usize> = (0..app.snippets.len()).collect();
+        let mut rects = Vec::new();
+        let mut content_size = egui::Vec2::ZERO;
+        let mut cols = 0;
+
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let scroll = egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .vertical_scroll_offset(scroll_offset)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                        ui.add_space(GRID_TOP_SPACE);
+                        let mut actions = Vec::new();
+                        let mut drag_start = None;
+                        let mut hover_cursor = None;
+                        app.card_grid(
+                            ui,
+                            &filtered,
+                            0.0,
+                            &mut actions,
+                            &mut drag_start,
+                            &mut hover_cursor,
+                        )
+                    });
+                cols = scroll.inner.0;
+                rects = scroll.inner.1.clone();
+                content_size = scroll.content_size;
+            });
+        });
+
+        (output.shapes.len(), rects, content_size, cols)
+    }
+
+    /// The grid must only build the cards near the viewport, while still reporting the
+    /// geometry of the whole library and reserving its full scroll height.
+    #[test]
+    fn card_grid_only_builds_the_rows_in_view() {
+        let small = test_app(
+            "grid-small",
+            (1..=40).map(|i| snippet(i, "Git")).collect(),
+            vec!["Git".into()],
+        );
+        let large = test_app(
+            "grid-large",
+            (1..=400).map(|i| snippet(i, "Git")).collect(),
+            vec!["Git".into()],
+        );
+
+        let (small_shapes, small_rects, small_content, cols) = run_grid(&small, 0.0);
+        let (large_shapes, large_rects, large_content, large_cols) = run_grid(&large, 0.0);
+        assert_eq!(cols, 2);
+        assert_eq!(large_cols, 2);
+
+        // Every card is accounted for, on-screen or not.
+        assert_eq!(small_rects.len(), 40);
+        assert_eq!(large_rects.len(), 400);
+
+        // The scroll range still spans the whole library.
+        let expected_height = |n: usize| GRID_TOP_SPACE + (n as f32 / 2.0).ceil() * ROW_PITCH;
+        assert!(
+            (small_content.y - expected_height(40)).abs() < 1.0,
+            "content height {} != {}",
+            small_content.y,
+            expected_height(40)
+        );
+        assert!(
+            (large_content.y - expected_height(400)).abs() < 1.0,
+            "content height {} != {}",
+            large_content.y,
+            expected_height(400)
+        );
+
+        // Ten times the library, but the same viewport: the frame's paint work must stay
+        // roughly constant. Without virtualization the 400-snippet grid emitted ten times
+        // the shapes of the 40-snippet one.
+        assert!(
+            large_shapes <= small_shapes * 3 / 2,
+            "large grid emitted {large_shapes} shapes vs {small_shapes} for a tenth of the library"
+        );
+        assert!(small_shapes > 20, "the visible cards must actually be painted");
+
+        // Scrolled deep into the library, cards are still painted (i.e. the visible band
+        // follows the viewport instead of staying at the top)...
+        let deep_offset = 60.0 * ROW_PITCH;
+        let (deep_shapes, deep_rects, _, _) = run_grid(&large, deep_offset);
+        assert!(
+            deep_shapes >= small_shapes / 2,
+            "scrolled grid emitted only {deep_shapes} shapes"
+        );
+
+        // ...and the reported geometry is a uniform grid whose rows are ROW_PITCH apart,
+        // shifted by the scroll offset.
+        for (i, r) in deep_rects.iter().enumerate() {
+            assert!((r.width() - CARD_W).abs() < 0.1);
+            assert!((r.height() - CARD_H).abs() < 0.1);
+            let expected = grid_card_rect(i, 2, deep_rects[0].min, CARD_W, CARD_H, CARD_SPACING);
+            assert!(r.min.distance(expected.min) < 0.1, "card {i} at {:?}", r.min);
+        }
+        assert!(
+            (deep_rects[0].min.y - (large_rects[0].min.y - deep_offset)).abs() < 1.0,
+            "scrolling must shift the grid geometry by the scroll offset"
+        );
+
+        // Drag-and-drop can still target a gap on a row that was never laid out: the
+        // pointer sits in the row-boundary gap after card 150.
+        let gap_index = 150;
+        let above = deep_rects[gap_index - 2];
+        let below = deep_rects[gap_index];
+        let pointer = egui::pos2(
+            above.center().x,
+            (above.bottom() + below.top()) * 0.5,
+        );
+        assert_eq!(
+            nearest_gap(pointer, &deep_rects, 2, CARD_SPACING, CARD_W),
+            gap_index,
+            "an off-screen gap must still be a valid drop target"
+        );
+    }
+
+    /// The grid only lays out the rows in view, so the rects it hands to the
+    /// drag-and-drop code are computed from the grid origin instead of harvested from
+    /// the layout. Those computed rects must match what an actually-rendered card gets,
+    /// or every drop target would be off.
+    #[test]
+    fn computed_grid_rects_match_rendered_cards() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1000.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let app = test_app(
+            "computed-rects",
+            (1..=7).map(|i| snippet(i, "Git")).collect(),
+            vec!["Git".into()],
+        );
+        let filtered: Vec<usize> = (0..app.snippets.len()).collect();
+
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                        ui.add_space(4.0);
+
+                        let card_inner_w = 300.0_f32;
+                        let card_inner_h = 168.0_f32;
+                        let card_frame_margin = 20.0_f32;
+                        let card_w = card_inner_w + card_frame_margin;
+                        let card_h = card_inner_h + card_frame_margin;
+                        let spacing = 12.0_f32;
+
+                        egui::Frame::none()
+                            .inner_margin(egui::Margin::symmetric(18.0, 0.0))
+                            .show(ui, |ui| {
+                                let avail = ui.available_width();
+                                let cols = ((avail / (card_w + spacing)).floor() as usize).max(1);
+                                let origin = ui.cursor().min;
+                                assert_eq!(cols, 2);
+
+                                for (i, chunk_start) in (0..filtered.len()).step_by(cols).enumerate()
+                                {
+                                    let row = &filtered[chunk_start
+                                        ..(chunk_start + cols).min(filtered.len())];
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                        for (offset, &idx) in row.iter().enumerate() {
+                                            let mut actions = Vec::new();
+                                            let rendered = app
+                                                .card(ui, idx, card_inner_w, 0.0, &mut actions, false)
+                                                .frame_rect;
+                                            let computed = grid_card_rect(
+                                                i * cols + offset,
+                                                cols,
+                                                origin,
+                                                card_w,
+                                                card_h,
+                                                spacing,
+                                            );
+                                            assert!(
+                                                rendered.min.distance(computed.min) < 0.1
+                                                    && rendered.max.distance(computed.max) < 0.1,
+                                                "card {} rendered at {:?}, computed {:?}",
+                                                i * cols + offset,
+                                                rendered,
+                                                computed,
+                                            );
+                                            ui.add_space(spacing);
+                                        }
+                                    });
+                                    ui.add_space(spacing);
+                                }
+                            });
+                    });
+            });
+        });
+    }
+
+    /// Row virtualization must cover everything the viewport can show (plus a row of
+    /// overscan) and never hand back a range outside the grid.
+    #[test]
+    fn visible_rows_covers_the_viewport_and_stays_in_bounds() {
+        let row_pitch = 200.0_f32;
+        let origin_y = 100.0_f32;
+        let rows = 50;
+
+        // Scrolled to the top: starts at row 0, reaches past the bottom of the viewport.
+        let clip = egui::Rect::from_min_max(egui::pos2(0.0, 100.0), egui::pos2(1000.0, 700.0));
+        let (first, last) = visible_rows(clip, origin_y, row_pitch, rows);
+        assert_eq!(first, 0);
+        assert!(last >= 3, "viewport spans 3 rows, got last = {last}");
+        assert!(last < rows);
+
+        // Scrolled into the middle: the visible band is covered with overscan on both
+        // sides, and rows far above/below are skipped.
+        let clip = egui::Rect::from_min_max(egui::pos2(0.0, 2100.0), egui::pos2(1000.0, 2700.0));
+        let (first, last) = visible_rows(clip, origin_y, row_pitch, rows);
+        assert!((8..=9).contains(&first), "first = {first}");
+        assert!(last >= 13, "last = {last}");
+        assert!(first > 0, "rows above the viewport must be skipped");
+        assert!(last < rows - 1, "rows below the viewport must be skipped");
+
+        // Every row of the grid is reachable by some scroll position.
+        for row in 0..rows {
+            let y = origin_y + row as f32 * row_pitch;
+            let clip = egui::Rect::from_min_max(egui::pos2(0.0, y), egui::pos2(1000.0, y + 10.0));
+            let (first, last) = visible_rows(clip, origin_y, row_pitch, rows);
+            assert!(
+                first <= row && row <= last,
+                "row {row} not rendered for its own scroll position ({first}..={last})"
+            );
+            assert!(last < rows);
+        }
+
+        // Degenerate inputs fall back to rendering everything rather than nothing.
+        assert_eq!(visible_rows(clip, origin_y, 0.0, rows), (0, rows - 1));
+        assert_eq!(visible_rows(clip, f32::NAN, row_pitch, rows), (0, rows - 1));
+        assert_eq!(visible_rows(clip, origin_y, row_pitch, 1), (0, 0));
+        assert_eq!(visible_rows(clip, origin_y, row_pitch, 0), (0, 0));
+    }
+
+    /// The filter is memoized: it must return the same indices the old
+    /// scan-every-frame code did, and it must be recomputed when the query, the
+    /// category, or the library changes.
+    #[test]
+    fn filter_cache_matches_a_fresh_scan_and_invalidates_on_change() {
+        let mut app = test_app(
+            "filter-cache",
+            vec![
+                Snippet {
+                    id: 1,
+                    title: "Rebase onto main".into(),
+                    category: "Git".into(),
+                    body: "git rebase origin/MAIN".into(),
+                },
+                Snippet {
+                    id: 2,
+                    title: "Summarize".into(),
+                    category: "Prompt".into(),
+                    body: "Summarize the following text".into(),
+                },
+                Snippet {
+                    id: 3,
+                    title: "Stash".into(),
+                    category: "Git".into(),
+                    body: "git stash pop".into(),
+                },
+            ],
+            vec!["Git".into(), "Prompt".into()],
+        );
+
+        // Reference implementation: the un-cached filter this replaced.
+        let expected = |app: &CopyIt| -> Vec<usize> {
+            let q = app.search.trim().to_lowercase();
+            app.snippets
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| {
+                    (app.category_filter == "All" || s.category == app.category_filter)
+                        && (q.is_empty()
+                            || s.title.to_lowercase().contains(&q)
+                            || s.body.to_lowercase().contains(&q)
+                            || s.category.to_lowercase().contains(&q))
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let check = |app: &mut CopyIt| {
+            let want = expected(app);
+            let got = app.take_filtered();
+            assert_eq!(got, want, "search {:?} / cat {:?}", app.search, app.category_filter);
+            app.restore_filtered(got);
+        };
+
+        check(&mut app); // everything
+
+        // Taking the buffer twice without restoring it must not report "no matches".
+        let first = app.take_filtered();
+        let second = app.take_filtered();
+        assert_eq!(first, second, "a checked-out cache must be recomputed, not reused");
+        app.restore_filtered(second);
+
+        // A cached result must not survive a changed query...
+        app.search = "GIT".into(); // case-insensitive, matches bodies and the category
+        check(&mut app);
+        app.search = "  summarize  ".into(); // trimmed
+        check(&mut app);
+        app.search = "   ".into(); // whitespace-only behaves like empty
+        check(&mut app);
+        assert_eq!(app.take_filtered().len(), 3);
+        let restored = vec![0, 1, 2];
+        app.restore_filtered(restored);
+
+        // ...a changed category filter...
+        app.search.clear();
+        app.category_filter = "Git".into();
+        check(&mut app);
+        assert_eq!(app.take_filtered(), vec![0, 2]);
+        app.restore_filtered(vec![0, 2]);
+
+        // ...or a changed library. Reordering keeps ids and derived data aligned.
+        app.category_filter = "All".into();
+        app.reorder(1, 3, &[0, 1, 2]);
+        assert_eq!(ids(&app), vec![2, 3, 1]);
+        check(&mut app);
+        app.search = "rebase".into();
+        assert_eq!(app.take_filtered(), vec![2], "the moved card is still findable");
+        app.restore_filtered(vec![2]);
+
+        // Deriving must track edits to a snippet's text, not just its position.
+        app.snippets[2].body = "git rebase --abort".into();
+        app.snippets[2].title = "Abort".into();
+        app.snippets_changed();
+        app.search = "abort".into();
+        check(&mut app);
+        assert_eq!(app.take_filtered(), vec![2]);
+    }
+
+    /// Card previews are cached; they must still collapse whitespace, truncate with an
+    /// ellipsis, and count characters rather than bytes.
+    #[test]
+    fn preview_text_collapses_and_truncates() {
+        assert_eq!(preview_text("  git   stash \n pop  ", 220), "git stash pop");
+        assert_eq!(preview_text("", 220), "");
+
+        let long = "word ".repeat(400);
+        let preview = preview_text(&long, 10);
+        assert_eq!(preview.chars().count(), 10);
+        assert!(preview.ends_with('\u{2026}'));
+        assert!(preview.starts_with("word word"));
+
+        // Multi-byte characters are counted as characters.
+        let unicode = "\u{00e9}".repeat(50);
+        assert_eq!(preview_text(&unicode, 10).chars().count(), 10);
+        assert_eq!(preview_text(&unicode, 100), unicode);
+
+        // The cached preview is what the card renders.
+        let app = test_app(
+            "preview-cache",
+            vec![Snippet {
+                id: 1,
+                title: "T".into(),
+                category: "Git".into(),
+                body: "  first    line\nsecond line  ".into(),
+            }],
+            vec!["Git".into()],
+        );
+        assert_eq!(app.derived[0].preview, "first line second line");
+        assert_eq!(app.derived[0].body_lower, "  first    line\nsecond line  ");
     }
 
     #[test]

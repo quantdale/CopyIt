@@ -23,13 +23,20 @@ cargo test              # unit tests in src/*.rs (layout, drag/reorder, storage,
 Six modules in `src/`, with a strict separation of concerns:
 
 - `main.rs` — eframe setup (1000x700 window, 560x400 min). Sets `windows_subsystem = "windows"` for release only, so release builds have no console.
-- `app.rs` — the `CopyIt` struct (all app state) and the entire egui UI: top bar (search, category filter, theme selector, New button), responsive card grid, clipboard copy with transient "Copied" feedback, modal add/edit/delete editor, and drag-and-drop card reordering. UI helpers (`truncate_chars`, `preview_text`, `category_color`) live at the bottom.
+- `app.rs` — the `CopyIt` struct (all app state) and the entire egui UI: top bar (search, category filter, theme selector, New button), responsive card grid, clipboard copy with transient "Copied" feedback, modal add/edit/delete editor, and drag-and-drop card reordering. UI helpers (`truncate_chars`, `preview_text`, `category_color`, `grid_card_rect`, `visible_rows`) live at the bottom.
+  - Frame-rate hot paths are cached, not recomputed per repaint: `Derived` (per-snippet lowercase text + card preview) and `FilterCache` (the visible-card index list). The card grid also only lays out the rows in view.
 - `model.rs` — `Snippet { id, title, category, body }`.
 - `storage.rs` — JSON persistence. `data_dir()` resolves `%APPDATA%\CopyIt` (falls back to next-to-exe when `APPDATA` is unset, e.g. non-Windows dev). Handles `snippets.json` (library) and `config.json` (canonical categories + selected theme), one-time migration from legacy next-to-exe locations, and `normalize_category()` (title-cases and dedupes).
 - `seed.rs` — default snippet library seeded on first launch.
 - `theme.rs` — `Theme` enum and custom `egui::Visuals` for 37 color themes.
 
 Persistence rule: keep UI in `app.rs`, data types in `model.rs`, persistence in `storage.rs`, themes in `theme.rs`. Saves happen automatically after every add/edit/delete/reorder.
+
+## Performance rules
+
+- **Every mutation of `snippets` must go through `CopyIt::snippets_changed()`** (not a bare `save_snippets()`). It rebuilds the `derived` cache so it stays index-aligned with `snippets`, bumps `generation` to invalidate the filter cache, and then saves. Skipping it leaves cards showing another snippet's preview and search matching stale text.
+- **The card grid is virtualized.** Only the rows intersecting `ui.clip_rect()` (plus one row of overscan) are laid out; the rest are replaced with `add_space` of the same height. Card rects come from `grid_card_rect` (computed from the grid origin), so drag-and-drop still sees the whole grid. If you change card size or spacing, change the `CARD_*` / `ROW_PITCH` / `GRID_*` constants — the renderer and the hit-testing both read them.
+- **Don't call `ctx.set_visuals()` every frame.** It rebuilds a whole `egui::Visuals`; apply it at startup and when the theme selection changes. Use `Theme::name()` (`&'static str`) rather than `to_string()` in UI code.
 
 ## Critical gotchas
 

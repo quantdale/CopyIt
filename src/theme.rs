@@ -1,8 +1,9 @@
 //! Color themes and visual styling for CopyIt.
 //!
 //! Provides 37 selectable color themes, each with custom egui::Visuals for background,
-//! text, panels, buttons, and accent colors. Themes are persisted in config.json
-//! and applied every frame via update().
+//! text, panels, buttons, and accent colors. Themes are persisted in config.json and
+//! applied to the egui context once at startup and again whenever the user picks a
+//! different one — not rebuilt every frame.
 
 use eframe::egui;
 use std::fmt;
@@ -96,7 +97,8 @@ impl Theme {
         ]
     }
 
-    /// Generates the complete egui::Visuals color scheme for this theme. Applied to egui context each frame.
+    /// Generates the complete egui::Visuals color scheme for this theme. Call it only when
+    /// the selected theme changes; the context keeps the visuals until they are replaced.
     pub fn visuals(self) -> egui::Visuals {
         match self {
             Theme::Dark => dark_theme(),
@@ -138,50 +140,59 @@ impl Theme {
             Theme::HorizonDark => horizon_dark_theme(),
         }
     }
+
+    /// The theme's human-readable name as a static string (e.g. "Solarized Dark").
+    /// Used by the theme selector and by `Display`: returning `&'static str` means
+    /// naming a theme (once per frame for the selected one, once per entry when the
+    /// dropdown is open) no longer allocates a fresh `String`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Theme::Dark => "Dark",
+            Theme::Light => "Light",
+            Theme::Nord => "Nord",
+            Theme::Dracula => "Dracula",
+            Theme::SolarizedDark => "Solarized Dark",
+            Theme::SolarizedLight => "Solarized Light",
+            Theme::GruvboxDark => "Gruvbox Dark",
+            Theme::GruvboxLight => "Gruvbox Light",
+            Theme::CatppuccinMocha => "Catppuccin Mocha",
+            Theme::CatppuccinLatte => "Catppuccin Latte",
+            Theme::CatppuccinFrappe => "Catppuccin Frappe",
+            Theme::CatppuccinMacchiato => "Catppuccin Macchiato",
+            Theme::TokyoNight => "Tokyo Night",
+            Theme::TokyoNightStorm => "Tokyo Night Storm",
+            Theme::TokyoNightLight => "Tokyo Night Light",
+            Theme::OneDark => "One Dark",
+            Theme::OneLight => "One Light",
+            Theme::Monokai => "Monokai",
+            Theme::MonokaiPro => "Monokai Pro",
+            Theme::GithubDark => "GitHub Dark",
+            Theme::GithubLight => "GitHub Light",
+            Theme::AyuDark => "Ayu Dark",
+            Theme::AyuLight => "Ayu Light",
+            Theme::AyuMirage => "Ayu Mirage",
+            Theme::RosePine => "Rose Pine",
+            Theme::RosePineMoon => "Rose Pine Moon",
+            Theme::RosePineDawn => "Rose Pine Dawn",
+            Theme::EverforestDark => "Everforest Dark",
+            Theme::EverforestLight => "Everforest Light",
+            Theme::MaterialOcean => "Material Ocean",
+            Theme::MaterialPalenight => "Material Palenight",
+            Theme::Kanagawa => "Kanagawa",
+            Theme::NightOwl => "Night Owl",
+            Theme::Zenburn => "Zenburn",
+            Theme::SynthwaveEighties => "Synthwave '84",
+            Theme::Cobalt2 => "Cobalt2",
+            Theme::HorizonDark => "Horizon Dark",
+        }
+    }
 }
 
-/// Converts a theme to its human-readable display string (e.g., "Solarized Dark"). Used in UI dropdowns and config serialization.
+/// Converts a theme to its human-readable display string (e.g., "Solarized Dark").
+/// Delegates to [`Theme::name`] so the two can never disagree.
 impl fmt::Display for Theme {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Theme::Dark => write!(f, "Dark"),
-            Theme::Light => write!(f, "Light"),
-            Theme::Nord => write!(f, "Nord"),
-            Theme::Dracula => write!(f, "Dracula"),
-            Theme::SolarizedDark => write!(f, "Solarized Dark"),
-            Theme::SolarizedLight => write!(f, "Solarized Light"),
-            Theme::GruvboxDark => write!(f, "Gruvbox Dark"),
-            Theme::GruvboxLight => write!(f, "Gruvbox Light"),
-            Theme::CatppuccinMocha => write!(f, "Catppuccin Mocha"),
-            Theme::CatppuccinLatte => write!(f, "Catppuccin Latte"),
-            Theme::CatppuccinFrappe => write!(f, "Catppuccin Frappe"),
-            Theme::CatppuccinMacchiato => write!(f, "Catppuccin Macchiato"),
-            Theme::TokyoNight => write!(f, "Tokyo Night"),
-            Theme::TokyoNightStorm => write!(f, "Tokyo Night Storm"),
-            Theme::TokyoNightLight => write!(f, "Tokyo Night Light"),
-            Theme::OneDark => write!(f, "One Dark"),
-            Theme::OneLight => write!(f, "One Light"),
-            Theme::Monokai => write!(f, "Monokai"),
-            Theme::MonokaiPro => write!(f, "Monokai Pro"),
-            Theme::GithubDark => write!(f, "GitHub Dark"),
-            Theme::GithubLight => write!(f, "GitHub Light"),
-            Theme::AyuDark => write!(f, "Ayu Dark"),
-            Theme::AyuLight => write!(f, "Ayu Light"),
-            Theme::AyuMirage => write!(f, "Ayu Mirage"),
-            Theme::RosePine => write!(f, "Rose Pine"),
-            Theme::RosePineMoon => write!(f, "Rose Pine Moon"),
-            Theme::RosePineDawn => write!(f, "Rose Pine Dawn"),
-            Theme::EverforestDark => write!(f, "Everforest Dark"),
-            Theme::EverforestLight => write!(f, "Everforest Light"),
-            Theme::MaterialOcean => write!(f, "Material Ocean"),
-            Theme::MaterialPalenight => write!(f, "Material Palenight"),
-            Theme::Kanagawa => write!(f, "Kanagawa"),
-            Theme::NightOwl => write!(f, "Night Owl"),
-            Theme::Zenburn => write!(f, "Zenburn"),
-            Theme::SynthwaveEighties => write!(f, "Synthwave '84"),
-            Theme::Cobalt2 => write!(f, "Cobalt2"),
-            Theme::HorizonDark => write!(f, "Horizon Dark"),
-        }
+        f.write_str(self.name())
     }
 }
 
