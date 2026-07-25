@@ -36,10 +36,11 @@ CopyIt is a small Windows desktop app for storing scripts and AI prompts as copy
 - `src/main.rs` — Sets up the native window (`1000x700` default, `560x400` minimum) and runs the egui event loop.
 - `src/app.rs` — Contains the `CopyIt` app state and the entire UI:
   - Top bar with search, category filter, theme selector, and a New-snippet button.
-  - Responsive card grid of snippets.
+  - Responsive card grid of snippets, rendered by `CopyIt::card_grid` (virtualized — see below).
   - Copy-to-clipboard action and transient "Copied" feedback.
   - Modal editor for adding, editing, and deleting snippets.
   - Drag-and-drop reordering of snippet cards (pointer drag on a card body, not on its buttons).
+  - Two caches keep per-frame work off the hot path: `Derived` holds each snippet's lowercase title/body/category plus its collapsed card preview, and `FilterCache` memoizes the list of visible card indices for the current query, category filter, and library `generation`.
 - `src/model.rs` — Defines `Snippet { id, title, category, body }`.
 - `src/storage.rs` — `data_dir()` resolves the stable `%APPDATA%\CopyIt` directory (falling back to next-to-the-exe if `APPDATA` isn't set, e.g. non-Windows dev/test). `data_path()`, `load()`, and `save()` handle `snippets.json`; `config_path()`, `load_config()`, and `save_config()` handle `config.json` (canonical categories and theme). `legacy_candidate_dirs()` lists old next-to-exe locations used for one-time migration. Also contains the category helpers: `normalize_category()` (title-cases), `same_category()` (case-insensitive comparison), `is_reserved_category()` (rejects blank and the reserved `All`), and `canonical_category()` (maps unusable names to `UNCATEGORIZED`).
   - Both loaders return `Load<T>` — `Loaded` / `Missing` / `Corrupt` — rather than an `Option`. Keep those three cases distinct: collapsing `Corrupt` into `Missing` makes the app seed defaults over a file it merely failed to parse and destroy the user's library on the next save.
@@ -88,7 +89,7 @@ cargo clippy
 cargo test
 ```
 
-Unit tests live in the relevant `src/*.rs` file under `#[cfg(test)] mod tests` (`mod layout_tests` in `app.rs`). Coverage today: grid/gap geometry and the scroll-area coordinate space, drag-and-drop reordering (including filtered views and a snippet that vanishes mid-drag), save-error reporting, atomic writes, corrupt-file recovery, category normalization, and theme name round-trips.
+Unit tests live in the relevant `src/*.rs` file under `#[cfg(test)] mod tests` (`mod layout_tests` in `app.rs`). Coverage today: grid/gap geometry and the scroll-area coordinate space, grid virtualization (visible-row range, computed-vs-rendered card rects, and that a ten-times-larger library emits roughly the same paint work), the memoized filter (matching a fresh scan, and invalidating on query/category/library changes), preview collapsing and truncation, drag-and-drop reordering (including filtered views and a snippet that vanishes mid-drag), save-error reporting, atomic writes, corrupt-file recovery, category normalization, and theme name round-trips.
 
 Tests that touch the save paths must point `path`/`config_path` at a throwaway temp directory — use the `test_app()` helper in `app.rs`, which does this. A test that leaves them as bare relative filenames writes `snippets.json` into the repository root.
 
@@ -135,6 +136,18 @@ Tests that touch the save paths must point `path`/`config_path` at a throwaway t
 ## Release console behavior
 
 `src/main.rs` sets `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`, so `--release` builds launch without a console window. Debug builds retain the console for troubleshooting.
+
+## Performance model
+
+The UI is repainted on every mouse move, so anything done inside `update()` runs dozens of times a second. The costly work is therefore cached or skipped:
+
+- **Derived snippet text is cached.** `Derived` stores the lowercase title/body/category the search matches against, plus the collapsed one-line card preview. Rebuilding it walks the whole library, so it happens only when the library changes.
+- **All snippet mutations go through `CopyIt::snippets_changed()`.** It calls `rebuild_derived()` (which also bumps `generation`, invalidating the filter cache) and then `save_snippets()`. Never mutate `self.snippets` and call `save_snippets()` directly: `derived` is a parallel `Vec` indexed the same way as `snippets`, and letting it drift shows the wrong preview on a card and makes search match text that is no longer there. `card()` falls back to computing a preview if the two ever disagree, and a `debug_assert` catches it in debug builds.
+- **The visible-card list is memoized.** `take_filtered()` recomputes the filtered index list only when the search text, the category filter, or `generation` changed; otherwise it hands back the same buffer. It *takes* the buffer (leaving the cache marked invalid) so the render loop can still borrow `self` mutably, and `restore_filtered()` puts it back at the end of the frame, reusing the allocation. If you add a second `take_filtered()` in one frame, restore it — the cache is deliberately treated as invalid while checked out, so the second call recomputes rather than reporting "no snippets match".
+- **The card grid is virtualized.** `card_grid()` lays out only the rows intersecting `ui.clip_rect()`, plus one row of overscan, and reserves the height of the skipped rows above and below with `ui.add_space`, so the scrollbar and every card position are exactly what they would be if all rows were built. `visible_rows()` computes that range (and falls back to "all rows" on non-finite geometry).
+- **Card rects are computed, not harvested.** Because rows can be skipped, `grid_card_rect()` derives each card's rect from the grid origin and the `CARD_*` / `CARD_SPACING` constants, and `card_grid` returns rects for *every* filtered card. Drag-and-drop can therefore still drop onto a gap that was never rendered. `layout_tests::computed_grid_rects_match_rendered_cards` pins the computed rects to what a real card gets, and a `debug_assert` in `card_grid` re-checks it per card. Changing card size, spacing, or grid margins means changing those constants — the renderer and the hit-testing read the same ones.
+- **Each grid row gets an explicit widget id** via `ui.push_id(row_start, …)`. egui otherwise derives ids from a per-parent counter, which would make the ids inside a card depend on how many rows above the viewport were skipped, so a card's buttons would change identity as the user scrolls.
+- **Visuals are applied only when the theme changes**, at startup and from the theme selector (which also requests one extra repaint so the already-painted top bar is redrawn with the new colors). `Theme::visuals()` builds a whole `egui::Visuals`; it is not something to do per frame. Use `Theme::name()` (`&'static str`) instead of `to_string()` in UI code, and avoid cloning app state (categories, the save-error message) just to satisfy the borrow checker inside a closure — borrow it, or record the decision in a local and apply it after the closure.
 
 ## Common gotchas
 

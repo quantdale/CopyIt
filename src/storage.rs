@@ -192,7 +192,15 @@ pub fn normalize_category(s: &str) -> String {
 /// True when two category names denote the same category, ignoring case.
 /// Uses full Unicode lowercasing (not `eq_ignore_ascii_case`) so accented
 /// categories don't sneak in as near-duplicates.
+///
+/// Category names are almost always plain ASCII, and this runs once per known
+/// category on every lookup, so that case is answered without allocating; anything
+/// non-ASCII still goes through full Unicode lowercasing, which for ASCII input
+/// produces exactly the same result.
 pub fn same_category(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        return a.eq_ignore_ascii_case(b);
+    }
     a.to_lowercase() == b.to_lowercase()
 }
 
@@ -243,18 +251,25 @@ impl Config {
         }
     }
 
-    /// Adds a category to the canonical list if it isn't already present (case-insensitive).
-    /// Normalizes the input, rejects empty strings and "All" (reserved), and keeps the list sorted.
-    pub fn add_category(&mut self, raw: &str) {
-        let cat = normalize_category(raw);
-        if is_reserved_category(&cat) {
-            return;
+    /// Adds categories to the canonical list, skipping any that are already present
+    /// (case-insensitive) or reserved, and normalizing the rest. The list is sorted a
+    /// single time at the end: startup registers every snippet's category, which used
+    /// to re-sort the whole list once per snippet.
+    pub fn add_categories<'a>(&mut self, raws: impl IntoIterator<Item = &'a str>) {
+        let before = self.categories.len();
+        for raw in raws {
+            let cat = normalize_category(raw);
+            if is_reserved_category(&cat) {
+                continue;
+            }
+            if self.categories.iter().any(|c| same_category(c, &cat)) {
+                continue;
+            }
+            self.categories.push(cat);
         }
-        if self.categories.iter().any(|c| same_category(c, &cat)) {
-            return;
+        if self.categories.len() != before {
+            self.categories.sort();
         }
-        self.categories.push(cat);
-        self.categories.sort();
     }
 }
 
@@ -308,14 +323,34 @@ mod tests {
     }
 
     #[test]
-    fn config_add_category_dedupes_case_insensitively() {
+    fn config_add_categories_dedupes_case_insensitively() {
         let mut config = Config::default();
-        config.add_category("git");
-        config.add_category("GIT");
-        config.add_category("  Git  ");
-        config.add_category("all");
-        config.add_category("");
+        config.add_categories(["git", "GIT", "  Git  ", "all", ""]);
         assert_eq!(config.categories, vec!["Git".to_string()]);
+
+        // Adding in batches must behave like adding one at a time, and keep the
+        // canonical list sorted.
+        config.add_categories(["prompt"]);
+        config.add_categories(["Docker", "prompt", "ansible"]);
+        assert_eq!(
+            config.categories,
+            vec![
+                "Ansible".to_string(),
+                "Docker".to_string(),
+                "Git".to_string(),
+                "Prompt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn same_category_ignores_case_for_ascii_and_unicode() {
+        assert!(same_category("git", "GIT"));
+        assert!(same_category("Git Hub", "git hub"));
+        assert!(!same_category("git", "gitt"));
+        // Non-ASCII names still go through full Unicode lowercasing.
+        assert!(same_category("Café", "CAFÉ"));
+        assert!(!same_category("Café", "Cafe"));
     }
 
     #[test]
