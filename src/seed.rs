@@ -46,6 +46,8 @@ pub fn defaults() -> Vec<Snippet> {
             title: (*title).to_string(),
             category: (*category).to_string(),
             body: (*body).to_string(),
+            is_secure: false,
+            password_hash: String::new(),
         })
         .collect()
 }

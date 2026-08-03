@@ -6,8 +6,12 @@ use serde::{Deserialize, Serialize};
 /// insertion order (they remain in self.snippets in whatever order the user drags them to).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Snippet {
-    pub id: u64,           // Stable unique identifier; incremented on creation, never reused
-    pub title: String,     // Display name of the snippet
-    pub category: String,  // User-defined category (normalized to title-case)
-    pub body: String,      // The actual content to copy to clipboard
+    pub id: u64,               // Stable unique identifier; incremented on creation, never reused
+    pub title: String,         // Display name of the snippet
+    pub category: String,      // User-defined category (normalized to title-case)
+    pub body: String,          // The actual content to copy to clipboard
+    #[serde(default)]
+    pub is_secure: bool,       // If true, snippet requires password to copy/edit
+    #[serde(default)]
+    pub password_hash: String, // SHA256 hash of the password (empty if not secure)
 }

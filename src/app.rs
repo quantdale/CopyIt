@@ -2,7 +2,20 @@ use crate::model::Snippet;
 use crate::storage::{self, Config};
 use crate::theme::Theme;
 use eframe::egui;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+
+/// Hashes a password using SHA256 for storage.
+fn hash_password(password: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Verifies a password against a stored hash.
+fn verify_password(password: &str, hash: &str) -> bool {
+    hash_password(password) == hash
+}
 
 /// Prefix of the banner message for a failed `snippets.json` write. Shared so a later
 /// successful snippet save can retire exactly its own error and nothing else.
@@ -53,11 +66,22 @@ struct Derived {
 
 impl Derived {
     fn new(s: &Snippet) -> Self {
+        // For secure snippets, censor the preview but keep full body for search
+        let preview = if s.is_secure {
+            let body = &s.body;
+            if body.chars().count() > 5 {
+                format!("{}*****", body.chars().take(5).collect::<String>())
+            } else {
+                "*****".to_string()
+            }
+        } else {
+            preview_text(&s.body, PREVIEW_CHARS)
+        };
         Derived {
             title_lower: s.title.to_lowercase(),
             category_lower: s.category.to_lowercase(),
             body_lower: s.body.to_lowercase(),
-            preview: preview_text(&s.body, PREVIEW_CHARS),
+            preview,
         }
     }
 
@@ -117,6 +141,7 @@ pub struct CopyIt {
     new_header_category: String,                   // Input buffer for the new category name in the top bar
     category_error: Option<String>,                // Validation error for the new category (e.g., "All" is reserved)
     save_error: Option<String>,                    // File I/O error message to display at the top
+    password_prompt: Option<PasswordPrompt>,       // Modal password prompt for secure snippets; None when not prompting
 }
 
 /// Tracks an in-progress drag operation. Initialized when the user clicks and holds on a card,
@@ -142,13 +167,17 @@ struct DragState {
 /// allows the editor to support category creation inline while keeping the main app's category
 /// list management separate, improving UX for workflows where the user invents a new category mid-edit.
 struct Editor {
-    id: Option<u64>, // None = creating a new snippet; Some(id) = editing existing with this stable ID
+    id: Option<u64>,               // None = creating a new snippet; Some(id) = editing existing with this stable ID
     title: String,
     category: String,
-    new_category: String,   // input buffer for inline category creation; cleared when user confirms
-    adding_category: bool,   // true when user clicked "+ Add new category" in the dropdown
+    new_category: String,           // input buffer for inline category creation; cleared when user confirms
+    adding_category: bool,          // true when user clicked "+ Add new category" in the dropdown
     body: String,
-    confirm_delete: bool,    // set to true on first "Delete" click; requires second "Confirm delete" to prevent accidents
+    confirm_delete: bool,           // set to true on first "Delete" click; requires second "Confirm delete" to prevent accidents
+    is_secure: bool,                // whether this snippet is password-protected
+    password: String,               // password input (for new secure snippets)
+    password_confirm: String,       // password confirmation input
+    show_password_fields: bool,     // whether to show password fields in the editor
 }
 
 impl Editor {
@@ -164,6 +193,10 @@ impl Editor {
             adding_category: false,
             body: String::new(),
             confirm_delete: false,
+            is_secure: false,
+            password: String::new(),
+            password_confirm: String::new(),
+            show_password_fields: false,
         }
     }
 
@@ -185,6 +218,10 @@ impl Editor {
             adding_category: false,
             body: s.body.clone(),
             confirm_delete: false,
+            is_secure: s.is_secure,
+            password: String::new(),
+            password_confirm: String::new(),
+            show_password_fields: s.is_secure,
         }
     }
 }
@@ -205,6 +242,20 @@ enum EditorResult {
     Cancel,                   // User clicked Cancel or closed the window; discard changes
     Delete,                   // User confirmed deletion (second click); remove the snippet
     AddCategory(String),      // User created a new category in the editor; add to canonical list
+}
+
+/// State for the password prompt modal shown when copying or editing a secure snippet.
+struct PasswordPrompt {
+    snippet_id: u64,           // The snippet requiring a password
+    action: PasswordAction,    // What to do after password verification (Copy or Edit)
+    password: String,          // User's password input
+    error: Option<String>,     // Error message if verification failed
+}
+
+/// Action to take after successful password verification.
+enum PasswordAction {
+    Copy,
+    Edit,
 }
 
 /// Layout and response data returned from rendering a single snippet card.
@@ -336,6 +387,7 @@ impl CopyIt {
             new_header_category: String::new(),
             category_error: None,
             save_error,
+            password_prompt: None,
         }
     }
 
@@ -539,15 +591,23 @@ impl CopyIt {
         let s = &self.snippets[idx];
         let card_h = CARD_INNER_H;
 
-        // The preview is cached per snippet; fall back to computing it only if the
-        // caches somehow got out of step, so a stale index can never panic or blank
-        // a card in a release build.
+        // The preview is cached per snippet (already censored for secure snippets);
+        // fall back to computing it only if the caches somehow got out of step.
         debug_assert_eq!(self.derived.len(), self.snippets.len());
         let fallback_preview;
         let preview: &str = match self.derived.get(idx) {
             Some(d) => &d.preview,
             None => {
-                fallback_preview = preview_text(&s.body, PREVIEW_CHARS);
+                fallback_preview = if s.is_secure {
+                    let body = &s.body;
+                    if body.chars().count() > 5 {
+                        format!("{}*****", body.chars().take(5).collect::<String>())
+                    } else {
+                        "*****".to_string()
+                    }
+                } else {
+                    preview_text(&s.body, PREVIEW_CHARS)
+                };
                 &fallback_preview
             }
         };
@@ -572,11 +632,14 @@ impl CopyIt {
                                 .copied
                                 .is_some_and(|(cid, t)| cid == s.id && now - t < 1.2);
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let resp = ui.button(if recently {
+                                let copy_label = if recently {
                                     "\u{2714} Copied"
+                                } else if s.is_secure {
+                                    "\u{1F512} Copy"
                                 } else {
                                     "\u{29C9} Copy"
-                                });
+                                };
+                                let resp = ui.button(copy_label);
                                 if resp.clicked() {
                                     actions.push(Action::Copy(s.id));
                                 }
@@ -587,6 +650,21 @@ impl CopyIt {
                                         )
                                         .truncate(true),
                                     );
+                                    // Secure badge
+                                    if s.is_secure {
+                                        ui.add_space(4.0);
+                                        egui::Frame::none()
+                                            .fill(egui::Color32::from_rgb(0xef, 0x44, 0x44))
+                                            .rounding(egui::Rounding::same(4.0))
+                                            .inner_margin(egui::Margin::symmetric(4.0, 1.0))
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    egui::RichText::new("\u{1F512} Secure")
+                                                        .small()
+                                                        .color(egui::Color32::WHITE),
+                                                );
+                                            });
+                                    }
                                 });
                                 resp
                             })
@@ -617,7 +695,8 @@ impl CopyIt {
                     // Preview + Edit pinned to the bottom
                     let edit_resp = ui
                         .with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                            let resp = ui.small_button("Edit");
+                            let edit_label = if s.is_secure { "\u{1F512} Edit" } else { "Edit" };
+                            let resp = ui.small_button(edit_label);
                             if resp.clicked() {
                                 actions.push(Action::Edit(s.id));
                             }
@@ -953,15 +1032,35 @@ impl eframe::App for CopyIt {
                         match a {
                             Action::Copy(id) => {
                                 if let Some(s) = self.snippets.iter().find(|s| s.id == id) {
-                                    let text = s.body.clone();
-                                    ui.output_mut(|o| o.copied_text = text);
-                                    self.copied = Some((id, now));
-                                    ctx.request_repaint_after(std::time::Duration::from_millis(1300));
+                                    if s.is_secure {
+                                        // Show password prompt for secure snippets
+                                        self.password_prompt = Some(PasswordPrompt {
+                                            snippet_id: id,
+                                            action: PasswordAction::Copy,
+                                            password: String::new(),
+                                            error: None,
+                                        });
+                                    } else {
+                                        let text = s.body.clone();
+                                        ui.output_mut(|o| o.copied_text = text);
+                                        self.copied = Some((id, now));
+                                        ctx.request_repaint_after(std::time::Duration::from_millis(1300));
+                                    }
                                 }
                             }
                             Action::Edit(id) => {
                                 if let Some(s) = self.snippets.iter().find(|s| s.id == id) {
-                                    self.editor = Some(Editor::from_snippet(s, &self.categories));
+                                    if s.is_secure {
+                                        // Show password prompt for secure snippets
+                                        self.password_prompt = Some(PasswordPrompt {
+                                            snippet_id: id,
+                                            action: PasswordAction::Edit,
+                                            password: String::new(),
+                                            error: None,
+                                        });
+                                    } else {
+                                        self.editor = Some(Editor::from_snippet(s, &self.categories));
+                                    }
                                 }
                             }
                         }
@@ -1152,6 +1251,48 @@ impl eframe::App for CopyIt {
                     });
                     ui.add_space(6.0);
 
+                    // Secure snippet checkbox and password fields
+                    ui.horizontal(|ui| {
+                        let secure_response = ui.checkbox(&mut ed.is_secure, "🔒 Secure (password-protected)");
+                        if secure_response.changed() {
+                            ed.show_password_fields = ed.is_secure;
+                            if !ed.is_secure {
+                                ed.password.clear();
+                                ed.password_confirm.clear();
+                            }
+                        }
+                        if ed.is_secure {
+                            ui.label(egui::RichText::new("Requires password to copy/edit").weak().small());
+                        }
+                    });
+                    if ed.show_password_fields {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label("Password");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut ed.password)
+                                        .password(true)
+                                        .desired_width(280.0)
+                                        .hint_text("Enter password"),
+                                );
+                            });
+                            ui.add_space(12.0);
+                            ui.vertical(|ui| {
+                                ui.label("Confirm Password");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut ed.password_confirm)
+                                        .password(true)
+                                        .desired_width(280.0)
+                                        .hint_text("Confirm password"),
+                                );
+                            });
+                        });
+                        if !ed.password.is_empty() && ed.password != ed.password_confirm {
+                            ui.colored_label(WARNING_COLOR, "Passwords do not match");
+                        }
+                    }
+                    ui.add_space(6.0);
+
                     ui.label("Content");
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, true])
@@ -1203,35 +1344,93 @@ impl eframe::App for CopyIt {
 
             match result {
                 EditorResult::Save => {
-                    // Normalize category: ensure it's canonical, fall back to "Uncategorized" if empty
-                    let category = {
-                        let canonical = self.add_category(&ed.category);
-                        if canonical.is_empty() {
-                            self.add_category("Uncategorized")
+                    // Validate password if creating a secure snippet
+                    if ed.is_secure && ed.show_password_fields {
+                        if ed.password.is_empty() || ed.password != ed.password_confirm {
+                            ed.password.clear();
+                            ed.password_confirm.clear();
+                            // Keep editor open with error (will show "Passwords do not match" in UI)
+                            self.editor = Some(ed);
                         } else {
-                            canonical
-                        }
-                    };
-                    let title = ed.title.trim().to_string();
-                    if let Some(id) = ed.id {
-                        if let Some(s) = self.snippets.iter_mut().find(|s| s.id == id) {
-                            s.title = title;
-                            s.category = category;
-                            // The editor is closing, so its buffer can be moved
-                            // instead of copied — snippet bodies can be large.
-                            s.body = std::mem::take(&mut ed.body);
+                            // Normalize category: ensure it's canonical, fall back to "Uncategorized" if empty
+                            let category = {
+                                let canonical = self.add_category(&ed.category);
+                                if canonical.is_empty() {
+                                    self.add_category("Uncategorized")
+                                } else {
+                                    canonical
+                                }
+                            };
+                            let title = ed.title.trim().to_string();
+                            let password_hash = if ed.is_secure && ed.show_password_fields {
+                                hash_password(&ed.password)
+                            } else {
+                                String::new()
+                            };
+                            if let Some(id) = ed.id {
+                                if let Some(s) = self.snippets.iter_mut().find(|s| s.id == id) {
+                                    s.title = title;
+                                    s.category = category;
+                                    s.is_secure = ed.is_secure;
+                                    s.password_hash = password_hash;
+                                    // The editor is closing, so its buffer can be moved
+                                    // instead of copied — snippet bodies can be large.
+                                    s.body = std::mem::take(&mut ed.body);
+                                }
+                            } else {
+                                let id = self.next_id;
+                                self.next_id += 1;
+                                self.snippets.push(Snippet {
+                                    id,
+                                    title,
+                                    category,
+                                    body: std::mem::take(&mut ed.body),
+                                    is_secure: ed.is_secure,
+                                    password_hash,
+                                });
+                            }
+                            self.snippets_changed();
                         }
                     } else {
-                        let id = self.next_id;
-                        self.next_id += 1;
-                        self.snippets.push(Snippet {
-                            id,
-                            title,
-                            category,
-                            body: std::mem::take(&mut ed.body),
-                        });
+                        // Normalize category: ensure it's canonical, fall back to "Uncategorized" if empty
+                        let category = {
+                            let canonical = self.add_category(&ed.category);
+                            if canonical.is_empty() {
+                                self.add_category("Uncategorized")
+                            } else {
+                                canonical
+                            }
+                        };
+                        let title = ed.title.trim().to_string();
+                        let password_hash = if ed.is_secure && ed.show_password_fields {
+                            hash_password(&ed.password)
+                        } else {
+                            String::new()
+                        };
+                        if let Some(id) = ed.id {
+                            if let Some(s) = self.snippets.iter_mut().find(|s| s.id == id) {
+                                s.title = title;
+                                s.category = category;
+                                s.is_secure = ed.is_secure;
+                                s.password_hash = password_hash;
+                                // The editor is closing, so its buffer can be moved
+                                // instead of copied — snippet bodies can be large.
+                                s.body = std::mem::take(&mut ed.body);
+                            }
+                        } else {
+                            let id = self.next_id;
+                            self.next_id += 1;
+                            self.snippets.push(Snippet {
+                                id,
+                                title,
+                                category,
+                                body: std::mem::take(&mut ed.body),
+                                is_secure: ed.is_secure,
+                                password_hash,
+                            });
+                        }
+                        self.snippets_changed();
                     }
-                    self.snippets_changed();
                 }
                 EditorResult::Delete => {
                     if let Some(id) = ed.id {
@@ -1256,6 +1455,82 @@ impl eframe::App for CopyIt {
                     }
                 }
             }
+        }
+
+        // ---- Password prompt window (for secure snippets) ----
+        if let Some(mut prompt) = self.password_prompt.take() {
+            let mut window_open = true;
+            let mut verified = false;
+            let snippet_title = self.snippets.iter().find(|s| s.id == prompt.snippet_id).map(|s| s.title.clone()).unwrap_or_default();
+
+            let mut close_window = false;
+            egui::Window::new("🔒 Password Required")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(360.0)
+                .open(&mut window_open)
+                .show(ctx, |ui| {
+                    ui.label(format!("Enter password for \"{}\"", snippet_title));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Password:");
+                        ui.add_space(8.0);
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut prompt.password)
+                                .password(true)
+                                .desired_width(200.0),
+                        );
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            verified = true;
+                        }
+                    });
+                    if let Some(err) = &prompt.error {
+                        ui.colored_label(WARNING_COLOR, err);
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Cancel").clicked() {
+                                close_window = true;
+                            }
+                            if ui.button("Verify").clicked() {
+                                verified = true;
+                            }
+                        });
+                    });
+                });
+
+            if close_window {
+                window_open = false;
+            }
+
+            if verified {
+                // Verify password
+                if let Some(s) = self.snippets.iter().find(|s| s.id == prompt.snippet_id) {
+                    if verify_password(&prompt.password, &s.password_hash) {
+                        // Password correct - perform the action
+                        match prompt.action {
+                            PasswordAction::Copy => {
+                                ctx.output_mut(|o| o.copied_text = s.body.clone());
+                                self.copied = Some((s.id, now));
+                                ctx.request_repaint_after(std::time::Duration::from_millis(1300));
+                            }
+                            PasswordAction::Edit => {
+                                self.editor = Some(Editor::from_snippet(s, &self.categories));
+                            }
+                        }
+                    } else {
+                        // Password incorrect - show error and re-prompt
+                        prompt.error = Some("Incorrect password".to_string());
+                        prompt.password.clear();
+                        self.password_prompt = Some(prompt);
+                    }
+                }
+            } else if window_open {
+                // User didn't verify yet, keep prompt open
+                self.password_prompt = Some(prompt);
+            }
+            // If window_open is false and not verified, prompt is dropped (cancelled)
         }
     }
 }
@@ -1623,6 +1898,7 @@ mod layout_tests {
             new_header_category: String::new(),
             category_error: None,
             save_error: None,
+            password_prompt: None,
         };
         app.rebuild_derived();
         app
@@ -1634,6 +1910,8 @@ mod layout_tests {
             title: format!("Snippet {id}"),
             category: category.to_string(),
             body: format!("body {id}"),
+            is_secure: false,
+            password_hash: String::new(),
         }
     }
 
