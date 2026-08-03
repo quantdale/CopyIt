@@ -1,8 +1,10 @@
+use crate::editor::{self, Editor, EditorResult};
+use crate::grid;
 use crate::model::Snippet;
 use crate::storage::{self, Config};
+use crate::store::Store;
 use crate::theme::Theme;
 use eframe::egui;
-use std::path::PathBuf;
 
 /// Prefix of the banner message for a failed `snippets.json` write. Shared so a later
 /// successful snippet save can retire exactly its own error and nothing else.
@@ -13,28 +15,6 @@ const CONFIG_SAVE_ERROR: &str = "Couldn't save settings";
 const WARNING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xef, 0x44, 0x44);
 /// Characters of a snippet body shown in a card's preview line.
 const PREVIEW_CHARS: usize = 220;
-
-// ---- Card grid geometry ----
-// The grid is uniform, and both the renderer and the drag-and-drop hit-testing derive
-// card positions from these numbers, so they live in one place.
-/// Width of a card's inner content area.
-const CARD_INNER_W: f32 = 300.0;
-/// Height of a card's inner content area.
-const CARD_INNER_H: f32 = 168.0;
-/// The group frame around each card adds 10 px of inner margin on each side.
-const CARD_FRAME_MARGIN: f32 = 20.0;
-/// Full visible width of a card, frame included.
-const CARD_W: f32 = CARD_INNER_W + CARD_FRAME_MARGIN;
-/// Full visible height of a card, frame included.
-const CARD_H: f32 = CARD_INNER_H + CARD_FRAME_MARGIN;
-/// Gap between neighbouring cards, horizontally and vertically.
-const CARD_SPACING: f32 = 12.0;
-/// Vertical distance from the top of one row of cards to the top of the next.
-const ROW_PITCH: f32 = CARD_H + CARD_SPACING;
-/// Blank space above the first row inside the scroll area.
-const GRID_TOP_SPACE: f32 = 4.0;
-/// Horizontal padding on both sides of the grid.
-const GRID_MARGIN_X: f32 = 18.0;
 
 /// Per-snippet data derived from the snippet's own text: the lowercase forms the
 /// search filter matches against, and the collapsed one-line card preview.
@@ -99,24 +79,23 @@ impl FilterCache {
 /// manages the editor modal, drag-and-drop reordering, clipboard operations,
 /// and persists all changes to disk automatically after mutations.
 pub struct CopyIt {
-    snippets: Vec<Snippet>,                        // Full snippet library; order is preserved and user-draggable
-    derived: Vec<Derived>,                         // Cached lowercase text + card preview, one entry per snippet (same order)
-    generation: u64,                               // Bumped whenever `snippets`/`derived` change; invalidates the filter cache
-    filter: FilterCache,                           // Memoized indices of the snippets visible under the current search/category
-    next_id: u64,                                  // Next ID to assign to a new snippet; incremented on creation
-    path: PathBuf,                                 // Path to snippets.json in the stable data directory
-    config_path: PathBuf,                          // Path to config.json (categories + theme selection)
-    categories: Vec<String>,                       // Sorted, deduplicated list of all known categories
-    search: String,                                // Active search query; filters snippets by title/body/category
-    category_filter: String,                       // "All" or a specific category; filters visible snippets
-    theme: Theme,                                  // Currently selected theme; applied to egui visuals each frame
-    editor: Option<Editor>,                        // Modal editor state; None when no editor is open
-    copied: Option<(u64, f64)>,                    // (id, time) for the transient "Copied" feedback (1.2s visibility)
-    drag: Option<DragState>,                       // In-progress drag operation; None when idle
-    adding_header_category: bool,                  // True when the user is typing a new category in the top bar
-    new_header_category: String,                   // Input buffer for the new category name in the top bar
-    category_error: Option<String>,                // Validation error for the new category (e.g., "All" is reserved)
-    save_error: Option<String>,                    // File I/O error message to display at the top
+    snippets: Vec<Snippet>, // Full snippet library; order is preserved and user-draggable
+    derived: Vec<Derived>, // Cached lowercase text + card preview, one entry per snippet (same order)
+    generation: u64, // Bumped whenever `snippets`/`derived` change; invalidates the filter cache
+    filter: FilterCache, // Memoized indices of the snippets visible under the current search/category
+    next_id: u64,        // Next ID to assign to a new snippet; incremented on creation
+    store: Store,        // Persistence seam: where data lives and how it's loaded/saved
+    categories: Vec<String>, // Sorted, deduplicated list of all known categories
+    search: String,      // Active search query; filters snippets by title/body/category
+    category_filter: String, // "All" or a specific category; filters visible snippets
+    theme: Theme,        // Currently selected theme; applied to egui visuals each frame
+    editor: Option<Editor>, // Modal editor state; None when no editor is open
+    copied: Option<(u64, f64)>, // (id, time) for the transient "Copied" feedback (1.2s visibility)
+    drag: Option<DragState>, // In-progress drag operation; None when idle
+    adding_header_category: bool, // True when the user is typing a new category in the top bar
+    new_header_category: String, // Input buffer for the new category name in the top bar
+    category_error: Option<String>, // Validation error for the new category (e.g., "All" is reserved)
+    save_error: Option<String>,     // File I/O error message to display at the top
 }
 
 /// Tracks an in-progress drag operation. Initialized when the user clicks and holds on a card,
@@ -129,119 +108,25 @@ pub struct CopyIt {
 /// start. An index captured then and used at drop time would be stale if the library
 /// changed in between (a delete would move the wrong card, or panic on a
 /// now-out-of-bounds `Vec::remove`).
-struct DragState {
-    snippet_id: u64, // The snippet being dragged (stable ID across reordering)
-    start_pos: egui::Pos2, // Pointer position at drag initiation; tracks distance for threshold
-    dragging: bool, // true only after pointer has moved >4px; prevents accidental drags on click
-}
-
-/// Modal editor state for creating or editing a snippet. The `adding_category` and
-/// `new_category` fields track an inline sub-form (entered via the category dropdown)
-/// that lets users add a category without closing the editor. The `confirm_delete`
-/// flag requires a second click to prevent accidental deletions. This separation of concerns
-/// allows the editor to support category creation inline while keeping the main app's category
-/// list management separate, improving UX for workflows where the user invents a new category mid-edit.
-struct Editor {
-    id: Option<u64>, // None = creating a new snippet; Some(id) = editing existing with this stable ID
-    title: String,
-    category: String,
-    new_category: String,   // input buffer for inline category creation; cleared when user confirms
-    adding_category: bool,   // true when user clicked "+ Add new category" in the dropdown
-    body: String,
-    confirm_delete: bool,    // set to true on first "Delete" click; requires second "Confirm delete" to prevent accidents
-}
-
-impl Editor {
-    /// Creates a new blank editor state for adding a new snippet.
-    /// Initializes with empty title and body, the first category (or empty string if no categories exist),
-    /// and disables inline category creation and delete confirmation.
-    fn blank(categories: &[String]) -> Self {
-        Editor {
-            id: None,
-            title: String::new(),
-            category: categories.first().cloned().unwrap_or_default(),
-            new_category: String::new(),
-            adding_category: false,
-            body: String::new(),
-            confirm_delete: false,
-        }
-    }
-
-    /// Creates an editor state pre-populated from an existing snippet for editing.
-    /// Loads the snippet's title, body, and category; ensures the category matches one
-    /// from the canonical list (case-insensitive), falling back to the original if no match found.
-    /// Used when the user clicks Edit on a card.
-    fn from_snippet(s: &Snippet, categories: &[String]) -> Self {
-        let category = categories
-            .iter()
-            .find(|c| c.eq_ignore_ascii_case(&s.category))
-            .cloned()
-            .unwrap_or_else(|| s.category.clone());
-        Editor {
-            id: Some(s.id),
-            title: s.title.clone(),
-            category,
-            new_category: String::new(),
-            adding_category: false,
-            body: s.body.clone(),
-            confirm_delete: false,
-        }
-    }
-}
+///
+/// The threshold, drop hit-testing, and gap math all live in `grid.rs`; this app-level
+/// wrapper keeps the id and pointer position and defers geometry to the grid module.
+type DragState = grid::DragMachine;
 
 /// User action triggered from card interaction (Copy or Edit button click).
 /// Used to defer action handling until after UI rendering to avoid borrowing conflicts.
 enum Action {
-    Copy(u64),   // User clicked Copy button on a snippet; copy its body to clipboard
-    Edit(u64),   // User clicked Edit button on a snippet; open editor modal
-}
-
-/// Result of the editor modal interaction: whether to save, delete, cancel, or add a new category.
-/// The editor modal handles inline category creation, so AddCategory is returned when the user
-/// creates a new category within the editor and then the main app adds it to the canonical list.
-enum EditorResult {
-    None,                     // No action (editor still open); keep editor visible
-    Save,                     // User clicked Save in editor; persist changes and close editor
-    Cancel,                   // User clicked Cancel or closed the window; discard changes
-    Delete,                   // User confirmed deletion (second click); remove the snippet
-    AddCategory(String),      // User created a new category in the editor; add to canonical list
+    Copy(u64), // User clicked Copy button on a snippet; copy its body to clipboard
+    Edit(u64), // User clicked Edit button on a snippet; open editor modal
 }
 
 /// Layout and response data returned from rendering a single snippet card.
 /// Separates the card frame's bounding rect from the button responses, used for
 /// drag-and-drop interaction detection and click handling.
 struct CardWidgets {
-    frame_rect: egui::Rect,   // Bounding rectangle of the entire card frame (includes padding)
-    copy: egui::Response,     // Response from the Copy button; checked for clicks
-    edit: egui::Response,     // Response from the Edit button; checked for clicks
-}
-
-/// One-time recovery for users upgrading from earlier versions that stored
-/// `snippets.json`/`config.json` next to the .exe: if the new stable location
-/// doesn't have a file yet, pull in the first non-empty copy found in a
-/// legacy location (next to the exe, `target/debug`, `target/release`, cwd).
-/// This migration runs once per file per session; after that, the stable location
-/// owns the data and legacy locations are ignored. Users who have data in multiple
-/// locations get the first non-empty match (search order: exe dir, debug, release, cwd).
-fn migrate_legacy_file(new_path: &std::path::Path, filename: &str) {
-    if new_path.exists() {
-        return; // Already migrated or was created fresh; don't search legacy locations
-    }
-    for dir in storage::legacy_candidate_dirs() {
-        let candidate = dir.join(filename);
-        if candidate == new_path {
-            continue; // Skip the new location itself (shouldn't happen, but be safe)
-        }
-        if let Ok(data) = std::fs::read_to_string(&candidate) {
-            let trimmed = data.trim();
-            // Skip empty or dummy JSON (e.g. "[]" or "{}" from a failed write).
-            if trimmed.is_empty() || trimmed == "[]" || trimmed == "{}" {
-                continue;
-            }
-            let _ = std::fs::write(new_path, data);
-            return; // Success: migrate and stop searching
-        }
-    }
+    frame_rect: egui::Rect, // Bounding rectangle of the entire card frame (includes padding)
+    copy: egui::Response,   // Response from the Copy button; checked for clicks
+    edit: egui::Response,   // Response from the Edit button; checked for clicks
 }
 
 /// Builds the banner text for a data file that exists but couldn't be parsed, moving the
@@ -265,20 +150,22 @@ impl CopyIt {
     /// seeds defaults if snippets.json doesn't exist, normalizes all categories, and applies
     /// the saved theme. Reports any file I/O errors in save_error for display in the UI.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let path = storage::data_path();
-        let config_path = storage::config_path();
-        migrate_legacy_file(&path, "snippets.json");
-        migrate_legacy_file(&config_path, "config.json");
+        let store = Store::open();
+        store.migrate_legacy();
 
         let mut save_error: Option<String> = None;
 
         // A file that exists but doesn't parse is *not* a first launch: preserve it
         // before the seeded defaults claim its name, and tell the user where it went.
-        let (mut snippets, seeded) = match storage::load(&path) {
+        let (mut snippets, seeded) = match store.load_snippets() {
             storage::Load::Loaded(snippets) => (snippets, false),
             storage::Load::Missing => (crate::seed::defaults(), true),
             storage::Load::Corrupt(e) => {
-                save_error = Some(describe_corrupt_file(&path, "snippets.json", &e));
+                save_error = Some(describe_corrupt_file(
+                    &store.snippets_path,
+                    "snippets.json",
+                    &e,
+                ));
                 (crate::seed::defaults(), true)
             }
         };
@@ -286,13 +173,13 @@ impl CopyIt {
             s.category = storage::canonical_category(&s.category);
         }
 
-        let mut config = match storage::load_config(&config_path) {
+        let mut config = match store.load_config() {
             storage::Load::Loaded(config) => config,
             storage::Load::Missing => Config::from_snippets(&snippets),
             storage::Load::Corrupt(e) => {
                 // Always move the unreadable file aside, even when the banner ends up
                 // showing the snippet-library notice instead of this one.
-                let note = describe_corrupt_file(&config_path, "config.json", &e);
+                let note = describe_corrupt_file(&store.config_path, "config.json", &e);
                 // The snippet library is the more important loss; don't bury its notice.
                 if save_error.is_none() {
                     save_error = Some(note);
@@ -301,7 +188,7 @@ impl CopyIt {
             }
         };
         config.add_categories(snippets.iter().map(|s| s.category.as_str()));
-        if let Err(e) = storage::save_config(&config_path, &config) {
+        if let Err(e) = store.save_config(&config) {
             save_error = Some(format!("{CONFIG_SAVE_ERROR}: {e}"));
         }
 
@@ -310,7 +197,7 @@ impl CopyIt {
 
         let next_id = snippets.iter().map(|s| s.id).max().unwrap_or(0) + 1;
         if seeded {
-            if let Err(e) = storage::save(&path, &snippets) {
+            if let Err(e) = store.save_snippets(&snippets) {
                 save_error = Some(format!("{SNIPPETS_SAVE_ERROR}: {e}"));
             }
         }
@@ -323,8 +210,7 @@ impl CopyIt {
             generation: 0,
             filter: FilterCache::default(),
             next_id,
-            path,
-            config_path,
+            store,
             categories: config.categories,
             search: String::new(),
             category_filter: "All".to_string(),
@@ -414,7 +300,7 @@ impl CopyIt {
     /// Persists the full snippet library to snippets.json in the stable data directory.
     /// Updates save_error if an I/O error occurs; the error is shown in the top bar.
     fn save_snippets(&mut self) {
-        match storage::save(&self.path, &self.snippets) {
+        match self.store.save_snippets(&self.snippets) {
             Ok(()) => self.clear_save_error(SNIPPETS_SAVE_ERROR),
             Err(e) => self.save_error = Some(format!("{SNIPPETS_SAVE_ERROR}: {e}")),
         }
@@ -428,7 +314,7 @@ impl CopyIt {
             categories: self.categories.clone(),
             theme: self.theme.to_string(),
         };
-        match storage::save_config(&self.config_path, &config) {
+        match self.store.save_config(&config) {
             Ok(()) => self.clear_save_error(CONFIG_SAVE_ERROR),
             Err(e) => self.save_error = Some(format!("{CONFIG_SAVE_ERROR}: {e}")),
         }
@@ -537,7 +423,7 @@ impl CopyIt {
         is_dragged: bool,
     ) -> CardWidgets {
         let s = &self.snippets[idx];
-        let card_h = CARD_INNER_H;
+        let card_h = grid::CARD_INNER_H;
 
         // The preview is cached per snippet; fall back to computing it only if the
         // caches somehow got out of step, so a stale index can never panic or blank
@@ -580,14 +466,17 @@ impl CopyIt {
                                 if resp.clicked() {
                                     actions.push(Action::Copy(s.id));
                                 }
-                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(&s.title).strong().size(15.0),
-                                        )
-                                        .truncate(true),
-                                    );
-                                });
+                                ui.with_layout(
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&s.title).strong().size(15.0),
+                                            )
+                                            .truncate(true),
+                                        );
+                                    },
+                                );
                                 resp
                             })
                             .inner
@@ -605,11 +494,7 @@ impl CopyIt {
                         .rounding(egui::Rounding::same(4.0))
                         .inner_margin(egui::Margin::symmetric(6.0, 2.0))
                         .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(&s.category)
-                                    .small()
-                                    .color(badge_text),
-                            );
+                            ui.label(egui::RichText::new(&s.category).small().color(badge_text));
                         });
 
                     ui.add_space(6.0);
@@ -640,7 +525,11 @@ impl CopyIt {
 
         let frame_rect = frame.response.rect;
         let (copy, edit) = frame.inner;
-        CardWidgets { frame_rect, copy, edit }
+        CardWidgets {
+            frame_rect,
+            copy,
+            edit,
+        }
     }
 
     /// Lays out the responsive card grid inside the scroll area and returns the column
@@ -670,22 +559,31 @@ impl CopyIt {
         hover_cursor: &mut Option<egui::CursorIcon>,
     ) -> (usize, Vec<egui::Rect>) {
         egui::Frame::none()
-            .inner_margin(egui::Margin::symmetric(GRID_MARGIN_X, 0.0))
+            .inner_margin(egui::Margin::symmetric(grid::GRID_MARGIN_X, 0.0))
             .show(ui, |ui| {
                 let avail = ui.available_width();
-                let cols = ((avail / (CARD_W + CARD_SPACING)).floor() as usize).max(1);
+                let cols = grid::cols_for(avail);
 
                 let origin = ui.cursor().min;
                 let rows = filtered.len().div_ceil(cols);
                 let card_rects: Vec<egui::Rect> = (0..filtered.len())
-                    .map(|i| grid_card_rect(i, cols, origin, CARD_W, CARD_H, CARD_SPACING))
+                    .map(|i| {
+                        grid::grid_card_rect(
+                            i,
+                            cols,
+                            origin,
+                            grid::CARD_W,
+                            grid::CARD_H,
+                            grid::CARD_SPACING,
+                        )
+                    })
                     .collect();
 
                 let (first_row, last_row) =
-                    visible_rows(ui.clip_rect(), origin.y, ROW_PITCH, rows);
+                    grid::visible_rows(ui.clip_rect(), origin.y, grid::ROW_PITCH, rows);
                 // Reserve the height of the rows above the viewport.
                 if first_row > 0 {
-                    ui.add_space(first_row as f32 * ROW_PITCH);
+                    ui.add_space(first_row as f32 * grid::ROW_PITCH);
                 }
 
                 for row_start in (first_row..=last_row).map(|r| r * cols) {
@@ -700,25 +598,32 @@ impl CopyIt {
                             ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
                             for (row_offset, &idx) in row.iter().enumerate() {
                                 let is_dragged = self.drag.as_ref().is_some_and(|d| {
-                                    d.dragging && d.snippet_id == self.snippets[idx].id
+                                    d.is_dragging() && d.snippet_id() == self.snippets[idx].id
                                 });
 
                                 let drag_id = ui.id().with("card_drag").with(idx);
                                 let expected_rect = egui::Rect::from_min_size(
                                     ui.cursor().min,
-                                    egui::vec2(CARD_W, CARD_H),
+                                    egui::vec2(grid::CARD_W, grid::CARD_H),
                                 );
                                 let drag_resp =
                                     ui.interact(expected_rect, drag_id, egui::Sense::drag());
 
-                                let widgets =
-                                    self.card(ui, idx, CARD_INNER_W, now, actions, is_dragged);
+                                let widgets = self.card(
+                                    ui,
+                                    idx,
+                                    grid::CARD_INNER_W,
+                                    now,
+                                    actions,
+                                    is_dragged,
+                                );
 
                                 debug_assert!(
                                     card_rects
                                         .get(row_start + row_offset)
-                                        .is_some_and(|r| r.min.distance(widgets.frame_rect.min)
-                                            < 0.5),
+                                        .is_some_and(
+                                            |r| r.min.distance(widgets.frame_rect.min) < 0.5
+                                        ),
                                     "computed card rect must match the rendered one"
                                 );
 
@@ -742,17 +647,17 @@ impl CopyIt {
                                     *hover_cursor = Some(egui::CursorIcon::Grab);
                                 }
 
-                                ui.add_space(CARD_SPACING);
+                                ui.add_space(grid::CARD_SPACING);
                             }
                         });
                     });
-                    ui.add_space(CARD_SPACING);
+                    ui.add_space(grid::CARD_SPACING);
                 }
 
                 // Reserve the height of the rows below the viewport, so the scrollbar
                 // still spans the whole library.
                 if last_row + 1 < rows {
-                    ui.add_space((rows - 1 - last_row) as f32 * ROW_PITCH);
+                    ui.add_space((rows - 1 - last_row) as f32 * grid::ROW_PITCH);
                 }
 
                 (cols, card_rects)
@@ -841,8 +746,9 @@ impl eframe::App for CopyIt {
                     if ui.button("Add").clicked() || enter_pressed {
                         let raw = self.new_header_category.trim().to_string();
                         if raw.eq_ignore_ascii_case("all") {
-                            self.category_error =
-                                Some("\"All\" is reserved and can't be used as a category".to_string());
+                            self.category_error = Some(
+                                "\"All\" is reserved and can't be used as a category".to_string(),
+                            );
                         } else if !raw.is_empty() {
                             let canonical = self.add_category(&raw);
                             if !canonical.is_empty() {
@@ -933,131 +839,133 @@ impl eframe::App for CopyIt {
             let mut drag_start: Option<(u64, egui::Pos2)> = None;
             let mut hover_cursor: Option<egui::CursorIcon> = None;
 
-            let scroll_output = egui::ScrollArea::vertical()
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                    ui.add_space(GRID_TOP_SPACE);
-                    self.card_grid(
-                        ui,
-                        &filtered,
-                        now,
-                        &mut actions,
-                        &mut drag_start,
-                        &mut hover_cursor,
-                    )
-                });
+            let scroll_output =
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                        ui.add_space(grid::GRID_TOP_SPACE);
+                        self.card_grid(
+                            ui,
+                            &filtered,
+                            now,
+                            &mut actions,
+                            &mut drag_start,
+                            &mut hover_cursor,
+                        )
+                    });
 
-                    // Process normal click actions.
-                    for a in actions {
-                        match a {
-                            Action::Copy(id) => {
-                                if let Some(s) = self.snippets.iter().find(|s| s.id == id) {
-                                    let text = s.body.clone();
-                                    ui.output_mut(|o| o.copied_text = text);
-                                    self.copied = Some((id, now));
-                                    ctx.request_repaint_after(std::time::Duration::from_millis(1300));
-                                }
-                            }
-                            Action::Edit(id) => {
-                                if let Some(s) = self.snippets.iter().find(|s| s.id == id) {
-                                    self.editor = Some(Editor::from_snippet(s, &self.categories));
-                                }
-                            }
+            // Process normal click actions.
+            for a in actions {
+                match a {
+                    Action::Copy(id) => {
+                        if let Some(s) = self.snippets.iter().find(|s| s.id == id) {
+                            let text = s.body.clone();
+                            ui.output_mut(|o| o.copied_text = text);
+                            self.copied = Some((id, now));
+                            ctx.request_repaint_after(std::time::Duration::from_millis(1300));
                         }
                     }
-
-                    // Start a new drag if requested.
-                    if let Some((id, pos)) = drag_start {
-                        self.drag = Some(DragState {
-                            snippet_id: id,
-                            start_pos: pos,
-                            dragging: false,
-                        });
-                    }
-
-                    // Card rects collected inside a ScrollArea are ALREADY in screen space:
-                    // the scroll area places its content Ui at `inner_rect.min - offset`, so
-                    // every widget rect below it is absolute and scroll-adjusted. Translating
-                    // them again (by that same origin) shifted all drop geometry down by the
-                    // height of the top bar, and further off with every pixel scrolled — the
-                    // insertion line and the chosen drop slot no longer matched the cursor.
-                    let card_screen_rects: &[egui::Rect] = &scroll_output.inner.1;
-                    let grid_area = scroll_output.inner_rect;
-                    let cols = scroll_output.inner.0;
-
-                    // Update drag threshold.
-                    if let Some(drag) = &mut self.drag {
-                        if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                            if !drag.dragging && drag.start_pos.distance(pos) > 4.0 {
-                                drag.dragging = true;
-                            }
+                    Action::Edit(id) => {
+                        if let Some(s) = self.snippets.iter().find(|s| s.id == id) {
+                            self.editor = Some(Editor::from_snippet(s, &self.categories));
                         }
                     }
+                }
+            }
 
-                    // Draw drag visuals and handle drop.
-                    let drag_state = self.drag.as_ref().map(|d| (d.dragging, d.snippet_id));
-                    if let Some((dragging, snippet_id)) = drag_state {
-                        let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
-                        let pointer_released = ctx.input(|i| i.pointer.primary_released());
-                        let pointer_moved = ctx.input(|i| i.pointer.delta().length_sq() > 0.0);
+            // Start a new drag if requested.
+            if let Some((id, pos)) = drag_start {
+                self.drag = Some(DragState::begin(id, pos));
+            }
 
-                        if dragging {
-                            hover_cursor = Some(egui::CursorIcon::Grabbing);
+            // Card rects collected inside a ScrollArea are ALREADY in screen space:
+            // the scroll area places its content Ui at `inner_rect.min - offset`, so
+            // every widget rect below it is absolute and scroll-adjusted. Translating
+            // them again (by that same origin) shifted all drop geometry down by the
+            // height of the top bar, and further off with every pixel scrolled — the
+            // insertion line and the chosen drop slot no longer matched the cursor.
+            let card_screen_rects: &[egui::Rect] = &scroll_output.inner.1;
+            let grid_area = scroll_output.inner_rect;
+            let cols = scroll_output.inner.0;
 
-                            if let Some(pointer) = pointer_pos {
-                                let gap = nearest_gap(pointer, card_screen_rects, cols, CARD_SPACING, CARD_W);
-                                draw_insertion_line(
-                                    ctx,
-                                    gap,
-                                    card_screen_rects,
-                                    cols,
-                                    CARD_SPACING,
-                                    CARD_W,
-                                    CARD_H,
-                                );
+            // Update drag threshold: the machine promotes itself to a real
+            // drag once the pointer has moved far enough past the start.
+            if let Some(drag) = &mut self.drag {
+                if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                    drag.pointer(pos);
+                }
+            }
 
-                                // Hollow ghost box following the cursor.
-                                let ghost_rect = egui::Rect::from_min_size(
-                                    pointer + egui::vec2(8.0, 8.0),
-                                    egui::vec2(CARD_W, CARD_H),
-                                );
-                                let painter = ctx.layer_painter(egui::LayerId::new(
-                                    egui::Order::Tooltip,
-                                    egui::Id::new("drag_ghost"),
-                                ));
-                                painter.rect_stroke(
-                                    ghost_rect,
-                                    egui::Rounding::same(8.0),
-                                    egui::Stroke::new(
-                                        2.0_f32,
-                                        egui::Color32::from_rgb(0x60, 0xb0, 0xff),
-                                    ),
-                                );
-                            }
+            // Draw drag visuals and handle drop.
+            if self.drag.as_ref().is_some_and(|d| d.is_dragging()) {
+                let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
+                let pointer_released = ctx.input(|i| i.pointer.primary_released());
+                let pointer_moved = ctx.input(|i| i.pointer.delta().length_sq() > 0.0);
 
-                            if pointer_released {
-                                if let Some(pointer) = pointer_pos {
-                                    if grid_area.contains(pointer) {
-                                        let gap =
-                                            nearest_gap(pointer, card_screen_rects, cols, CARD_SPACING, CARD_W);
-                                        self.reorder(snippet_id, gap, &filtered);
-                                    }
-                                }
-                                self.drag = None;
-                            } else if pointer_moved {
-                                ctx.request_repaint();
-                            }
-                        } else if pointer_released {
-                            // Released before crossing the drag threshold: cancel.
-                            self.drag = None;
-                        }
+                hover_cursor = Some(egui::CursorIcon::Grabbing);
+
+                if let Some(pointer) = pointer_pos {
+                    let gap = grid::nearest_gap(
+                        pointer,
+                        card_screen_rects,
+                        cols,
+                        grid::CARD_SPACING,
+                        grid::CARD_W,
+                    );
+                    grid::draw_insertion_line(
+                        ctx,
+                        gap,
+                        card_screen_rects,
+                        cols,
+                        grid::CARD_SPACING,
+                        grid::CARD_W,
+                        grid::CARD_H,
+                    );
+
+                    // Hollow ghost box following the cursor.
+                    let ghost_rect = egui::Rect::from_min_size(
+                        pointer + egui::vec2(8.0, 8.0),
+                        egui::vec2(grid::CARD_W, grid::CARD_H),
+                    );
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Tooltip,
+                        egui::Id::new("drag_ghost"),
+                    ));
+                    painter.rect_stroke(
+                        ghost_rect,
+                        egui::Rounding::same(8.0),
+                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0x60, 0xb0, 0xff)),
+                    );
+                }
+
+                if pointer_released {
+                    // Consume the machine regardless of where the release
+                    // happened; only a drop inside the grid reorders.
+                    let drag_ctx = grid::DragContext {
+                        grid_area,
+                        card_rects: card_screen_rects,
+                        cols,
+                    };
+                    let dropped = self
+                        .drag
+                        .take()
+                        .and_then(|drag| pointer_pos.map(|p| drag.release(p, &drag_ctx)));
+                    if let Some(Some((id, gap))) = dropped {
+                        self.reorder(id, gap, &filtered);
                     }
+                } else if pointer_moved {
+                    ctx.request_repaint();
+                }
+            } else if ctx.input(|i| i.pointer.primary_released()) {
+                // Released before crossing the drag threshold: cancel.
+                self.drag = None;
+            }
 
-                    if let Some(cursor) = hover_cursor {
-                        ctx.output_mut(|o| o.cursor_icon = cursor);
-                    }
-                });
+            if let Some(cursor) = hover_cursor {
+                ctx.output_mut(|o| o.cursor_icon = cursor);
+            }
+        });
 
         // Hand the index buffer back so its allocation is reused next frame.
         self.restore_filtered(filtered);
@@ -1098,10 +1006,7 @@ impl eframe::App for CopyIt {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label("Title");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut ed.title)
-                                    .desired_width(280.0),
-                            );
+                            ui.add(egui::TextEdit::singleline(&mut ed.title).desired_width(280.0));
                         });
 
                         ui.add_space(12.0);
@@ -1201,8 +1106,10 @@ impl eframe::App for CopyIt {
                     });
                 });
 
-            match result {
-                EditorResult::Save => {
+            // Pure transition: the button click plus the window's open/close flag
+            // decide what happens next; the app only applies the outcome.
+            match editor::decide(result, ed, window_open) {
+                editor::EditorOutcome::Save(mut ed) => {
                     // Normalize category: ensure it's canonical, fall back to "Uncategorized" if empty
                     let category = {
                         let canonical = self.add_category(&ed.category);
@@ -1233,14 +1140,12 @@ impl eframe::App for CopyIt {
                     }
                     self.snippets_changed();
                 }
-                EditorResult::Delete => {
-                    if let Some(id) = ed.id {
-                        self.snippets.retain(|s| s.id != id);
-                        self.snippets_changed();
-                    }
+                editor::EditorOutcome::Delete(id) => {
+                    self.snippets.retain(|s| s.id != id);
+                    self.snippets_changed();
                 }
-                EditorResult::Cancel => {}
-                EditorResult::AddCategory(name) => {
+                editor::EditorOutcome::Close => {}
+                editor::EditorOutcome::AddCategory(name, mut ed) => {
                     let canonical = self.add_category(&name);
                     if !canonical.is_empty() {
                         ed.category = canonical;
@@ -1249,11 +1154,8 @@ impl eframe::App for CopyIt {
                     ed.adding_category = false;
                     self.editor = Some(ed);
                 }
-                EditorResult::None => {
-                    // Keep editing unless the user closed the window via the X.
-                    if window_open {
-                        self.editor = Some(ed);
-                    }
+                editor::EditorOutcome::Keep(ed) => {
+                    self.editor = Some(ed);
                 }
             }
         }
@@ -1295,57 +1197,6 @@ fn preview_text(body: &str, max: usize) -> String {
     truncate_chars(&collapsed, max)
 }
 
-/// Position of the card at index `i` of the filtered grid, computed from the grid's
-/// origin rather than from layout. The grid is uniform — `cols` cards of `card_w` x
-/// `card_h` per row, separated by `spacing` — so off-screen cards still have exact
-/// rects for drag-and-drop hit-testing without being laid out or painted.
-fn grid_card_rect(
-    i: usize,
-    cols: usize,
-    origin: egui::Pos2,
-    card_w: f32,
-    card_h: f32,
-    spacing: f32,
-) -> egui::Rect {
-    let cols = cols.max(1);
-    let col = i % cols;
-    let row = i / cols;
-    egui::Rect::from_min_size(
-        origin
-            + egui::vec2(
-                col as f32 * (card_w + spacing),
-                row as f32 * (card_h + spacing),
-            ),
-        egui::vec2(card_w, card_h),
-    )
-}
-
-/// Inclusive range of grid rows that intersect `clip` (the visible part of the scroll
-/// area), with one row of overscan on each side so a row entering the viewport is
-/// already laid out and edge rounding can't reveal a gap. Rows outside the range are
-/// replaced by blank space of the same height, so scrolling and card positions are
-/// unaffected. Falls back to "every row" if the geometry isn't finite.
-fn visible_rows(clip: egui::Rect, origin_y: f32, row_pitch: f32, rows: usize) -> (usize, usize) {
-    let max_row = rows.saturating_sub(1);
-    if rows == 0 {
-        return (0, 0);
-    }
-    if !row_pitch.is_finite()
-        || row_pitch <= 0.0
-        || !origin_y.is_finite()
-        || !clip.top().is_finite()
-        || !clip.bottom().is_finite()
-    {
-        return (0, max_row);
-    }
-    let first = (((clip.top() - origin_y) / row_pitch).floor() - 1.0).max(0.0);
-    let last = (((clip.bottom() - origin_y) / row_pitch).ceil() + 1.0).max(0.0);
-    // `as usize` saturates, so an absurd clip rect clamps instead of wrapping.
-    let first = (first as usize).min(max_row);
-    let last = (last as usize).clamp(first, max_row);
-    (first, last)
-}
-
 /// Deterministically maps a category name to a color from a 6-color palette via hashing.
 /// Same category name always maps to the same color. Used to visually distinguish categories in badges.
 fn category_color(cat: &str) -> egui::Color32 {
@@ -1364,238 +1215,16 @@ fn category_color(cat: &str) -> egui::Color32 {
     palette[h % palette.len()]
 }
 
-/// Finds the closest insertion gap (0 to n, inclusive) based on the pointer position.
-/// A "gap" is a logical position between cards in the filtered grid: gap 0 is before the first card,
-/// gap n is after the last card, and gaps in between are the spaces between adjacent cards (both
-/// vertical within a row and horizontal between rows). The function computes a representative
-/// point for each gap (via gap_point) and returns the index of the gap whose point is closest
-/// to the current pointer position. This guides the insertion line and drop target.
-/// Returns 0 if the card list is empty (edge case: no cards to reorder against).
-fn nearest_gap(
-    pointer: egui::Pos2,
-    rects: &[egui::Rect],
-    cols: usize,
-    spacing: f32,
-    card_w: f32,
-) -> usize {
-    let n = rects.len();
-    if n == 0 {
-        return 0;
-    }
-
-    let mut best = 0;
-    let mut best_dist = f32::INFINITY;
-
-    for g in 0..=n {
-        let p = gap_point(g, rects, cols, spacing, card_w, pointer);
-        let d = pointer.distance(p);
-        if d < best_dist {
-            best_dist = d;
-            best = g;
-        }
-    }
-
-    best
-}
-
-/// Computes a representative point for a given gap in the grid, used for distance-based
-/// gap selection. The grid is arranged in rows of `cols` cards each.
-/// - If g is a vertical gap (between cards in the same row), return the midpoint between them.
-/// - If g is a horizontal gap (between rows), return a point centered on the column nearest
-///   the pointer's x-coordinate. This ensures the insertion line aligns with the pointer's
-///   intended column even when dragging over empty space between rows.
-fn gap_point(
-    g: usize,
-    rects: &[egui::Rect],
-    cols: usize,
-    spacing: f32,
-    _card_w: f32,
-    pointer: egui::Pos2,
-) -> egui::Pos2 {
-    let n = rects.len();
-
-    // Same-row vertical gap: return the point midway between the two adjacent cards.
-    if g > 0 && g < n && !g.is_multiple_of(cols) {
-        let x = (rects[g - 1].right() + rects[g].left()) * 0.5;
-        let y = rects[g].center().y;
-        return egui::pos2(x, y);
-    }
-
-    // Row-boundary horizontal gap: y-coordinate centered in the gap; x-coordinate follows pointer.
-    let y = if g == 0 {
-        rects[0].top() - spacing * 0.5
-    } else if g == n {
-        rects[n - 1].bottom() + spacing * 0.5
-    } else {
-        (rects[g - 1].bottom() + rects[g].top()) * 0.5
-    };
-
-    // Find the card column whose x-center is closest to the pointer's x position.
-    // `total_cmp` keeps this from panicking if a coordinate is ever NaN.
-    let nearest_x = rects
-        .iter()
-        .map(|r| r.center().x)
-        .min_by(|a, b| (a - pointer.x).abs().total_cmp(&(b - pointer.x).abs()))
-        .unwrap_or(rects[0].center().x);
-
-    egui::pos2(nearest_x, y)
-}
-
-/// Renders a dashed insertion line indicating where the dragged card would be dropped.
-/// For vertical gaps (between cards in the same row), draws a short vertical dashed line centered
-/// between the two cards. For horizontal gaps (between rows), draws a horizontal dashed line
-/// centered on the column nearest the pointer's x-position. Both cases include clearance checks
-/// to ensure the line doesn't visually overlap with adjacent cards (which would be confusing).
-/// The line only draws if its computed length is non-zero and it won't intersect any cards.
-fn draw_insertion_line(
-    ctx: &egui::Context,
-    gap: usize,
-    rects: &[egui::Rect],
-    cols: usize,
-    spacing: f32,
-    card_w: f32,
-    card_h: f32,
-) {
-    let n = rects.len();
-    if n == 0 {
-        return;
-    }
-    let pointer = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
-
-    let color = egui::Color32::from_rgb(0x60, 0xb0, 0xff);
-    let stroke = egui::Stroke::new(2.0_f32, color);
-    let clearance = 4.0_f32; // Minimum distance the line must maintain from card edges
-
-    let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Tooltip,
-        egui::Id::new("drag_ghost"),
-    ));
-
-    if gap > 0 && gap < n && !gap.is_multiple_of(cols) {
-        // Vertical dashed line between two cards on the same row.
-        let a = &rects[gap - 1];
-        let b = &rects[gap];
-        let x = (a.right() + b.left()) * 0.5;
-        let y_center = a.center().y;
-        // Make the line span ~35% of the card height, but never extend past the card boundaries.
-        let half_len = (card_h * 0.35).min(a.height() * 0.5 - clearance);
-        let from = egui::pos2(x, y_center - half_len);
-        let to = egui::pos2(x, y_center + half_len);
-        let line_rect = line_segment_rect(from, to, stroke.width);
-        if half_len > 0.0 && !line_rect.intersects(*a) && !line_rect.intersects(*b) {
-            draw_dashed_line(&painter, from, to, 6.0, 4.0, stroke);
-        }
-    } else {
-        // Horizontal dashed line at a row boundary (top, between rows, or bottom).
-        let (y, gap_top, gap_bottom, above, below) = if gap == 0 {
-            (
-                rects[0].top() - spacing * 0.5,
-                rects[0].top() - spacing,
-                rects[0].top(),
-                None,
-                Some(&rects[0]),
-            )
-        } else if gap == n {
-            (
-                rects[n - 1].bottom() + spacing * 0.5,
-                rects[n - 1].bottom(),
-                rects[n - 1].bottom() + spacing,
-                Some(&rects[n - 1]),
-                None,
-            )
-        } else {
-            (
-                (rects[gap - 1].bottom() + rects[gap].top()) * 0.5,
-                rects[gap - 1].bottom(),
-                rects[gap].top(),
-                Some(&rects[gap - 1]),
-                Some(&rects[gap]),
-            )
-        };
-
-        // Center the horizontal line on the column of the nearest card to guide the drop location.
-        let nearest = rects
-            .iter()
-            .min_by(|a, b| {
-                (a.center().x - pointer.x)
-                    .abs()
-                    .total_cmp(&(b.center().x - pointer.x).abs())
-            })
-            .unwrap_or(&rects[0]);
-        let x_center = nearest.center().x;
-        let half_len = (card_w * 0.35).min(nearest.width() * 0.5 - clearance);
-        let from = egui::pos2(x_center - half_len, y);
-        let to = egui::pos2(x_center + half_len, y);
-        let line_rect = line_segment_rect(from, to, stroke.width);
-        // Only draw if the line has positive length and maintains clearance from adjacent cards.
-        let mut clear = half_len > 0.0
-            && y > gap_top + clearance
-            && y < gap_bottom - clearance;
-        if let Some(a) = above {
-            clear &= !line_rect.intersects(*a);
-        }
-        if let Some(b) = below {
-            clear &= !line_rect.intersects(*b);
-        }
-        if clear {
-            draw_dashed_line(&painter, from, to, 6.0, 4.0, stroke);
-        }
-    }
-}
-
-/// Computes a tight bounding rect of a line segment, including its stroke thickness on all sides.
-/// Used to check for visual overlap between the insertion line and adjacent cards during drag-and-drop.
-fn line_segment_rect(from: egui::Pos2, to: egui::Pos2, stroke_width: f32) -> egui::Rect {
-    let half = stroke_width * 0.5;
-    egui::Rect::from_min_max(
-        (from.min(to)) - egui::vec2(half, half),
-        (from.max(to)) + egui::vec2(half, half),
-    )
-}
-
-/// Draws a dashed line by rendering alternating solid segments (dashes) and transparent gaps.
-/// This creates a visual "dashed" effect without needing special stroke rendering. The line
-/// is drawn along the direction from `from` to `to`, and `dash_len` / `gap_len` control
-/// the length of each dash and the space between them (both in screen pixels).
-fn draw_dashed_line(
-    painter: &egui::Painter,
-    from: egui::Pos2,
-    to: egui::Pos2,
-    dash_len: f32,
-    gap_len: f32,
-    stroke: egui::Stroke,
-) {
-    let vec = to - from;
-    let total = vec.length();
-    if total <= 0.0 {
-        return;
-    }
-    let dir = vec / total;
-    let mut pos = 0.0;
-    let mut drawing_dash = true;
-    while pos < total {
-        let seg_len = if drawing_dash {
-            dash_len.min(total - pos)
-        } else {
-            gap_len.min(total - pos)
-        };
-        if drawing_dash {
-            // Only draw the solid segment; skip gaps by not painting them.
-            let a = from + dir * pos;
-            let b = from + dir * (pos + seg_len);
-            painter.line_segment([a, b], stroke);
-        }
-        pos += seg_len;
-        drawing_dash = !drawing_dash; // Alternate between drawing and skipping
-    }
-}
-
 /// Unit tests for grid layout and drag-and-drop logic.
 /// Validates that card positioning, gap detection, and insertion line rendering work correctly
 /// across different grid configurations (single and multi-card layouts).
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+    use crate::grid::{
+        gap_point, grid_card_rect, nearest_gap, visible_rows, CARD_H, CARD_SPACING, CARD_W,
+        GRID_TOP_SPACE, ROW_PITCH,
+    };
 
     /// Builds an app whose data files live in a throwaway temp directory, so tests that
     /// exercise the auto-save paths never write into the repository or clobber real user data.
@@ -1610,8 +1239,7 @@ mod layout_tests {
             generation: 0,
             filter: FilterCache::default(),
             next_id,
-            path: dir.join("snippets.json"),
-            config_path: dir.join("config.json"),
+            store: Store::at(dir.clone()),
             categories,
             search: String::new(),
             category_filter: "All".into(),
@@ -1772,12 +1400,7 @@ mod layout_tests {
                 let b = &rects_out[g];
                 let gap = b.top() - a.bottom();
                 let midpoint = (a.bottom() + b.top()) * 0.5;
-                assert!(
-                    (gap - 12.0).abs() < 0.1,
-                    "horizontal gap {} = {}",
-                    g,
-                    gap
-                );
+                assert!((gap - 12.0).abs() < 0.1, "horizontal gap {} = {}", g, gap);
                 assert!((midpoint - (a.bottom() + gap * 0.5)).abs() < 0.1);
             }
         }
@@ -1831,7 +1454,12 @@ mod layout_tests {
                                         for &idx in row {
                                             let mut actions = Vec::new();
                                             let widgets = app.card(
-                                                ui, idx, card_inner_w, 0.0, &mut actions, false,
+                                                ui,
+                                                idx,
+                                                card_inner_w,
+                                                0.0,
+                                                &mut actions,
+                                                false,
                                             );
                                             rects.push(widgets.frame_rect);
                                             ui.add_space(spacing);
@@ -1955,15 +1583,27 @@ mod layout_tests {
                 let b = &rects[g];
                 let gap = b.left() - a.right();
                 let expected_x = a.right() + gap * 0.5;
-                assert!((p.x - expected_x).abs() < 0.1, "vertical gap {} x = {}, expected {}", g, p.x, expected_x);
+                assert!(
+                    (p.x - expected_x).abs() < 0.1,
+                    "vertical gap {} x = {}, expected {}",
+                    g,
+                    p.x,
+                    expected_x
+                );
                 assert!((p.y - a.center().y).abs() < 0.1);
                 // 2px vertical line centered in x must not intersect either card.
                 let line_rect = egui::Rect::from_min_max(
                     egui::pos2(p.x - stroke_width * 0.5, p.y - 60.0),
                     egui::pos2(p.x + stroke_width * 0.5, p.y + 60.0),
                 );
-                assert!(!line_rect.intersects(*a), "vertical line intersects left card");
-                assert!(!line_rect.intersects(*b), "vertical line intersects right card");
+                assert!(
+                    !line_rect.intersects(*a),
+                    "vertical line intersects left card"
+                );
+                assert!(
+                    !line_rect.intersects(*b),
+                    "vertical line intersects right card"
+                );
                 assert!(p.x > a.right() + clearance - stroke_width * 0.5);
                 assert!(p.x < b.left() - clearance + stroke_width * 0.5);
             } else {
@@ -1971,14 +1611,26 @@ mod layout_tests {
                 let b = &rects[g];
                 let gap = b.top() - a.bottom();
                 let expected_y = a.bottom() + gap * 0.5;
-                assert!((p.y - expected_y).abs() < 0.1, "horizontal gap {} y = {}, expected {}", g, p.y, expected_y);
+                assert!(
+                    (p.y - expected_y).abs() < 0.1,
+                    "horizontal gap {} y = {}, expected {}",
+                    g,
+                    p.y,
+                    expected_y
+                );
                 // 2px horizontal line centered in y must not intersect either card.
                 let line_rect = egui::Rect::from_min_max(
                     egui::pos2(p.x - 112.0, p.y - stroke_width * 0.5),
                     egui::pos2(p.x + 112.0, p.y + stroke_width * 0.5),
                 );
-                assert!(!line_rect.intersects(*a), "horizontal line intersects above card");
-                assert!(!line_rect.intersects(*b), "horizontal line intersects below card");
+                assert!(
+                    !line_rect.intersects(*a),
+                    "horizontal line intersects above card"
+                );
+                assert!(
+                    !line_rect.intersects(*b),
+                    "horizontal line intersects below card"
+                );
                 assert!(p.y > a.bottom() + clearance - stroke_width * 0.5);
                 assert!(p.y < b.top() - clearance + stroke_width * 0.5);
             }
@@ -1989,10 +1641,7 @@ mod layout_tests {
     /// scroll offset. Returns the number of paint shapes the frame emitted (a proxy for
     /// how many cards were actually built), the rects the grid reported for every card,
     /// the scroll area's content size, and the column count.
-    fn run_grid(
-        app: &CopyIt,
-        scroll_offset: f32,
-    ) -> (usize, Vec<egui::Rect>, egui::Vec2, usize) {
+    fn run_grid(app: &CopyIt, scroll_offset: f32) -> (usize, Vec<egui::Rect>, egui::Vec2, usize) {
         let ctx = egui::Context::default();
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -2013,7 +1662,7 @@ mod layout_tests {
                     .vertical_scroll_offset(scroll_offset)
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                        ui.add_space(GRID_TOP_SPACE);
+                        ui.add_space(grid::GRID_TOP_SPACE);
                         let mut actions = Vec::new();
                         let mut drag_start = None;
                         let mut hover_cursor = None;
@@ -2081,7 +1730,10 @@ mod layout_tests {
             large_shapes <= small_shapes * 3 / 2,
             "large grid emitted {large_shapes} shapes vs {small_shapes} for a tenth of the library"
         );
-        assert!(small_shapes > 20, "the visible cards must actually be painted");
+        assert!(
+            small_shapes > 20,
+            "the visible cards must actually be painted"
+        );
 
         // Scrolled deep into the library, cards are still painted (i.e. the visible band
         // follows the viewport instead of staying at the top)...
@@ -2098,7 +1750,11 @@ mod layout_tests {
             assert!((r.width() - CARD_W).abs() < 0.1);
             assert!((r.height() - CARD_H).abs() < 0.1);
             let expected = grid_card_rect(i, 2, deep_rects[0].min, CARD_W, CARD_H, CARD_SPACING);
-            assert!(r.min.distance(expected.min) < 0.1, "card {i} at {:?}", r.min);
+            assert!(
+                r.min.distance(expected.min) < 0.1,
+                "card {i} at {:?}",
+                r.min
+            );
         }
         assert!(
             (deep_rects[0].min.y - (large_rects[0].min.y - deep_offset)).abs() < 1.0,
@@ -2110,10 +1766,7 @@ mod layout_tests {
         let gap_index = 150;
         let above = deep_rects[gap_index - 2];
         let below = deep_rects[gap_index];
-        let pointer = egui::pos2(
-            above.center().x,
-            (above.bottom() + below.top()) * 0.5,
-        );
+        let pointer = egui::pos2(above.center().x, (above.bottom() + below.top()) * 0.5);
         assert_eq!(
             nearest_gap(pointer, &deep_rects, 2, CARD_SPACING, CARD_W),
             gap_index,
@@ -2165,16 +1818,24 @@ mod layout_tests {
                                 let origin = ui.cursor().min;
                                 assert_eq!(cols, 2);
 
-                                for (i, chunk_start) in (0..filtered.len()).step_by(cols).enumerate()
+                                for (i, chunk_start) in
+                                    (0..filtered.len()).step_by(cols).enumerate()
                                 {
-                                    let row = &filtered[chunk_start
-                                        ..(chunk_start + cols).min(filtered.len())];
+                                    let row = &filtered
+                                        [chunk_start..(chunk_start + cols).min(filtered.len())];
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
                                         for (offset, &idx) in row.iter().enumerate() {
                                             let mut actions = Vec::new();
                                             let rendered = app
-                                                .card(ui, idx, card_inner_w, 0.0, &mut actions, false)
+                                                .card(
+                                                    ui,
+                                                    idx,
+                                                    card_inner_w,
+                                                    0.0,
+                                                    &mut actions,
+                                                    false,
+                                                )
                                                 .frame_rect;
                                             let computed = grid_card_rect(
                                                 i * cols + offset,
@@ -2295,7 +1956,11 @@ mod layout_tests {
         let check = |app: &mut CopyIt| {
             let want = expected(app);
             let got = app.take_filtered();
-            assert_eq!(got, want, "search {:?} / cat {:?}", app.search, app.category_filter);
+            assert_eq!(
+                got, want,
+                "search {:?} / cat {:?}",
+                app.search, app.category_filter
+            );
             app.restore_filtered(got);
         };
 
@@ -2304,7 +1969,10 @@ mod layout_tests {
         // Taking the buffer twice without restoring it must not report "no matches".
         let first = app.take_filtered();
         let second = app.take_filtered();
-        assert_eq!(first, second, "a checked-out cache must be recomputed, not reused");
+        assert_eq!(
+            first, second,
+            "a checked-out cache must be recomputed, not reused"
+        );
         app.restore_filtered(second);
 
         // A cached result must not survive a changed query...
@@ -2331,7 +1999,11 @@ mod layout_tests {
         assert_eq!(ids(&app), vec![2, 3, 1]);
         check(&mut app);
         app.search = "rebase".into();
-        assert_eq!(app.take_filtered(), vec![2], "the moved card is still findable");
+        assert_eq!(
+            app.take_filtered(),
+            vec![2],
+            "the moved card is still findable"
+        );
         app.restore_filtered(vec![2]);
 
         // Deriving must track edits to a snippet's text, not just its position.
@@ -2378,11 +2050,7 @@ mod layout_tests {
 
     #[test]
     fn add_category_normalizes_and_dedups() {
-        let mut app = test_app(
-            "add-category",
-            vec![],
-            vec!["Git".into(), "Prompt".into()],
-        );
+        let mut app = test_app("add-category", vec![], vec!["Git".into(), "Prompt".into()]);
         assert_eq!(app.add_category("  git "), "Git"); // existing, case-insensitive
         assert_eq!(app.add_category("werner"), "Werner"); // new
         assert_eq!(app.add_category("Werner"), "Werner"); // duplicate
@@ -2392,10 +2060,7 @@ mod layout_tests {
         assert_eq!(app.add_category("all"), "");
         assert_eq!(app.add_category("All"), "");
         assert_eq!(app.add_category("ALL"), "");
-        assert!(!app
-            .categories
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case("all")));
+        assert!(!app.categories.iter().any(|c| c.eq_ignore_ascii_case("all")));
         assert_eq!(app.categories.len(), 3);
     }
 
@@ -2640,7 +2305,11 @@ mod layout_tests {
     /// still reporting an unsaved snippet library.
     #[test]
     fn a_successful_save_only_clears_its_own_error() {
-        let mut app = test_app("save-error-scope", vec![snippet(1, "Git")], vec!["Git".into()]);
+        let mut app = test_app(
+            "save-error-scope",
+            vec![snippet(1, "Git")],
+            vec!["Git".into()],
+        );
 
         app.save_error = Some(format!("{SNIPPETS_SAVE_ERROR}: disk full"));
         app.save_config();
@@ -2651,7 +2320,10 @@ mod layout_tests {
         );
 
         app.save_snippets();
-        assert!(app.save_error.is_none(), "the snippet save clears its own error");
+        assert!(
+            app.save_error.is_none(),
+            "the snippet save clears its own error"
+        );
 
         // Startup notices about recovered data files survive until dismissed.
         app.save_error = Some("snippets.json couldn't be read".to_string());
@@ -2671,17 +2343,23 @@ mod layout_tests {
         app.save_snippets();
         assert!(app.save_error.is_none());
 
-        let dir = app.path.parent().unwrap().to_path_buf();
+        let dir = app.store.snippets_path.parent().unwrap().to_path_buf();
         let leftovers: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name.ends_with(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
 
-        match storage::load(&app.path) {
+        match storage::load(&app.store.snippets_path) {
             storage::Load::Loaded(snippets) => {
-                assert_eq!(snippets.iter().map(|s| s.id).collect::<Vec<_>>(), vec![1, 2]);
+                assert_eq!(
+                    snippets.iter().map(|s| s.id).collect::<Vec<_>>(),
+                    vec![1, 2]
+                );
             }
             _ => panic!("saved library should load back"),
         }
@@ -2704,9 +2382,7 @@ mod layout_tests {
         let mut category = String::from("Git");
         let mut body: String = (0..500)
             .map(|i| {
-                format!(
-                    "Line {i}: Lorem ipsum dolor sit amet, consectetur adipiscing elit.\n"
-                )
+                format!("Line {i}: Lorem ipsum dolor sit amet, consectetur adipiscing elit.\n")
             })
             .collect();
 
@@ -2726,10 +2402,7 @@ mod layout_tests {
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
                                 ui.label("Title");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut title)
-                                        .desired_width(280.0),
-                                );
+                                ui.add(egui::TextEdit::singleline(&mut title).desired_width(280.0));
                             });
 
                             ui.add_space(12.0);

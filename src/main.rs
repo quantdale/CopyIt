@@ -3,11 +3,14 @@
 // Hide the console window on Windows in release builds (GUI app).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;    // Main UI and interaction logic; handles rendering, user input, and state updates
-mod model;  // Core data structure: Snippet (id, title, category, body)
-mod seed;   // Default snippet library seeded on first launch for new users
-mod storage;// JSON persistence, data directory resolution, and category normalization
-mod theme;  // 37 selectable color themes via custom egui::Visuals
+mod app; // Main UI and interaction logic; handles rendering, user input, and state updates
+mod editor; // Snippet add/edit modal: state, constructors, and the transition decision
+mod grid; // Card grid geometry, virtualization, insertion lines, and the drag state machine
+mod model; // Core data structure: Snippet (id, title, category, body)
+mod seed; // Default snippet library seeded on first launch for new users
+mod storage; // JSON persistence, data directory resolution, and category normalization
+mod store; // Persistence seam: paths, legacy migration, load/save of snippets and config
+mod theme; // 37 selectable color themes via custom egui::Visuals
 
 use app::CopyIt;
 
@@ -17,7 +20,7 @@ use app::CopyIt;
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 700.0])  // Default window size: wide enough for ~2-3 card columns
+            .with_inner_size([1000.0, 700.0]) // Default window size: wide enough for ~2-3 card columns
             .with_min_inner_size([560.0, 400.0]) // Minimum size: ensures UI doesn't break on resize
             .with_title("CopyIt"),
         ..Default::default()

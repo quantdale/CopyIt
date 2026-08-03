@@ -27,18 +27,6 @@ pub fn data_dir() -> PathBuf {
     PathBuf::from(".") // Last-resort fallback: current working directory
 }
 
-/// Returns the full path to snippets.json in the stable data directory.
-pub fn data_path() -> PathBuf {
-    data_dir().join("snippets.json")
-}
-
-/// Small config file holding canonical categories and the selected theme.
-/// Kept separate from `snippets.json` so snippet data stays
-/// backward-compatible with earlier versions.
-pub fn config_path() -> PathBuf {
-    data_dir().join("config.json")
-}
-
 /// Legacy locations `snippets.json`/`config.json` may have been left in by
 /// earlier versions that stored data next to the .exe. Used for one-time
 /// migration into the new stable `data_dir()`.
