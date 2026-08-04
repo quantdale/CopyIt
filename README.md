@@ -12,7 +12,8 @@ native `.exe` with no runtime, no WebView, and no installer.
 - Category filter dropdown.
 - 37 selectable color themes (Dark, Light, Nord, Dracula, Solarized, Gruvbox, Catppuccin, Tokyo Night, One Dark/Light, Monokai, GitHub, Ayu, Rose Pine, Everforest, Material, Kanagawa, Night Owl, Zenburn, Synthwave '84, Cobalt2, Horizon, and more).
 - Add / edit / delete snippets from inside the app.
-- Data stored as a plain, hand-editable `snippets.json` in a stable per-user folder (`%APPDATA%\CopyIt`), so it survives rebuilding, moving, or replacing the `.exe`.
+- Password-protected snippets: tick **Protect this snippet** in the editor and the body is encrypted at rest — the card shows a masked hint until you unlock, and a vault lock/unlock control appears in the top bar.
+- Data stored as plain, hand-editable JSON (`snippets.json`) in a stable per-user folder (`%APPDATA%\CopyIt`), so it survives rebuilding, moving, or replacing the `.exe` (protected bodies are ciphertext inside the same file).
 
 ## Build (on Windows)
 
@@ -53,8 +54,35 @@ new version.
 ]
 ```
 
+Want a card to stay secret? Tick **Protect this snippet** in the Add/Edit dialog. Its body
+is stored only as ciphertext (XChaCha20-Poly1305, key derived from your vault password with
+Argon2id), and the card shows a short hint plus bullets instead of the text. Copying or
+editing a protected card asks for the vault password once per session; the top bar shows
+**Vault locked/unlocked** with a **Lock** button to drop the key from memory.
+
 ## Notes
 
 - Pinned to `eframe`/`egui` **0.27** for a stable, well-tested API surface.
 - Release profile is tuned for a small binary and fast startup
   (`opt-level = "z"`, LTO, stripped).
+- **No password recovery.** Forget the vault password and protected bodies are unrecoverable. Titles and categories stay visible, and a protected card shows its first 5 body characters as a hint (bodies under 12 characters show none) — keep secrets out of titles.
+- Unprotected snippets remain plaintext JSON, so the "don't store credentials" rule applies to *unprotected* cards. An older version of CopyIt reading a file with protected cards sees empty bodies — don't downgrade after protecting.
+
+## For contributors
+
+The UI is exercised by an in-process simulation suite that drives the real CopyIt UI
+headlessly — the same code a user runs, pumped frame by frame with synthesized input. Run
+the journeys headlessly (this is what CI does):
+
+```powershell
+cargo test --bin copyit sim_journeys -- --test-threads 1
+```
+
+To watch one journey in the real window (local only — requires the `sim` cargo feature):
+
+```powershell
+cargo run --features sim -- --simulate first-run-explorer --seed 42
+```
+
+Journeys never touch your real `%APPDATA%\CopyIt` data: each run gets a throwaway store in
+the temp dir, and failures leave an inspectable report bundle under `sim-report/`.

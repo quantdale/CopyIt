@@ -1,4 +1,5 @@
 use crate::model::Snippet;
+use crate::vault::VaultMeta;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -229,21 +230,27 @@ pub fn canonical_category(raw: &str) -> String {
     }
 }
 
-/// User configuration: canonical category list and the selected theme.
+/// User configuration: canonical category list, the selected theme, and the vault
+/// metadata backing protected snippets.
 /// Stored separately from snippets.json so that snippet data can remain stable
 /// across version upgrades; only the config file changes when features (categories, themes) evolve.
 /// Both fields use `#[serde(default)]` to handle missing fields gracefully in older config files.
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub categories: Vec<String>, // Sorted, deduplicated list of all known categories
     #[serde(default)]
     pub theme: String, // Theme name (e.g., "Dark", "Nord"); defaults to "Dark" on first run
+    /// Vault metadata (KDF salt + encrypted canary) for protected snippets; `None`
+    /// on files written before the vault feature, or until the user protects a
+    /// snippet for the first time.
+    #[serde(default)]
+    pub vault: Option<VaultMeta>,
 }
 
 impl Config {
     /// Initializes config from an existing snippet library: extracts all unique, normalized categories
-    /// and sets the theme to "Dark" by default.
+    /// and sets the theme to "Dark" by default. No vault metadata (it is created on first protect).
     pub fn from_snippets(snippets: &[Snippet]) -> Self {
         let mut cats: Vec<String> = snippets
             .iter()
@@ -255,6 +262,7 @@ impl Config {
         Self {
             categories: cats,
             theme: "Dark".to_string(),
+            vault: None,
         }
     }
 
@@ -297,6 +305,7 @@ mod tests {
             title: format!("Snippet {id}"),
             category: category.to_string(),
             body: "body".to_string(),
+            protection: None,
         }
     }
 
@@ -465,6 +474,7 @@ mod tests {
         let config = Config {
             categories: vec!["Git".into(), "Prompt".into()],
             theme: "Nord".into(),
+            vault: None,
         };
         save_config(&path, &config).unwrap();
         match load_config(&path) {
@@ -508,6 +518,90 @@ mod tests {
                 assert_eq!(config.theme, "Nord");
             }
             _ => panic!("config without categories should still load"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_without_vault_loads_with_none() {
+        // A config file written before the vault feature has no `vault` key; it must
+        // load with `vault: None` rather than being reported corrupt.
+        let dir = tmp_dir("config-no-vault");
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"categories":["Git"],"theme":"Dark"}"#).unwrap();
+        match load_config(&path) {
+            Load::Loaded(config) => {
+                assert_eq!(config.categories, vec!["Git".to_string()]);
+                assert!(config.vault.is_none());
+            }
+            _ => panic!("config without vault should still load"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_vault_round_trips_through_disk() {
+        let dir = tmp_dir("config-vault");
+        let path = dir.join("config.json");
+        let (meta, _) = crate::vault::create_vault("pw").unwrap();
+        let config = Config {
+            categories: vec!["Git".into()],
+            theme: "Dark".into(),
+            vault: Some(meta.clone()),
+        };
+        save_config(&path, &config).unwrap();
+        match load_config(&path) {
+            Load::Loaded(loaded) => {
+                let loaded = loaded.vault.expect("vault should round-trip");
+                assert_eq!(loaded.salt, meta.salt);
+                assert_eq!(loaded.nonce, meta.nonce);
+                assert_eq!(loaded.canary, meta.canary);
+                // The persisted canary still unlocks with the same password.
+                assert!(crate::vault::verify_password("pw", &loaded).is_ok());
+            }
+            _ => panic!("config with vault should load"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn protected_snippet_round_trips_with_empty_body_on_disk() {
+        // A protected snippet is stored with ciphertext + nonce + hint and an empty
+        // `body`, and loads back with the same protection (so the app can decrypt it
+        // on demand after unlocking).
+        let dir = tmp_dir("protected-roundtrip");
+        let (_, key) = crate::vault::create_vault("pw").unwrap();
+        let protection = crate::vault::encrypt_body(&key, "a secret body long enough").unwrap();
+        let snippet = Snippet {
+            id: 1,
+            title: "KEY".into(),
+            category: "Git".into(),
+            body: String::new(),
+            protection: Some(protection.clone()),
+        };
+
+        let store = crate::store::Store::at(dir.clone());
+        store.save_snippets(&[snippet]).unwrap();
+        let raw = std::fs::read_to_string(store.snippets_path.clone()).unwrap();
+        assert!(
+            !raw.contains("a secret body long enough"),
+            "the secret must never be written to disk"
+        );
+
+        match store.load_snippets() {
+            Load::Loaded(loaded) => {
+                assert_eq!(loaded.len(), 1);
+                assert!(loaded[0].body.is_empty());
+                let p = loaded[0].protection.as_ref().expect("protection round-trips");
+                assert_eq!(p.hint, protection.hint);
+                assert_eq!(p.nonce, protection.nonce);
+                assert_eq!(p.ciphertext, protection.ciphertext);
+                assert_eq!(
+                    crate::vault::decrypt_body(&key, p).unwrap(),
+                    "a secret body long enough"
+                );
+            }
+            _ => panic!("protected snippet should load"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -115,6 +115,7 @@ mod tests {
             title: format!("Snippet {id}"),
             category: category.to_string(),
             body: "body".to_string(),
+            protection: None,
         }
     }
 
@@ -143,6 +144,7 @@ mod tests {
             .save_config(&Config {
                 categories: vec!["Git".into(), "Prompt".into()],
                 theme: "Nord".into(),
+                vault: None,
             })
             .unwrap();
 

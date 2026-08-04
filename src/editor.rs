@@ -12,7 +12,9 @@ use crate::model::Snippet;
 /// Modal editor state for creating or editing a snippet. The `adding_category` and
 /// `new_category` fields track an inline sub-form (entered via the category dropdown)
 /// that lets users add a category without closing the editor. The `confirm_delete`
-/// flag requires a second click to prevent accidental deletions.
+/// flag requires a second click to prevent accidental deletions. `protect` is the
+/// "Protect this snippet" checkbox: saving with it checked encrypts the body (the
+/// snippet must already have an unlocked vault at save time, enforced by the app).
 pub struct Editor {
     /// None = creating a new snippet; Some(id) = editing existing with this stable ID.
     pub id: Option<u64>,
@@ -23,6 +25,9 @@ pub struct Editor {
     /// True when the user clicked "+ Add new category" in the dropdown.
     pub adding_category: bool,
     pub body: String,
+    /// True when the snippet should be stored encrypted ("Protect this snippet").
+    /// Mirrors an existing snippet's protection when editing; default false for new.
+    pub protect: bool,
     /// Set to true on first "Delete" click; requires a second "Confirm delete" to prevent accidents.
     pub confirm_delete: bool,
     /// Validation error for the inline category field (e.g. "All" is reserved); shown
@@ -42,6 +47,7 @@ impl Editor {
             new_category: String::new(),
             adding_category: false,
             body: String::new(),
+            protect: false,
             confirm_delete: false,
             category_error: None,
         }
@@ -50,7 +56,9 @@ impl Editor {
     /// An editor pre-populated from an existing snippet. The category is matched
     /// against the canonical list case-insensitively (full Unicode, matching the
     /// rest of the app), falling back to the snippet's own category if no canonical
-    /// match exists.
+    /// match exists. The `protect` checkbox mirrors whether the snippet is currently
+    /// protected (when editing a protected card, the app passes a copy whose `body`
+    /// holds the decrypted plaintext but whose `protection` is preserved).
     pub fn from_snippet(s: &Snippet, categories: &[String]) -> Self {
         let category = categories
             .iter()
@@ -64,6 +72,7 @@ impl Editor {
             new_category: String::new(),
             adding_category: false,
             body: s.body.clone(),
+            protect: s.protection.is_some(),
             confirm_delete: false,
             category_error: None,
         }
@@ -124,6 +133,13 @@ pub fn decide(result: EditorResult, ed: Editor, window_open: bool) -> EditorOutc
     }
 }
 
+/// The vault gate on card actions: a protected snippet's copy/edit/delete must not
+/// proceed while the vault is locked. Pure — no app state, so the gating decision is
+/// testable without a UI. The caller routes a gated action to the unlock prompt.
+pub fn card_action_requires_vault(protected: bool, vault_unlocked: bool) -> bool {
+    protected && !vault_unlocked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +152,7 @@ mod tests {
             new_category: String::new(),
             adding_category: false,
             body: "Body".into(),
+            protect: false,
             confirm_delete: false,
             category_error: None,
         }
@@ -165,6 +182,7 @@ mod tests {
             title: "Stash".into(),
             category: "pRoMpT".into(),
             body: "git stash".into(),
+            protection: None,
         };
         let ed = Editor::from_snippet(&s, &categories());
         assert_eq!(ed.id, Some(7));
@@ -175,6 +193,7 @@ mod tests {
             title: "X".into(),
             category: "Uncategorized".into(),
             body: "y".into(),
+            protection: None,
         };
         let ed = Editor::from_snippet(&unknown, &categories());
         assert_eq!(ed.category, "Uncategorized", "no match keeps the original");
@@ -189,6 +208,7 @@ mod tests {
             title: "Café".into(),
             category: "CAFÉ".into(),
             body: "x".into(),
+            protection: None,
         };
         let ed = Editor::from_snippet(&s, &["Café".to_string()]);
         assert_eq!(ed.category, "Café", "must match using full Unicode case folding");
@@ -202,6 +222,7 @@ mod tests {
             title: "T".into(),
             category: "Git".into(),
             body: "b".into(),
+            protection: None,
         };
         assert!(Editor::from_snippet(&s, &categories()).category_error.is_none());
     }
@@ -256,6 +277,47 @@ mod tests {
             EditorOutcome::Close => {}
             other => panic!("expected Close, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn blank_editors_are_not_protected_by_default() {
+        assert!(!Editor::blank(&categories()).protect);
+    }
+
+    #[test]
+    fn from_snippet_mirrors_the_existing_protection() {
+        let plain = Snippet {
+            id: 1,
+            title: "T".into(),
+            category: "Git".into(),
+            body: "plain".into(),
+            protection: None,
+        };
+        assert!(!Editor::from_snippet(&plain, &categories()).protect);
+
+        let protected = Snippet {
+            id: 2,
+            title: "T".into(),
+            category: "Git".into(),
+            body: String::new(), // empty on disk for protected snippets
+            protection: Some(crate::model::Protection {
+                hint: "hint".into(),
+                nonce: "nonce".into(),
+                ciphertext: "cipher".into(),
+            }),
+        };
+        let ed = Editor::from_snippet(&protected, &categories());
+        assert!(ed.protect, "editing a protected card keeps the checkbox on");
+    }
+
+    #[test]
+    fn card_action_vault_gate_is_pure() {
+        // Protected snippets need the vault for any action...
+        assert!(card_action_requires_vault(true, false));
+        // ...but not when it is already unlocked, and plain snippets never do.
+        assert!(!card_action_requires_vault(true, true));
+        assert!(!card_action_requires_vault(false, false));
+        assert!(!card_action_requires_vault(false, true));
     }
 
     /// The derive-free enums end up as plain data, so test asserts need a

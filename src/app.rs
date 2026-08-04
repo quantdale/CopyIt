@@ -4,6 +4,7 @@ use crate::model::Snippet;
 use crate::storage::{self, Config};
 use crate::store::Store;
 use crate::theme::Theme;
+use crate::vault::{self, VaultMeta, VaultState};
 use eframe::egui;
 use std::collections::HashSet;
 
@@ -34,11 +35,31 @@ struct Derived {
 
 impl Derived {
     fn new(s: &Snippet) -> Self {
+        // A protected snippet's plaintext never touches these caches: its body is
+        // empty on disk/in memory, and even if a stray value leaked in here the
+        // derived text would be what search matches — so force it empty. The
+        // preview is always the masked hint, regardless of unlock state.
+        let protected = s.protection.is_some();
+        let body_lower = if protected {
+            String::new()
+        } else {
+            s.body.to_lowercase()
+        };
+        let preview = if protected {
+            vault::masked_preview(
+                s.protection
+                    .as_ref()
+                    .map(|p| p.hint.as_str())
+                    .unwrap_or(""),
+            )
+        } else {
+            preview_text(&s.body, PREVIEW_CHARS)
+        };
         Derived {
             title_lower: s.title.to_lowercase(),
             category_lower: s.category.to_lowercase(),
-            body_lower: s.body.to_lowercase(),
-            preview: preview_text(&s.body, PREVIEW_CHARS),
+            body_lower,
+            preview,
         }
     }
 
@@ -97,6 +118,9 @@ pub struct CopyIt {
     new_header_category: String, // Input buffer for the new category name in the top bar
     category_error: Option<String>, // Validation error for the new category (e.g., "All" is reserved)
     save_error: Option<String>,     // File I/O error message to display at the top
+    vault: VaultState,              // Session lock state; starts locked on every launch
+    vault_meta: Option<VaultMeta>,  // KDF salt + canary loaded from config.json; None until first protect
+    vault_prompt: Option<VaultPrompt>, // Unlock / create-vault modal; None when closed
 }
 
 /// Tracks an in-progress drag operation. Initialized when the user clicks and holds on a card,
@@ -119,6 +143,59 @@ type DragState = grid::DragMachine;
 enum Action {
     Copy(u64), // User clicked Copy button on a snippet; copy its body to clipboard
     Edit(u64), // User clicked Edit button on a snippet; open editor modal
+}
+
+/// What the vault prompt was opened for: does the vault exist to unlock, or must
+/// the user create it first (first-ever protect)?
+#[derive(Clone, Copy, PartialEq)]
+enum VaultPromptMode {
+    /// Verify an existing vault's password to proceed.
+    Unlock,
+    /// No vault exists yet; collect a password + confirmation and create one.
+    Create,
+}
+
+/// The action suspended behind the vault prompt. Copy/Edit carry the card id; the
+/// editor is folded in for the first-ever-protect flow so the save can run once
+/// the vault exists (and is restored on cancel so nothing is lost).
+enum PendingVaultAction {
+    Copy(u64),
+    Edit(u64),
+    ProtectSave(Editor),
+}
+
+/// State of the unlock / create-vault modal: password fields, an inline error,
+/// and the action to run once the vault is available.
+struct VaultPrompt {
+    mode: VaultPromptMode,
+    password: String,
+    /// Password confirmation; only used in `Create` mode.
+    confirm: String,
+    /// Inline error (wrong password, mismatched confirmation, ...).
+    error: Option<String>,
+    pending: Option<PendingVaultAction>,
+}
+
+impl VaultPrompt {
+    fn unlock_for(pending: PendingVaultAction) -> Self {
+        VaultPrompt {
+            mode: VaultPromptMode::Unlock,
+            password: String::new(),
+            confirm: String::new(),
+            error: None,
+            pending: Some(pending),
+        }
+    }
+
+    fn create_for(pending: PendingVaultAction) -> Self {
+        VaultPrompt {
+            mode: VaultPromptMode::Create,
+            password: String::new(),
+            confirm: String::new(),
+            error: None,
+            pending: Some(pending),
+        }
+    }
 }
 
 /// Layout and response data returned from rendering a single snippet card.
@@ -155,17 +232,26 @@ fn describe_corrupt_file(path: &std::path::Path, filename: &str, error: &str) ->
 }
 
 impl CopyIt {
-    /// Creates a new CopyIt instance on app launch.
-    /// Loads snippets and config from disk (with one-time migration from legacy locations),
-    /// seeds defaults if snippets.json doesn't exist, sanitizes categories, deduplicates
-    /// snippet ids, and applies the saved theme. A corrupt data file is moved aside and
-    /// reported in the banner; when the backup rename fails, the corrupt file is left in
-    /// place and the seeded defaults are *not* written over it, so the user's data is not
-    /// destroyed. Reports any file I/O errors in save_error for display in the UI.
+    /// Creates a new CopyIt instance on app launch: opens the real store, runs
+    /// the one-time legacy migration, then constructs the app via
+    /// [`Self::from_store`].
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let store = Store::open();
         store.migrate_legacy();
+        Self::from_store(store, &cc.egui_ctx)
+    }
 
+    /// Constructs a fully initialized app from an explicit store, shared by
+    /// `new` (production), the tests, and the simulation harness. Loads snippets
+    /// and config from disk, seeds defaults if `snippets.json` doesn't exist,
+    /// sanitizes categories, deduplicates snippet ids, and applies the saved
+    /// theme to `ctx`. A corrupt data file is moved aside and reported in the
+    /// banner; when the backup rename fails, the corrupt file is left in place
+    /// and the seeded defaults are *not* written over it, so the user's data is
+    /// not destroyed. Reports any file I/O errors in save_error for display in
+    /// the UI. Unlike `new`, it never runs legacy migration — that is `new`'s
+    /// job, and the harness must not touch legacy locations.
+    pub fn from_store(store: Store, ctx: &egui::Context) -> Self {
         let mut save_error: Option<String> = None;
 
         // A file that exists but doesn't parse is *not* a first launch: preserve it
@@ -235,7 +321,11 @@ impl CopyIt {
         }
 
         let theme = config.theme.parse::<Theme>().unwrap_or(Theme::Dark);
-        cc.egui_ctx.set_visuals(theme.visuals());
+        ctx.set_visuals(theme.visuals());
+
+        // The vault metadata travels with the config; the session starts locked
+        // every launch (the key is memory-only and never persisted).
+        let vault_meta = config.vault.clone();
 
         // The next id is derived from the (deduplicated) library with a check for a
         // saturated id space, so a hand-edited `id == u64::MAX` can't wrap the
@@ -267,6 +357,9 @@ impl CopyIt {
             new_header_category: String::new(),
             category_error: None,
             save_error,
+            vault: VaultState::new(),
+            vault_meta,
+            vault_prompt: None,
         }
     }
 
@@ -358,6 +451,7 @@ impl CopyIt {
         let config = Config {
             categories: self.categories.clone(),
             theme: self.theme.to_string(),
+            vault: self.vault_meta.clone(),
         };
         match self.store.save_config(&config) {
             Ok(()) => self.clear_save_error(CONFIG_SAVE_ERROR),
@@ -408,8 +502,14 @@ impl CopyIt {
     }
 
     /// Applies the `EditorOutcome::Save` outcome: normalizes the category (falling back
-    /// to "Uncategorized" if blank), updates or inserts the snippet, and persists the
-    /// library. Factored out of `update()` so tests can drive it without a UI context.
+    /// to "Uncategorized" if blank), updates or inserts the snippet (encrypting the body
+    /// when "Protect this snippet" is checked), and persists the library. Factored out
+    /// of `update()` so tests can drive it without a UI context.
+    ///
+    /// Encryption requires an unlocked vault with persisted metadata; the UI guarantees
+    /// that (checkbox disabled while locked, create-vault prompt before the first-ever
+    /// protect), so reaching this with protect on and no key is a bug — refuse the save
+    /// rather than silently writing plaintext that was supposed to be protected.
     fn apply_save(&mut self, mut ed: Editor) {
         let category = {
             let canonical = self.add_category(&ed.category);
@@ -420,13 +520,45 @@ impl CopyIt {
             }
         };
         let title = ed.title.trim().to_string();
+
+        // Encrypt the body up front (fresh nonce, hint fixed now). On failure the
+        // whole save is refused: partial writes would leave the card protected with
+        // ciphertext under a key/no vault state that can never decrypt it.
+        let protection = if ed.protect {
+            match self.vault.key() {
+                Some(key) => match vault::encrypt_body(key, &ed.body) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        self.save_error =
+                            Some(format!("Couldn't protect a snippet: the vault failed ({e})"));
+                        return;
+                    }
+                },
+                None => {
+                    self.save_error =
+                        Some("Couldn't protect a snippet: the vault isn't unlocked".to_string());
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let will_protect = protection.is_some();
+
         if let Some(id) = ed.id {
             if let Some(s) = self.snippets.iter_mut().find(|s| s.id == id) {
                 s.title = title;
                 s.category = category;
-                // The editor is closing, so its buffer can be moved instead of copied —
-                // snippet bodies can be large.
-                s.body = std::mem::take(&mut ed.body);
+                s.protection = protection;
+                if will_protect {
+                    // The secret lives only in the ciphertext; the plaintext body
+                    // is empty on disk.
+                    s.body.clear();
+                } else {
+                    // The editor is closing, so its buffer can be moved instead of
+                    // copied — snippet bodies can be large.
+                    s.body = std::mem::take(&mut ed.body);
+                }
             }
         } else {
             // The cursor is always a free id (it mirrors the library's max, or a scanned
@@ -435,15 +567,227 @@ impl CopyIt {
             // the id space is non-contiguous (e.g. a hand-edited `id == u64::MAX`), and
             // can never wrap to 0 and collide.
             let id = self.next_id;
+            let body = if will_protect {
+                String::new()
+            } else {
+                std::mem::take(&mut ed.body)
+            };
             self.snippets.push(Snippet {
                 id,
                 title,
                 category,
-                body: std::mem::take(&mut ed.body),
+                body,
+                protection,
             });
             self.next_id = next_snippet_id(&self.snippets);
         }
         self.snippets_changed();
+    }
+
+    /// Entrance for an editor Save. A save with protection on must first make sure
+    /// the vault exists and is unlocked: no vault yet → route through the
+    /// create-vault prompt (which precedes the save); vault locked → route through
+    /// the unlock prompt. Plaintext saves never touch the vault.
+    fn handle_editor_save(&mut self, ed: Editor) {
+        if !ed.protect {
+            self.apply_save(ed);
+            return;
+        }
+        if self.vault_meta.is_none() {
+            // First-ever protect: create the vault (password + confirmation) before
+            // anything is written. The editor rides along in the pending action.
+            self.vault_prompt = Some(VaultPrompt::create_for(PendingVaultAction::ProtectSave(ed)));
+        } else if self.vault.is_locked() {
+            self.vault_prompt =
+                Some(VaultPrompt::unlock_for(PendingVaultAction::ProtectSave(ed)));
+        } else {
+            self.apply_save(ed);
+        }
+    }
+
+    /// Copies a snippet's body to the clipboard. Protected snippets are decrypted on
+    /// demand; an AEAD failure refuses the copy, names the card in the warning banner,
+    /// and leaves the file untouched.
+    fn copy_snippet(&mut self, id: u64, ctx: &egui::Context, now: f64) {
+        let Some(s) = self.snippets.iter().find(|s| s.id == id) else {
+            return;
+        };
+        let text = match &s.protection {
+            None => s.body.clone(),
+            Some(p) => {
+                let Some(key) = self.vault.key() else {
+                    self.save_error =
+                        Some("Couldn't copy: the vault is locked, unlock it first".to_string());
+                    return;
+                };
+                match vault::decrypt_body(key, p) {
+                    Ok(plaintext) => plaintext,
+                    Err(e) => {
+                        self.save_error = Some(format!(
+                            "Couldn't copy \"{}\": the protected snippet can't be decrypted ({e})",
+                            s.title
+                        ));
+                        return;
+                    }
+                }
+            }
+        };
+        ctx.output_mut(|o| o.copied_text = text);
+        self.copied = Some((id, now));
+        ctx.request_repaint_after(std::time::Duration::from_millis(1300));
+    }
+
+    /// Opens the editor on a snippet. Protected snippets are decrypted first so the
+    /// editor shows the plaintext body (the protection is kept on the editor's
+    /// checkbox). An AEAD failure refuses the edit with a warning banner.
+    fn edit_snippet(&mut self, id: u64) {
+        let Some(s) = self.snippets.iter().find(|s| s.id == id) else {
+            return;
+        };
+        let editor = match &s.protection {
+            None => Editor::from_snippet(s, &self.categories),
+            Some(p) => {
+                let Some(key) = self.vault.key() else {
+                    self.save_error =
+                        Some("Couldn't edit: the vault is locked, unlock it first".to_string());
+                    return;
+                };
+                match vault::decrypt_body(key, p) {
+                    Ok(plaintext) => {
+                        let mut copy = s.clone();
+                        copy.body = plaintext;
+                        Editor::from_snippet(&copy, &self.categories)
+                    }
+                    Err(e) => {
+                        self.save_error = Some(format!(
+                            "Couldn't edit \"{}\": the protected snippet can't be decrypted ({e})",
+                            s.title
+                        ));
+                        return;
+                    }
+                }
+            }
+        };
+        self.editor = Some(editor);
+    }
+
+    /// Routes a single card action: protected + locked → open the unlock prompt with
+    /// the action pending; everything else acts immediately. The gating predicate is
+    /// `editor::card_action_requires_vault` (pure, unit-tested).
+    fn dispatch_action(&mut self, action: Action, ctx: &egui::Context, now: f64) {
+        match action {
+            Action::Copy(id) => {
+                let protected = self
+                    .snippets
+                    .iter()
+                    .any(|s| s.id == id && s.protection.is_some());
+                if editor::card_action_requires_vault(protected, self.vault.is_unlocked()) {
+                    self.vault_prompt = Some(VaultPrompt::unlock_for(PendingVaultAction::Copy(id)));
+                } else {
+                    self.copy_snippet(id, ctx, now);
+                }
+            }
+            Action::Edit(id) => {
+                let protected = self
+                    .snippets
+                    .iter()
+                    .any(|s| s.id == id && s.protection.is_some());
+                if editor::card_action_requires_vault(protected, self.vault.is_unlocked()) {
+                    self.vault_prompt = Some(VaultPrompt::unlock_for(PendingVaultAction::Edit(id)));
+                } else {
+                    self.edit_snippet(id);
+                }
+            }
+        }
+    }
+
+    /// Runs the action suspended behind a vault prompt once the vault is available.
+    fn run_pending_vault_action(&mut self, pending: PendingVaultAction, ctx: &egui::Context, now: f64) {
+        match pending {
+            PendingVaultAction::Copy(id) => self.copy_snippet(id, ctx, now),
+            PendingVaultAction::Edit(id) => self.edit_snippet(id),
+            PendingVaultAction::ProtectSave(ed) => self.apply_save(ed),
+        }
+    }
+
+    /// Creates the vault from a validated password: derives the key, keeps the
+    /// metadata in memory, and persists `config.json` atomically. Returns an error
+    /// (and rolls the in-memory state back) if the config write fails — protecting a
+    /// card under a vault that would vanish on relaunch would destroy the secret.
+    fn create_vault_and_unlock(&mut self, password: &str) -> Result<(), String> {
+        let (meta, key) = vault::create_vault(password).map_err(|e| e.to_string())?;
+        self.vault_meta = Some(meta);
+        self.vault.unlock_with_key(key);
+        self.save_config();
+        if self
+            .save_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(CONFIG_SAVE_ERROR))
+        {
+            self.vault_meta = None;
+            self.vault.lock();
+            return Err(format!(
+                "{CONFIG_SAVE_ERROR}: the vault couldn't be written, so nothing was protected"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Handles the outcome of the unlock / create-vault modal after the user clicked
+    /// its submit button. Returns `Some(prompt)` when the modal should stay open with
+    /// an inline error, `None` when it succeeded and closed (running the pending
+    /// action). `prompt` is owned so the caller can put it back or drop it.
+    fn handle_vault_prompt(
+        &mut self,
+        mut prompt: VaultPrompt,
+        ctx: &egui::Context,
+        now: f64,
+    ) -> Option<VaultPrompt> {
+        match prompt.mode {
+            VaultPromptMode::Create => {
+                if prompt.password.is_empty() {
+                    prompt.error = Some("Password can't be empty".to_string());
+                    return Some(prompt);
+                }
+                if prompt.password != prompt.confirm {
+                    prompt.error = Some("Passwords don't match".to_string());
+                    return Some(prompt);
+                }
+                match self.create_vault_and_unlock(&prompt.password) {
+                    Ok(()) => {
+                        if let Some(pending) = prompt.pending.take() {
+                            self.run_pending_vault_action(pending, ctx, now);
+                        }
+                        None
+                    }
+                    Err(e) => {
+                        prompt.error = Some(e);
+                        Some(prompt)
+                    }
+                }
+            }
+            VaultPromptMode::Unlock => {
+                let Some(meta) = self.vault_meta.clone() else {
+                    prompt.error = Some(
+                        "No vault exists yet — check \"Protect this snippet\" to create one"
+                            .to_string(),
+                    );
+                    return Some(prompt);
+                };
+                match self.vault.unlock(&prompt.password, &meta) {
+                    Ok(()) => {
+                        if let Some(pending) = prompt.pending.take() {
+                            self.run_pending_vault_action(pending, ctx, now);
+                        }
+                        None
+                    }
+                    Err(_) => {
+                        prompt.error = Some("Wrong password. Try again.".to_string());
+                        Some(prompt)
+                    }
+                }
+            }
+        }
     }
 
     /// Applies the `EditorOutcome::AddCategory` outcome: registers the new category and,
@@ -540,7 +884,11 @@ impl CopyIt {
         let preview: &str = match self.derived.get(idx) {
             Some(d) => &d.preview,
             None => {
-                fallback_preview = preview_text(&s.body, PREVIEW_CHARS);
+                // A protected snippet never renders its body even in this fallback.
+                fallback_preview = match &s.protection {
+                    Some(p) => vault::masked_preview(&p.hint),
+                    None => preview_text(&s.body, PREVIEW_CHARS),
+                };
                 &fallback_preview
             }
         };
@@ -582,6 +930,10 @@ impl CopyIt {
                                             )
                                             .truncate(true),
                                         );
+                                        if s.protection.is_some() {
+                                            ui.add_space(4.0);
+                                            protected_chip(ui);
+                                        }
                                     },
                                 );
                                 resp
@@ -777,12 +1129,22 @@ impl CopyIt {
 }
 
 impl eframe::App for CopyIt {
-    /// Main UI render loop called once per frame.
-    /// Renders the top bar (search, category filter, theme selector, new button),
-    /// the responsive grid of snippet cards, and the editor modal if open.
-    /// Handles all user input: search/filter/category management, copy/edit/delete actions,
-    /// drag-and-drop reordering with visual insertion lines, and theme switching.
+    /// Main UI render loop called once per frame by eframe. Delegates to
+    /// [`Self::ui`], so the harness and the real window run the identical code.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui(ctx);
+    }
+}
+
+impl CopyIt {
+    /// Renders the entire UI once per frame against a bare `egui::Context`:
+    ///   the top bar (search, category filter, theme selector, new button),
+    ///   the responsive grid of snippet cards, and the editor modal if open.
+    /// Handles all user input: search/filter/category management, copy/edit/delete
+    /// actions, drag-and-drop reordering with visual insertion lines, and theme
+    /// switching. eframe's `update` delegates here, and the simulation harness
+    /// drives this same function headlessly through `egui::Context::run`.
+    pub fn ui(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
         let previous_theme = self.theme;
         // The visuals are *not* rebuilt here every frame: `Theme::visuals()` constructs a
@@ -894,6 +1256,30 @@ impl eframe::App for CopyIt {
                     self.save_config();
                 }
 
+                // Vault state, shown only when at least one snippet is protected. The
+                // indicator uses plain labels (the padlock emoji isn't reliably in
+                // egui's default fonts); while unlocked a Lock button drops the key.
+                if self.snippets.iter().any(|s| s.protection.is_some()) {
+                    ui.add_space(12.0);
+                    match &self.vault {
+                        VaultState::Locked => {
+                            ui.label(
+                                egui::RichText::new("Vault locked")
+                                    .color(egui::Color32::from_rgb(0xef, 0x44, 0x44)),
+                            );
+                        }
+                        VaultState::Unlocked(_) => {
+                            ui.label(
+                                egui::RichText::new("Vault unlocked")
+                                    .color(egui::Color32::from_rgb(0x10, 0xb9, 0x81)),
+                            );
+                            if ui.button("Lock Vault").clicked() {
+                                self.vault.lock();
+                            }
+                        }
+                    }
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("\u{FF0B} New").clicked() {
                         self.editor = Some(Editor::blank(&self.categories));
@@ -965,23 +1351,11 @@ impl eframe::App for CopyIt {
                         )
                     });
 
-            // Process normal click actions.
+            // Process normal click actions. Protected cards are gated here: while
+            // the vault is locked the action is parked behind the unlock prompt
+            // instead of acting.
             for a in actions {
-                match a {
-                    Action::Copy(id) => {
-                        if let Some(s) = self.snippets.iter().find(|s| s.id == id) {
-                            let text = s.body.clone();
-                            ui.output_mut(|o| o.copied_text = text);
-                            self.copied = Some((id, now));
-                            ctx.request_repaint_after(std::time::Duration::from_millis(1300));
-                        }
-                    }
-                    Action::Edit(id) => {
-                        if let Some(s) = self.snippets.iter().find(|s| s.id == id) {
-                            self.editor = Some(Editor::from_snippet(s, &self.categories));
-                        }
-                    }
-                }
+                self.dispatch_action(a, ctx, now);
             }
 
             // Start a new drag if requested.
@@ -1103,6 +1477,11 @@ impl eframe::App for CopyIt {
             let reserved_for_fixed = 170.0; // title/category row + label + buttons + spacing
             let max_content_height = (max_window_height - reserved_for_fixed).max(120.0);
 
+            // The protect checkbox only makes sense with a vault available: it is
+            // enabled while the vault is unlocked, or when no vault exists yet (the
+            // first-ever-protect path, which runs password creation before saving).
+            let can_protect = self.vault.is_unlocked() || self.vault_meta.is_none();
+
             egui::Window::new(title)
                 .collapsible(false)
                 .resizable(true)
@@ -1190,6 +1569,14 @@ impl eframe::App for CopyIt {
                         });
                     ui.add_space(10.0);
 
+                    // "Protect this snippet" — the editor mirrors an existing card's
+                    // protection; saving with it checked encrypts the body. Enabled
+                    // only while a vault is available (see `can_protect` above).
+                    ui.add_enabled_ui(can_protect, |ui| {
+                        ui.checkbox(&mut ed.protect, "Protect this snippet");
+                    });
+                    ui.add_space(6.0);
+
                     ui.horizontal(|ui| {
                         let can_save = !ed.title.trim().is_empty();
                         if ui
@@ -1228,7 +1615,7 @@ impl eframe::App for CopyIt {
             // Pure transition: the button click plus the window's open/close flag
             // decide what happens next; the app only applies the outcome.
             match editor::decide(result, ed, window_open) {
-                editor::EditorOutcome::Save(ed) => self.apply_save(ed),
+                editor::EditorOutcome::Save(ed) => self.handle_editor_save(ed),
                 editor::EditorOutcome::Delete(id) => {
                     self.snippets.retain(|s| s.id != id);
                     self.snippets_changed();
@@ -1240,6 +1627,94 @@ impl eframe::App for CopyIt {
                 editor::EditorOutcome::Keep(ed) => {
                     self.editor = Some(ed);
                 }
+            }
+        }
+
+        // ---- Vault prompt modal (unlock / create vault) ----
+        // Opened by gated card actions and by the first-ever-protect save. On
+        // success the pending action (copy, edit, or the folded-in editor save) runs
+        // immediately; on failure an inline error keeps the modal open. Cancelling
+        // restores an editor that was parked here so no edits are lost.
+        if let Some(mut prompt) = self.vault_prompt.take() {
+            let mut window_open = true;
+            let mut submit = false;
+            let mut cancel = false;
+            let title = match prompt.mode {
+                VaultPromptMode::Create => "Create vault password",
+                VaultPromptMode::Unlock => "Unlock vault",
+            };
+
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(380.0)
+                .open(&mut window_open)
+                .show(ctx, |ui| {
+                    let explain = match prompt.mode {
+                        VaultPromptMode::Create => {
+                            "This app keeps protected snippets encrypted with a vault \
+                             password — one password for all protected cards. Choose one \
+                             below; it cannot be recovered if forgotten and is never stored."
+                        }
+                        VaultPromptMode::Unlock => {
+                            "This card is protected. Unlock the vault to copy or edit its \
+                             content. Cards stay masked until then."
+                        }
+                    };
+                    ui.label(explain);
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Password");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut prompt.password)
+                                .password(true)
+                                .desired_width(220.0),
+                        );
+                    });
+                    if matches!(prompt.mode, VaultPromptMode::Create) {
+                        ui.horizontal(|ui| {
+                            ui.label("Confirm");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut prompt.confirm)
+                                    .password(true)
+                                    .desired_width(220.0),
+                            );
+                        });
+                    }
+                    if let Some(err) = &prompt.error {
+                        ui.colored_label(WARNING_COLOR, err);
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let button_label = match prompt.mode {
+                            VaultPromptMode::Create => "Create vault",
+                            VaultPromptMode::Unlock => "Unlock",
+                        };
+                        if ui.button(button_label).clicked() {
+                            submit = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+
+            if cancel {
+                window_open = false;
+            }
+
+            if !window_open {
+                // Cancelled: if an editor was parked here (first-ever protect),
+                // hand it back so the user keeps their draft.
+                if let Some(PendingVaultAction::ProtectSave(ed)) = prompt.pending {
+                    self.editor = Some(ed);
+                }
+            } else if submit {
+                if let Some(kept) = self.handle_vault_prompt(prompt, ctx, now) {
+                    self.vault_prompt = Some(kept);
+                }
+            } else {
+                self.vault_prompt = Some(prompt);
             }
         }
     }
@@ -1364,12 +1839,32 @@ fn category_color(cat: &str) -> egui::Color32 {
     palette[h % palette.len()]
 }
 
+/// The lock indicator a protected card always shows. Plain text on purpose: the
+/// padlock glyph (U+1F512) is not guaranteed to render in egui's default fonts,
+/// so a small colored "PROTECTED" tag is used instead. The chip must be visually
+/// distinct from the (hash-colored) category badge.
+fn protected_chip(ui: &mut egui::Ui) {
+    let text_color = if ui.visuals().dark_mode {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::BLACK
+    };
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(0xa9, 0x7b, 0x00)) // dark amber, not in the badge palette
+        .rounding(egui::Rounding::same(4.0))
+        .inner_margin(egui::Margin::symmetric(5.0, 1.0))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new("PROTECTED").small().color(text_color));
+        });
+}
+
 /// Unit tests for grid layout and drag-and-drop logic.
 /// Validates that card positioning, gap detection, and insertion line rendering work correctly
 /// across different grid configurations (single and multi-card layouts).
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+    use crate::model::Protection;
     use crate::grid::{
         gap_point, grid_card_rect, nearest_gap, visible_rows, CARD_H, CARD_SPACING, CARD_W,
         GRID_TOP_SPACE, ROW_PITCH,
@@ -1377,32 +1872,24 @@ mod layout_tests {
 
     /// Builds an app whose data files live in a throwaway temp directory, so tests that
     /// exercise the auto-save paths never write into the repository or clobber real user data.
+    /// The fixture is materialized into the temp store first, then loaded through
+    /// [`CopyIt::from_store`] — the same construction path the app and the simulation
+    /// harness use.
     fn test_app(name: &str, snippets: Vec<Snippet>, categories: Vec<String>) -> CopyIt {
         let dir = std::env::temp_dir().join(format!("copyit-app-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp data dir");
-        let next_id = next_snippet_id(&snippets);
-        let mut app = CopyIt {
-            snippets,
-            derived: Vec::new(),
-            generation: 0,
-            filter: FilterCache::default(),
-            next_id,
-            store: Store::at(dir.clone()),
-            categories,
-            search: String::new(),
-            category_filter: "All".into(),
-            theme: Theme::Dark,
-            editor: None,
-            copied: None,
-            drag: None,
-            adding_header_category: false,
-            new_header_category: String::new(),
-            category_error: None,
-            save_error: None,
-        };
-        app.rebuild_derived();
-        app
+        let store = Store::at(dir.clone());
+        store.save_snippets(&snippets).expect("seed fixture snippets");
+        store
+            .save_config(&Config {
+                categories,
+                theme: "Dark".into(),
+                vault: None,
+            })
+            .expect("seed fixture config");
+        let ctx = egui::Context::default();
+        CopyIt::from_store(store, &ctx)
     }
 
     fn snippet(id: u64, category: &str) -> Snippet {
@@ -1411,6 +1898,23 @@ mod layout_tests {
             title: format!("Snippet {id}"),
             category: category.to_string(),
             body: format!("body {id}"),
+            protection: None,
+        }
+    }
+
+    /// Builds a protected snippet directly (dummy nonce/ciphertext — fine for the
+    /// Derived/card tests, which never decrypt).
+    fn protected_snippet(id: u64, category: &str, hint: &str) -> Snippet {
+        Snippet {
+            id,
+            title: format!("Secret {id}"),
+            category: category.to_string(),
+            body: String::new(),
+            protection: Some(Protection {
+                hint: hint.to_string(),
+                nonce: "bm9uY2U=".into(),
+                ciphertext: "Y2lwaGVy".into(),
+            }),
         }
     }
 
@@ -2069,18 +2573,21 @@ mod layout_tests {
                     title: "Rebase onto main".into(),
                     category: "Git".into(),
                     body: "git rebase origin/MAIN".into(),
+                    protection: None,
                 },
                 Snippet {
                     id: 2,
                     title: "Summarize".into(),
                     category: "Prompt".into(),
                     body: "Summarize the following text".into(),
+                    protection: None,
                 },
                 Snippet {
                     id: 3,
                     title: "Stash".into(),
                     category: "Git".into(),
                     body: "git stash pop".into(),
+                    protection: None,
                 },
             ],
             vec!["Git".into(), "Prompt".into()],
@@ -2190,6 +2697,7 @@ mod layout_tests {
                 title: "T".into(),
                 category: "Git".into(),
                 body: "  first    line\nsecond line  ".into(),
+                protection: None,
             }],
             vec!["Git".into()],
         );
@@ -2792,5 +3300,337 @@ mod layout_tests {
                 );
             });
         });
+    }
+
+    // ---- Vault / protected-snippet tests ----
+    //
+    // Renamed import so the Engine trait methods (encode/decode) are reachable when
+    // a test needs to tamper with a ciphertext's bytes.
+    use base64::Engine as _;
+
+    /// Builds an app with one REAL protected snippet: the vault password is `pw`,
+    /// `body` is encrypted under the derived key at setup, and the vault metadata is
+    /// installed in memory (the app itself still starts locked — tests unlock it
+    /// explicitly). The on-disk `config.json` has no vault section (a fresh library),
+    /// matching a first-protect scenario.
+    fn protected_test_app(name: &str, body: &str) -> (CopyIt, VaultMeta, [u8; 32]) {
+        let (meta, key) = vault::create_vault("pw").unwrap();
+        let protection = vault::encrypt_body(&key, body).unwrap();
+        let mut app = test_app(
+            name,
+            vec![Snippet {
+                id: 1,
+                title: "Secret".into(),
+                category: "Git".into(),
+                body: String::new(),
+                protection: Some(protection),
+            }],
+            vec!["Git".into()],
+        );
+        app.vault_meta = Some(meta.clone());
+        (app, meta, key)
+    }
+
+    fn input_frame() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(400.0, 300.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn search_never_matches_protected_bodies_but_matches_title_and_category() {
+        let mut app = test_app(
+            "search-protected",
+            vec![
+                snippet(1, "Git"),
+                Snippet {
+                    id: 2,
+                    title: "AWS prod key".into(),
+                    category: "Secrets".into(),
+                    body: String::new(),
+                    protection: Some(Protection {
+                        hint: "ghp_x".into(),
+                        nonce: "n".into(),
+                        ciphertext: "c".into(),
+                    }),
+                },
+            ],
+            vec!["Git".into(), "Secrets".into()],
+        );
+
+        // The hint is cleartext metadata, not searchable text.
+        app.search = "ghp_x".into();
+        assert_eq!(app.take_filtered(), Vec::<usize>::new(), "hint must never enter search");
+        app.restore_filtered(Vec::new());
+        // Title and category stay searchable.
+        app.search = "AWS".into();
+        assert_eq!(app.take_filtered(), vec![1], "title still matches");
+        app.restore_filtered(vec![1]);
+        app.search = "Secrets".into();
+        assert_eq!(app.take_filtered(), vec![1], "category still matches");
+        app.restore_filtered(vec![1]);
+    }
+
+    #[test]
+    fn masked_preview_follows_the_hint_rule_for_protected_cards() {
+        let app = test_app(
+            "masked-preview",
+            vec![protected_snippet(1, "Git", "ghp_x"), protected_snippet(2, "Git", "")],
+            vec!["Git".into()],
+        );
+        assert_eq!(
+            app.derived[0].preview,
+            "ghp_x\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}"
+        );
+        assert_eq!(
+            app.derived[1].preview,
+            "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}"
+        );
+        // Protected bodies are never indexed, whatever the stored hint is.
+        assert_eq!(app.derived[0].body_lower, "");
+        assert_eq!(app.derived[1].body_lower, "");
+    }
+
+    #[test]
+    fn protected_cards_stay_masked_while_unlocked() {
+        let (mut app, _, key) = protected_test_app("stay-masked", "a long secret body");
+        assert!(app.vault.is_locked());
+        assert_eq!(app.derived[0].body_lower, "");
+        assert_eq!(app.derived[0].preview, vault::masked_preview("a lon"));
+        app.vault.unlock_with_key(key);
+        assert!(app.vault.is_unlocked());
+        // Unlocking skips prompts; it must not change what the grid renders.
+        assert_eq!(app.derived[0].body_lower, "");
+        assert_eq!(app.derived[0].preview, vault::masked_preview("a lon"));
+    }
+
+    #[test]
+    fn locked_copy_and_edit_prompt_instead_of_acting() {
+        let (mut app, _, _) = protected_test_app("locked-gate", "a long secret body");
+        assert!(app.vault.is_locked());
+        let ctx = egui::Context::default();
+
+        let _ = ctx.run(input_frame(), |ctx| {
+            app.dispatch_action(Action::Copy(1), ctx, 0.0);
+        });
+        assert!(
+            app.vault_prompt.is_some(),
+            "copying a protected card while locked opens the unlock prompt"
+        );
+        let prompt = app.vault_prompt.as_ref().unwrap();
+        assert!(matches!(prompt.mode, VaultPromptMode::Unlock));
+        assert!(matches!(prompt.pending, Some(PendingVaultAction::Copy(1))));
+        assert!(app.copied.is_none(), "nothing may be copied while locked");
+        app.vault_prompt = None;
+
+        let _ = ctx.run(input_frame(), |ctx| {
+            app.dispatch_action(Action::Edit(1), ctx, 0.0);
+        });
+        assert!(
+            app.vault_prompt.is_some(),
+            "editing a protected card while locked opens the unlock prompt"
+        );
+        assert!(matches!(
+            app.vault_prompt.as_ref().unwrap().pending,
+            Some(PendingVaultAction::Edit(1))
+        ));
+        assert!(app.editor.is_none(), "the editor must not open while locked");
+    }
+
+    #[test]
+    fn unlocked_copy_places_plaintext_on_the_clipboard() {
+        let (mut app, _, key) = protected_test_app("unlocked-copy", "super secret value");
+        app.vault.unlock_with_key(key);
+        let ctx = egui::Context::default();
+        let output = ctx.run(input_frame(), |ctx| {
+            app.dispatch_action(Action::Copy(1), ctx, 0.0);
+        });
+        assert_eq!(output.platform_output.copied_text, "super secret value");
+        assert_eq!(app.copied, Some((1, 0.0)));
+        assert!(app.vault_prompt.is_none());
+    }
+
+    #[test]
+    fn unlocked_edit_opens_with_the_decrypted_body() {
+        let (mut app, _, key) = protected_test_app("unlocked-edit", "secret edit body");
+        app.vault.unlock_with_key(key);
+        let ctx = egui::Context::default();
+        app.dispatch_action(Action::Edit(1), &ctx, 0.0);
+        let ed = app.editor.as_ref().expect("editor opens");
+        assert_eq!(ed.id, Some(1));
+        assert_eq!(ed.body, "secret edit body");
+        assert!(ed.protect, "the checkbox reflects the card's protection");
+    }
+
+    #[test]
+    fn wrong_password_changes_nothing() {
+        let (mut app, _, _) = protected_test_app("wrong-pw", "a long secret body");
+        let ctx = egui::Context::default();
+        let mut prompt = VaultPrompt::unlock_for(PendingVaultAction::Copy(1));
+        prompt.password = "wrong".into();
+        let kept = app
+            .handle_vault_prompt(prompt, &ctx, 0.0)
+            .expect("modal stays open on a wrong password");
+        assert_eq!(kept.error.as_deref(), Some("Wrong password. Try again."));
+        assert!(app.vault.is_locked(), "wrong password must not unlock");
+        assert!(
+            matches!(kept.pending, Some(PendingVaultAction::Copy(1))),
+            "the pending action survives the failed attempt"
+        );
+        assert!(app.copied.is_none());
+    }
+
+    #[test]
+    fn aead_failure_with_valid_canary_shows_banner_and_leaves_file_untouched() {
+        let (mut app, _, key) = protected_test_app("aead-fail", "a long secret body");
+        app.vault.unlock_with_key(key);
+        // Tamper the card's ciphertext (the canary stays valid, so the vault unlocks).
+        let protection = app.snippets[0].protection.as_mut().unwrap();
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(&protection.ciphertext)
+            .unwrap();
+        bytes[0] ^= 0xff;
+        protection.ciphertext = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        let file_before = std::fs::read_to_string(&app.store.snippets_path).unwrap();
+        let ctx = egui::Context::default();
+        let output = ctx.run(input_frame(), |ctx| {
+            app.dispatch_action(Action::Copy(1), ctx, 0.0);
+        });
+        assert_eq!(
+            output.platform_output.copied_text, "",
+            "a failed decrypt must not copy anything"
+        );
+        assert!(app.copied.is_none());
+        let banner = app.save_error.as_deref().expect("warning banner is set");
+        assert!(banner.contains("Secret"), "banner names the card: {banner}");
+        assert!(banner.contains("can't be decrypted"));
+        assert_eq!(
+            std::fs::read_to_string(&app.store.snippets_path).unwrap(),
+            file_before,
+            "the failed decrypt must leave the file untouched"
+        );
+    }
+
+    #[test]
+    fn protect_stores_ciphertext_and_censors_the_card() {
+        let (meta, key) = vault::create_vault("pw").unwrap();
+        let mut app = test_app("protect-save", vec![], vec!["Git".into()]);
+        app.vault_meta = Some(meta);
+        app.vault.unlock_with_key(key);
+        let mut ed = Editor::blank(&app.categories);
+        ed.title = "Secret".into();
+        ed.body = "a secret body long enough".into();
+        ed.protect = true;
+        app.apply_save(ed);
+
+        assert_eq!(app.snippets.len(), 1);
+        let s = &app.snippets[0];
+        assert!(s.protection.is_some());
+        assert!(s.body.is_empty(), "the plaintext body is empty on disk");
+        assert_eq!(s.protection.as_ref().unwrap().hint, "a sec");
+        // The card is censored.
+        assert_eq!(app.derived[0].body_lower, "");
+        assert_eq!(app.derived[0].preview, vault::masked_preview("a sec"));
+        // On disk: ciphertext only, no plaintext.
+        let raw = std::fs::read_to_string(&app.store.snippets_path).unwrap();
+        assert!(!raw.contains("a secret body long enough"), "secret on disk: {raw}");
+        assert!(raw.contains("ciphertext"));
+        // Round-trips through the store.
+        match storage::load(&app.store.snippets_path) {
+            storage::Load::Loaded(snips) => {
+                assert!(snips[0].protection.is_some());
+                assert!(snips[0].body.is_empty());
+            }
+            _ => panic!("saved library should load back"),
+        }
+    }
+
+    #[test]
+    fn unprotect_restores_plaintext() {
+        let (mut app, _, key) = protected_test_app("unprotect", "a secret body long enough");
+        app.vault.unlock_with_key(key);
+        let mut ed = Editor::from_snippet(&app.snippets[0], &app.categories);
+        assert!(ed.protect, "the checkbox starts checked on a protected card");
+        ed.protect = false;
+        ed.body = "now plaintext".into();
+        app.apply_save(ed);
+
+        assert!(app.snippets[0].protection.is_none());
+        assert_eq!(app.snippets[0].body, "now plaintext");
+        let raw = std::fs::read_to_string(&app.store.snippets_path).unwrap();
+        assert!(raw.contains("now plaintext"));
+        assert!(raw.contains("\"body\": \"now plaintext\""));
+        assert!(!raw.contains("ciphertext"));
+        // The card renders normally again.
+        assert_eq!(app.derived[0].body_lower, "now plaintext");
+    }
+
+    #[test]
+    fn first_protect_creates_the_config_vault() {
+        let mut app = test_app("first-protect", vec![], vec!["Git".into()]);
+        assert!(app.vault_meta.is_none());
+
+        let mut ed = Editor::blank(&app.categories);
+        ed.title = "Secret".into();
+        ed.body = "a secret body long enough".into();
+        ed.protect = true;
+
+        // Saving with protect on and no vault routes to the create-vault prompt
+        // BEFORE anything is persisted.
+        app.handle_editor_save(ed);
+        let prompt = app.vault_prompt.take().expect("create prompt opens");
+        assert!(matches!(prompt.mode, VaultPromptMode::Create));
+        assert!(matches!(prompt.pending, Some(PendingVaultAction::ProtectSave(_))));
+        assert!(app.snippets.is_empty(), "nothing saved before the vault exists");
+
+        // Mismatched confirmation: inline error, no vault, nothing persisted.
+        let mut prompt = prompt;
+        prompt.password = "pw".into();
+        prompt.confirm = "different".into();
+        let ctx = egui::Context::default();
+        let kept = app
+            .handle_vault_prompt(prompt, &ctx, 0.0)
+            .expect("a mismatch keeps the modal open");
+        assert_eq!(kept.error.as_deref(), Some("Passwords don't match"));
+        assert!(app.vault_meta.is_none());
+        assert!(app.snippets.is_empty());
+
+        // Matching passwords: vault created and persisted, the pending save runs.
+        let mut prompt = kept;
+        prompt.password = "pw".into();
+        prompt.confirm = "pw".into();
+        prompt.error = None;
+        assert!(app.handle_vault_prompt(prompt, &ctx, 0.0).is_none(), "modal closes on success");
+        assert!(app.vault.is_unlocked());
+        assert!(app.vault_meta.is_some());
+        assert_eq!(app.snippets.len(), 1);
+        assert!(app.snippets[0].protection.is_some());
+        assert!(app.snippets[0].body.is_empty());
+
+        // `config.json` now carries the vault section.
+        match storage::load_config(&app.store.config_path) {
+            storage::Load::Loaded(config) => {
+                assert!(config.vault.is_some(), "first protect persists the vault");
+            }
+            _ => panic!("config should load"),
+        }
+    }
+
+    #[test]
+    fn lock_relocks_and_drops_the_key() {
+        let (mut app, _, key) = protected_test_app("lock-relock", "a long secret body");
+        app.vault.unlock_with_key(key);
+        assert!(app.vault.is_unlocked());
+        app.vault.lock();
+        assert!(app.vault.is_locked());
+        assert!(app.vault.key().is_none());
+        // After locking, protected actions prompt again.
+        app.dispatch_action(Action::Copy(1), &egui::Context::default(), 0.0);
+        assert!(app.vault_prompt.is_some());
     }
 }

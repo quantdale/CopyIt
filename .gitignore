@@ -3,3 +3,10 @@
 # Local run artifacts if the app is ever launched from the repo root during dev.
 /snippets.json
 /config.json
+
+# Simulation run reports (headless journeys + headed mode).
+/sim-report/
+
+# Local agent tooling / stray working notes (not project content).
+/.kimi/
+/deep review resolve.txt

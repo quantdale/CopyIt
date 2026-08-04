@@ -10,6 +10,20 @@ egui = "0.27"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Vault crypto for protected snippets (all pure-Rust, no system libraries):
+# Argon2id key derivation, XChaCha20-Poly1305 AEAD, base64 encoding, and
+# salt/nonce generation. rand also powers the seeded simulation harness.
+argon2 = "0.5"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+
+[features]
+# Simulation harness (headless journeys + headed mode). Compiling it is gated on
+# `cfg(any(test, feature = "sim"))`, so the release binary is unaffected by
+# default builds.
+sim = []
+
 # Small, fast-launching release binary
 [profile.release]
 opt-level = "z"     # optimize for size

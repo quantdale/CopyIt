@@ -12,6 +12,18 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
       - run: cargo build --release
+      # The headless journey suite (all sim_journeys_* tests), run serially so
+      # the reported timing is deterministic. The same tests already ran in
+      # `cargo test --all-targets`; this step makes the suite explicit and its
+      # runtime measurable (must stay under 60 s).
+      - run: cargo test --bin copyit sim_journeys -- --test-threads 1
+      - name: Upload simulation report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-report
+          path: sim-report/
+          if-no-files-found: ignore
   audit:
     runs-on: ubuntu-latest       # cargo audit reads Cargo.lock (all-platform); cheap + identical here
     permissions:
