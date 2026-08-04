@@ -25,6 +25,9 @@ pub struct Editor {
     pub body: String,
     /// Set to true on first "Delete" click; requires a second "Confirm delete" to prevent accidents.
     pub confirm_delete: bool,
+    /// Validation error for the inline category field (e.g. "All" is reserved); shown
+    /// under the input and cleared as soon as the user edits it.
+    pub category_error: Option<String>,
 }
 
 impl Editor {
@@ -40,16 +43,18 @@ impl Editor {
             adding_category: false,
             body: String::new(),
             confirm_delete: false,
+            category_error: None,
         }
     }
 
     /// An editor pre-populated from an existing snippet. The category is matched
-    /// against the canonical list case-insensitively, falling back to the
-    /// snippet's own category if no canonical match exists.
+    /// against the canonical list case-insensitively (full Unicode, matching the
+    /// rest of the app), falling back to the snippet's own category if no canonical
+    /// match exists.
     pub fn from_snippet(s: &Snippet, categories: &[String]) -> Self {
         let category = categories
             .iter()
-            .find(|c| c.eq_ignore_ascii_case(&s.category))
+            .find(|c| crate::storage::same_category(c, &s.category))
             .cloned()
             .unwrap_or_else(|| s.category.clone());
         Editor {
@@ -60,6 +65,7 @@ impl Editor {
             adding_category: false,
             body: s.body.clone(),
             confirm_delete: false,
+            category_error: None,
         }
     }
 }
@@ -131,6 +137,7 @@ mod tests {
             adding_category: false,
             body: "Body".into(),
             confirm_delete: false,
+            category_error: None,
         }
     }
 
@@ -171,6 +178,32 @@ mod tests {
         };
         let ed = Editor::from_snippet(&unknown, &categories());
         assert_eq!(ed.category, "Uncategorized", "no match keeps the original");
+    }
+
+    #[test]
+    fn from_snippet_matches_categories_with_unicode_case_folding() {
+        // The rest of the app compares categories with `storage::same_category` (full
+        // Unicode lowercasing), not ASCII-only equality, so accented names must match.
+        let s = Snippet {
+            id: 9,
+            title: "Café".into(),
+            category: "CAFÉ".into(),
+            body: "x".into(),
+        };
+        let ed = Editor::from_snippet(&s, &["Café".to_string()]);
+        assert_eq!(ed.category, "Café", "must match using full Unicode case folding");
+    }
+
+    #[test]
+    fn constructors_initialize_category_error_to_none() {
+        assert!(Editor::blank(&categories()).category_error.is_none());
+        let s = Snippet {
+            id: 5,
+            title: "T".into(),
+            category: "Git".into(),
+            body: "b".into(),
+        };
+        assert!(Editor::from_snippet(&s, &categories()).category_error.is_none());
     }
 
     #[test]

@@ -64,12 +64,20 @@ impl Store {
 }
 
 /// Moves the first non-empty legacy `filename` into `new_path` if the stable
-/// location doesn't have one yet.
+/// location doesn't have one yet, searching the standard legacy locations.
 fn migrate_path(new_path: &Path, filename: &str) {
+    migrate_path_from(new_path, filename, &storage::legacy_candidate_dirs());
+}
+
+/// Moves the first non-empty legacy `filename` found in an explicit `candidates`
+/// list into `new_path` if the stable location doesn't have one yet. Extracted
+/// from [`migrate_path`] as a pure function so migration can be tested with an
+/// explicit candidate list instead of the hard-coded legacy scan locations.
+fn migrate_path_from(new_path: &Path, filename: &str, candidates: &[PathBuf]) {
     if new_path.exists() {
         return; // Already migrated or was created fresh; don't search legacy locations
     }
-    for dir in storage::legacy_candidate_dirs() {
+    for dir in candidates {
         let candidate = dir.join(filename);
         if candidate == new_path {
             continue; // Skip the new location itself (shouldn't happen, but be safe)
@@ -80,8 +88,12 @@ fn migrate_path(new_path: &Path, filename: &str) {
             if trimmed.is_empty() || trimmed == "[]" || trimmed == "{}" {
                 continue;
             }
-            let _ = std::fs::write(new_path, data);
-            return; // Success: migrate and stop searching
+            // Write atomically so a crash mid-migration can't leave a truncated
+            // stable file. On write failure, stop rather than swallow it: the
+            // legacy source stays intact for the next launch to retry.
+            if storage::write_atomic(new_path, &data).is_ok() {
+                return; // Success: migrate and stop searching
+            }
         }
     }
 }
@@ -170,15 +182,75 @@ mod tests {
     }
 
     #[test]
-    fn migrate_skips_empty_placeholder_files() {
-        let dir = temp_dir("migrate_empty");
-        let store = Store::at(dir.join("new"));
-        std::fs::create_dir_all(dir.join("legacy")).unwrap();
-        std::fs::write(dir.join("legacy/snippets.json"), "[]").unwrap();
-        std::fs::write(dir.join("legacy/config.json"), "{}").unwrap();
-        store.migrate_legacy();
-        assert!(!store.snippets_path.exists());
-        assert!(!store.config_path.exists());
+    fn migrate_copies_first_non_empty_legacy_file_verbatim() {
+        let dir = temp_dir("migrate_copy");
+        let new_path = dir.join("new").join("snippets.json");
+        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        let legacy = dir.join("legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let data = r#"[{"id":1,"title":"X","category":"Git","body":"y"}]"#;
+        std::fs::write(legacy.join("snippets.json"), data).unwrap();
+
+        migrate_path_from(&new_path, "snippets.json", std::slice::from_ref(&legacy));
+        assert_eq!(std::fs::read_to_string(&new_path).unwrap(), data);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_skips_empty_and_placeholder_legacy_files() {
+        let dir = temp_dir("migrate_skip");
+        // Three candidate dirs, each holding a "snippets.json"; all are empty or
+        // dummy JSON, so nothing should be migrated.
+        let empty = dir.join("empty");
+        let array = dir.join("array");
+        let object = dir.join("object");
+        for d in [&empty, &array, &object] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(empty.join("snippets.json"), "").unwrap();
+        std::fs::write(array.join("snippets.json"), "[]").unwrap();
+        std::fs::write(object.join("snippets.json"), "{}").unwrap();
+
+        let new_path = dir.join("new").join("snippets.json");
+        migrate_path_from(
+            &new_path,
+            "snippets.json",
+            &[empty.clone(), array.clone(), object.clone()],
+        );
+        assert!(!new_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_skips_a_candidate_that_resolves_to_new_path() {
+        let dir = temp_dir("migrate_self");
+        let new_path = dir.join("new").join("snippets.json");
+        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        std::fs::write(&new_path, "data").unwrap();
+        // The candidate dir is new_path's parent, so candidate.join(filename) ==
+        // new_path. The file must not be treated as a legacy source or copied
+        // over itself.
+        migrate_path_from(
+            &new_path,
+            "snippets.json",
+            &[new_path.parent().unwrap().to_path_buf()],
+        );
+        assert_eq!(std::fs::read_to_string(&new_path).unwrap(), "data");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_does_nothing_when_new_path_already_exists() {
+        let dir = temp_dir("migrate_exists");
+        let new_path = dir.join("new").join("snippets.json");
+        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        std::fs::write(&new_path, "stable data").unwrap();
+        let legacy = dir.join("legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("snippets.json"), "legacy data").unwrap();
+
+        migrate_path_from(&new_path, "snippets.json", std::slice::from_ref(&legacy));
+        assert_eq!(std::fs::read_to_string(&new_path).unwrap(), "stable data");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -67,7 +67,10 @@ pub fn grid_card_rect(
 /// area), with one row of overscan on each side so a row entering the viewport is
 /// already laid out and edge rounding can't reveal a gap. Rows outside the range are
 /// replaced by blank space of the same height, so scrolling and card positions are
-/// unaffected. Falls back to "every row" if the geometry isn't finite.
+/// unaffected. Non-finite geometry (NaN or infinity in `clip`, `origin_y`, or
+/// `row_pitch`) falls back to "every row". Extreme finite inputs whose
+/// `clip - origin_y` difference overflows to infinity in the intermediate math
+/// saturate to a single row via the `as usize` clamp rather than wrapping.
 pub fn visible_rows(clip: Rect, origin_y: f32, row_pitch: f32, rows: usize) -> (usize, usize) {
     let max_row = rows.saturating_sub(1);
     if rows == 0 {
@@ -103,6 +106,10 @@ pub fn gap_point(
     _card_w: f32,
     pointer: Pos2,
 ) -> Pos2 {
+    let cols = cols.max(1);
+    if rects.is_empty() {
+        return pos2(0.0, 0.0);
+    }
     let n = rects.len();
 
     // Same-row vertical gap: return the point midway between the two adjacent cards.
@@ -140,6 +147,7 @@ pub fn gap_point(
 /// to the current pointer position. This guides the insertion line and drop target.
 /// Returns 0 if the card list is empty (edge case: no cards to reorder against).
 pub fn nearest_gap(pointer: Pos2, rects: &[Rect], cols: usize, spacing: f32, card_w: f32) -> usize {
+    let cols = cols.max(1);
     let n = rects.len();
     if n == 0 {
         return 0;
@@ -175,6 +183,7 @@ pub fn draw_insertion_line(
     card_w: f32,
     card_h: f32,
 ) {
+    let cols = cols.max(1);
     let n = rects.len();
     if n == 0 {
         return;
@@ -451,6 +460,33 @@ mod tests {
         let clearance = 4.0_f32;
         let stroke_width = 2.0_f32;
 
+        // Boundary gaps (before the first card and after the last) are horizontal
+        // gaps: y sits centered in the spacing above/below the edge card, and x
+        // follows the nearest column to the pointer.
+        let p0 = gap_point(0, &rects, cols, CARD_SPACING, CARD_W, rects[0].center());
+        assert!(
+            (p0.y - (rects[0].top() - CARD_SPACING * 0.5)).abs() < 0.1,
+            "gap 0 y = {}, expected {}",
+            p0.y,
+            rects[0].top() - CARD_SPACING * 0.5
+        );
+        assert!((p0.x - rects[0].center().x).abs() < 0.1);
+        let pn = gap_point(
+            rects.len(),
+            &rects,
+            cols,
+            CARD_SPACING,
+            CARD_W,
+            rects[rects.len() - 1].center(),
+        );
+        assert!(
+            (pn.y - (rects[rects.len() - 1].bottom() + CARD_SPACING * 0.5)).abs() < 0.1,
+            "gap n y = {}, expected {}",
+            pn.y,
+            rects[rects.len() - 1].bottom() + CARD_SPACING * 0.5
+        );
+        assert!((pn.x - rects[rects.len() - 1].center().x).abs() < 0.1);
+
         for g in 1..rects.len() {
             let pointer = if g % cols != 0 {
                 pointer_in_vertical_gap(&rects, g)
@@ -531,6 +567,22 @@ mod tests {
     }
 
     #[test]
+    fn zero_cols_does_not_panic() {
+        // `is_multiple_of(cols)` panics on a zero rhs, so cols: 0 must be clamped
+        // before it is reached. These calls must not panic and return something sane.
+        let rects = card_rects(4, 2);
+        let p = pointer_in_vertical_gap(&rects, 1);
+        let gp = gap_point(1, &rects, 0, CARD_SPACING, CARD_W, p);
+        assert!(gp.is_finite());
+        let ng = nearest_gap(p, &rects, 0, CARD_SPACING, CARD_W);
+        assert!((0..=rects.len()).contains(&ng));
+
+        // Empty card list with cols: 0 must also be safe.
+        assert_eq!(gap_point(0, &[], 0, CARD_SPACING, CARD_W, pos2(0.0, 0.0)), pos2(0.0, 0.0));
+        assert_eq!(nearest_gap(pos2(0.0, 0.0), &[], 0, CARD_SPACING, CARD_W), 0);
+    }
+
+    #[test]
     fn visible_rows_covers_the_viewport_and_stays_in_bounds() {
         let row_pitch = 200.0_f32;
         let origin_y = 100.0_f32;
@@ -565,6 +617,13 @@ mod tests {
         assert_eq!(visible_rows(clip, f32::NAN, row_pitch, rows), (0, rows - 1));
         assert_eq!(visible_rows(clip, origin_y, row_pitch, 1), (0, 0));
         assert_eq!(visible_rows(clip, origin_y, row_pitch, 0), (0, 0));
+
+        // An infinite clip is non-finite geometry, so it falls back to every row.
+        let inf_clip = Rect::from_min_max(
+            pos2(0.0, f32::INFINITY),
+            pos2(1000.0, f32::INFINITY),
+        );
+        assert_eq!(visible_rows(inf_clip, origin_y, row_pitch, rows), (0, rows - 1));
     }
 
     #[test]

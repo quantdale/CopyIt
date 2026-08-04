@@ -10,14 +10,16 @@ pub const UNCATEGORIZED: &str = "Uncategorized";
 /// Resolves the stable per-user directory where snippets.json and config.json live.
 /// Uses `%APPDATA%\CopyIt` on Windows (preferred: survives git checkouts, cargo clean, etc.),
 /// falling back to the directory containing the running .exe on non-Windows or when APPDATA
-/// is unset (e.g., in dev/CI environments). This strategy decouples data persistence from
-/// build artifacts: users can freely update/rebuild the application without losing their
+/// is unset or empty (e.g., in dev/CI environments). This strategy decouples data persistence
+/// from build artifacts: users can freely update/rebuild the application without losing their
 /// saved snippets. The directory is created on first access if it doesn't exist.
 pub fn data_dir() -> PathBuf {
     if let Ok(appdata) = std::env::var("APPDATA") {
-        let dir = PathBuf::from(appdata).join("CopyIt");
-        let _ = std::fs::create_dir_all(&dir);
-        return dir;
+        if !appdata.is_empty() {
+            let dir = PathBuf::from(appdata).join("CopyIt");
+            let _ = std::fs::create_dir_all(&dir);
+            return dir;
+        }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -92,6 +94,10 @@ pub fn load_config(path: &Path) -> Load<Config> {
 /// Moves an unreadable data file aside (appending `.corrupt` to its name) so the
 /// user can still recover it by hand, and returns the backup path. Called before
 /// the seeded defaults are allowed to take over the original filename.
+///
+/// If a `.corrupt` backup already exists (a previous corruption), the next free
+/// name in the sequence `.corrupt.1`, `.corrupt.2`, ... is used, so an old backup
+/// is never silently overwritten.
 pub fn backup_corrupt(path: &Path) -> io::Result<PathBuf> {
     let Some(name) = path.file_name() else {
         return Err(io::Error::new(
@@ -99,9 +105,22 @@ pub fn backup_corrupt(path: &Path) -> io::Result<PathBuf> {
             "data file path has no file name",
         ));
     };
-    let mut backup_name = name.to_os_string();
-    backup_name.push(".corrupt");
-    let backup = path.with_file_name(backup_name);
+    let base = name.to_os_string();
+    let mut backup = path.with_file_name({
+        let mut first = base.clone();
+        first.push(".corrupt");
+        first
+    });
+    let mut n = 1;
+    while backup.exists() {
+        backup = path.with_file_name({
+            let mut next = base.clone();
+            next.push(".corrupt.");
+            next.push(n.to_string());
+            next
+        });
+        n += 1;
+    }
     std::fs::rename(path, &backup)?;
     Ok(backup)
 }
@@ -111,7 +130,7 @@ pub fn backup_corrupt(path: &Path) -> io::Result<PathBuf> {
 /// A crash, power loss, or full disk partway through a save can therefore never
 /// leave a truncated `snippets.json` behind — the old file survives intact instead.
 /// The temporary name includes the process id so two running copies can't collide.
-fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
     let Some(name) = path.file_name() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -389,6 +408,25 @@ mod tests {
     }
 
     #[test]
+    fn backup_corrupt_never_overwrites_an_existing_backup() {
+        let dir = tmp_dir("backup-twice");
+        let path = dir.join("snippets.json");
+
+        std::fs::write(&path, "first corruption").unwrap();
+        let first = backup_corrupt(&path).unwrap();
+        assert_eq!(first.file_name().unwrap(), "snippets.json.corrupt");
+
+        // A second corruption must pick the next free name, not clobber the first.
+        std::fs::write(&path, "second corruption").unwrap();
+        let second = backup_corrupt(&path).unwrap();
+        assert_eq!(second.file_name().unwrap(), "snippets.json.corrupt.1");
+
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "first corruption");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second corruption");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn save_is_atomic_and_leaves_no_temp_files() {
         let dir = tmp_dir("atomic");
         let path = dir.join("snippets.json");
@@ -439,6 +477,38 @@ mod tests {
 
         std::fs::write(&path, "{ not json").unwrap();
         assert!(matches!(load_config(&path), Load::Corrupt(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_missing_fields_default_gracefully() {
+        // Older config files may predate a field; `#[serde(default)]` must fill
+        // in the missing side so load never turns into `Corrupt`.
+        let dir = tmp_dir("config-missing");
+        let path = dir.join("config.json");
+
+        // Only categories present: theme falls back to the empty string.
+        std::fs::write(&path, r#"{"categories":["Git","Prompt"]}"#).unwrap();
+        match load_config(&path) {
+            Load::Loaded(config) => {
+                assert_eq!(
+                    config.categories,
+                    vec!["Git".to_string(), "Prompt".to_string()]
+                );
+                assert_eq!(config.theme, "");
+            }
+            _ => panic!("config without theme should still load"),
+        }
+
+        // Only theme present: categories fall back to an empty list.
+        std::fs::write(&path, r#"{"theme":"Nord"}"#).unwrap();
+        match load_config(&path) {
+            Load::Loaded(config) => {
+                assert!(config.categories.is_empty());
+                assert_eq!(config.theme, "Nord");
+            }
+            _ => panic!("config without categories should still load"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

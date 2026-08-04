@@ -108,7 +108,7 @@ Tests that touch the save paths must point the app's data files at a throwaway t
   - `config.json` stores the canonical category list and selected theme.
 - This is deliberate: resolving storage relative to the running `.exe` meant `cargo run` (debug) and `cargo build --release` read/write different files, and `cargo clean` / git checkouts of the build folder could reset or destroy real data. `%APPDATA%\CopyIt` is immune to all of that.
 - If `APPDATA` isn't set (non-Windows dev/test environments), the app falls back to the previous next-to-the-exe behavior.
-- On first launch (or first launch after upgrading from an older version), the app checks legacy locations (next to the exe, `target/debug/`, `target/release/`, cwd) and migrates the first non-empty `snippets.json`/`config.json` it finds into the new location before falling back to the seeded defaults from `src/seed.rs`.
+- On first launch (or first launch after upgrading from an older version), the app checks legacy locations (next to the exe, `target/debug/`, `target/release/`, cwd) and migrates the first non-empty `snippets.json`/`config.json` it finds into the new location before falling back to the seeded defaults from `src/seed.rs`. The migration write is atomic (same temp-file-then-rename path as every other data write), so a crash mid-migration can't leave a truncated stable file behind.
 - Both files are plain, hand-editable JSON:
 
   ```json
@@ -118,8 +118,8 @@ Tests that touch the save paths must point the app's data files at a throwaway t
   ```
 
 - Saves are automatic after every add, edit, delete, or drag-and-drop reorder, and are atomic: the JSON is written to a temporary file in the same directory, flushed, and only then renamed over the real one. A crash, power loss, or full disk part-way through a save leaves the previous file intact instead of a truncated one.
-- A data file that exists but doesn't parse is **not** treated as a first launch. It is renamed to `<name>.corrupt` (preserving the bytes for hand-recovery), the defaults are loaded, and the warning banner tells the user where the original went. An empty (zero-byte) file counts as absent, since it holds nothing to lose.
-- Categories are normalized to title-case (e.g., `git` and `GIT` both become `Git`) and stored as a sorted, deduplicated list in `config.json`. Blank categories and the reserved `All` are mapped to `Uncategorized` on load, so a hand-edited `"category": ""` can't produce a badge that no filter entry selects.
+- A data file that exists but doesn't parse is **not** treated as a first launch. It is renamed aside as `<name>.corrupt` (or `.corrupt.1`, `.corrupt.2`, … if a previous backup already exists, so an old backup is never overwritten) preserving the bytes for hand-recovery, the defaults are loaded, and the warning banner tells the user where the original went. If the backup rename fails (e.g. the file is locked), the corrupt file is left **in place** and the defaults are **not** written over it — the app refuses to destroy the only remaining copy of the user's data. An empty (zero-byte) file counts as absent, since it holds nothing to lose.
+- Categories are normalized to title-case (e.g., `git` and `GIT` both become `Git`) and stored as a sorted, deduplicated list in `config.json`. On load the stored list is sanitized (normalized, deduplicated case-insensitively, reserved names dropped), so a hand-edited `config.json` can't smuggle an entry that collides with the reserved `All` filter sentinel. Blank categories and the reserved `All` are mapped to `Uncategorized` on load, so a hand-edited `"category": ""` can't produce a badge that no filter entry selects. Snippet ids are deduplicated on load (later duplicates get fresh ids) and the "next id" counter is overflow-safe, hardening the app against hand-edited JSON.
 
 ## Security considerations
 

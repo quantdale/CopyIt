@@ -5,6 +5,7 @@ use crate::storage::{self, Config};
 use crate::store::Store;
 use crate::theme::Theme;
 use eframe::egui;
+use std::collections::HashSet;
 
 /// Prefix of the banner message for a failed `snippets.json` write. Shared so a later
 /// successful snippet save can retire exactly its own error and nothing else.
@@ -88,7 +89,7 @@ pub struct CopyIt {
     categories: Vec<String>, // Sorted, deduplicated list of all known categories
     search: String,      // Active search query; filters snippets by title/body/category
     category_filter: String, // "All" or a specific category; filters visible snippets
-    theme: Theme,        // Currently selected theme; applied to egui visuals each frame
+    theme: Theme,        // Currently selected theme; visuals are applied at startup and on change
     editor: Option<Editor>, // Modal editor state; None when no editor is open
     copied: Option<(u64, f64)>, // (id, time) for the transient "Copied" feedback (1.2s visibility)
     drag: Option<DragState>, // In-progress drag operation; None when idle
@@ -131,15 +132,24 @@ struct CardWidgets {
 
 /// Builds the banner text for a data file that exists but couldn't be parsed, moving the
 /// original aside first so it is never silently replaced by the seeded defaults.
-fn describe_corrupt_file(path: &std::path::Path, filename: &str, error: &str) -> String {
+/// Returns the banner text and whether the backup rename succeeded. When it fails
+/// (e.g. the file is locked), the caller must NOT overwrite the corrupt file with
+/// defaults — it is the only remaining copy of the user's data.
+fn describe_corrupt_file(path: &std::path::Path, filename: &str, error: &str) -> (String, bool) {
     match storage::backup_corrupt(path) {
-        Ok(backup) => format!(
-            "{filename} couldn't be read ({error}). It was kept as {} and the default library was loaded.",
-            backup.display()
+        Ok(backup) => (
+            format!(
+                "{filename} couldn't be read ({error}). It was kept as {} and the default library was loaded.",
+                backup.display()
+            ),
+            true,
         ),
-        Err(e) => format!(
-            "{filename} couldn't be read ({error}) and couldn't be backed up ({e}). \
-             The default library was loaded — copy the file elsewhere before making changes."
+        Err(e) => (
+            format!(
+                "{filename} couldn't be read ({error}) and couldn't be backed up ({e}). \
+                 The file was left in place — copy it elsewhere before making changes."
+            ),
+            false,
         ),
     }
 }
@@ -147,8 +157,11 @@ fn describe_corrupt_file(path: &std::path::Path, filename: &str, error: &str) ->
 impl CopyIt {
     /// Creates a new CopyIt instance on app launch.
     /// Loads snippets and config from disk (with one-time migration from legacy locations),
-    /// seeds defaults if snippets.json doesn't exist, normalizes all categories, and applies
-    /// the saved theme. Reports any file I/O errors in save_error for display in the UI.
+    /// seeds defaults if snippets.json doesn't exist, sanitizes categories, deduplicates
+    /// snippet ids, and applies the saved theme. A corrupt data file is moved aside and
+    /// reported in the banner; when the backup rename fails, the corrupt file is left in
+    /// place and the seeded defaults are *not* written over it, so the user's data is not
+    /// destroyed. Reports any file I/O errors in save_error for display in the UI.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let store = Store::open();
         store.migrate_legacy();
@@ -157,45 +170,77 @@ impl CopyIt {
 
         // A file that exists but doesn't parse is *not* a first launch: preserve it
         // before the seeded defaults claim its name, and tell the user where it went.
+        // `seeded` is true only when writing the defaults over the file is safe — the
+        // file was missing, or its corrupt copy was successfully moved aside. If the
+        // backup rename fails, the corrupt file stays on disk untouched.
         let (mut snippets, seeded) = match store.load_snippets() {
             storage::Load::Loaded(snippets) => (snippets, false),
             storage::Load::Missing => (crate::seed::defaults(), true),
             storage::Load::Corrupt(e) => {
-                save_error = Some(describe_corrupt_file(
-                    &store.snippets_path,
-                    "snippets.json",
-                    &e,
-                ));
-                (crate::seed::defaults(), true)
+                let (note, backed_up) =
+                    describe_corrupt_file(&store.snippets_path, "snippets.json", &e);
+                save_error = Some(note);
+                (crate::seed::defaults(), backed_up)
             }
         };
         for s in &mut snippets {
             s.category = storage::canonical_category(&s.category);
         }
 
-        let mut config = match store.load_config() {
-            storage::Load::Loaded(config) => config,
-            storage::Load::Missing => Config::from_snippets(&snippets),
+        // Snippet ids come from hand-editable JSON. Deduplicate them: keep the first
+        // occurrence of each id and reassign a fresh id to later duplicates, so a
+        // duplicate id can't make Delete (`retain(|s| s.id != id)`) remove every copy
+        // at once.
+        dedup_snippet_ids(&mut snippets);
+
+        // Load the user config, remembering whether it's safe to overwrite the on-disk
+        // file later (it was missing, or its corrupt copy was moved aside) and what the
+        // loaded categories were, verbatim, so a save happens only when the canonical
+        // config actually differs from what's on disk.
+        let mut loaded_categories: Option<Vec<String>> = None;
+        let (mut config, config_write_ok) = match store.load_config() {
+            storage::Load::Loaded(config) => {
+                loaded_categories = Some(config.categories.clone());
+                (config, false)
+            }
+            storage::Load::Missing => (Config::from_snippets(&snippets), true),
             storage::Load::Corrupt(e) => {
-                // Always move the unreadable file aside, even when the banner ends up
-                // showing the snippet-library notice instead of this one.
-                let note = describe_corrupt_file(&store.config_path, "config.json", &e);
-                // The snippet library is the more important loss; don't bury its notice.
-                if save_error.is_none() {
-                    save_error = Some(note);
-                }
-                Config::from_snippets(&snippets)
+                let (note, backed_up) =
+                    describe_corrupt_file(&store.config_path, "config.json", &e);
+                // When both data files are corrupt, surface both notices: the config
+                // was moved aside too, and the user needs to know where it went.
+                save_error = Some(match save_error.take() {
+                    Some(prev) => format!("{prev}\n{note}"),
+                    None => note,
+                });
+                (Config::from_snippets(&snippets), backed_up)
             }
         };
+        // Hand-edited or pre-fix config can carry non-canonical category names ("all",
+        // near-duplicates differing only in whitespace or case): sanitize them so no
+        // dropdown entry collides with the reserved "All" filter sentinel. The save
+        // below persists the sanitized list when it differs from what was loaded.
+        config.categories = sanitize_categories(&config.categories);
         config.add_categories(snippets.iter().map(|s| s.category.as_str()));
-        if let Err(e) = store.save_config(&config) {
-            save_error = Some(format!("{CONFIG_SAVE_ERROR}: {e}"));
+
+        // Persist the config only when it's safe to overwrite the on-disk file and the
+        // canonical config differs from what was loaded. Writing a freshly derived
+        // config over a corrupt original that couldn't be backed up would destroy the
+        // only copy of the user's settings.
+        let config_changed = matches!(&loaded_categories, Some(loaded) if *loaded != config.categories);
+        if config_write_ok || config_changed {
+            if let Err(e) = store.save_config(&config) {
+                save_error = Some(format!("{CONFIG_SAVE_ERROR}: {e}"));
+            }
         }
 
         let theme = config.theme.parse::<Theme>().unwrap_or(Theme::Dark);
         cc.egui_ctx.set_visuals(theme.visuals());
 
-        let next_id = snippets.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+        // The next id is derived from the (deduplicated) library with a check for a
+        // saturated id space, so a hand-edited `id == u64::MAX` can't wrap the
+        // new-snippet counter to 0 and collide with an existing id.
+        let next_id = next_snippet_id(&snippets);
         if seeded {
             if let Err(e) = store.save_snippets(&snippets) {
                 save_error = Some(format!("{SNIPPETS_SAVE_ERROR}: {e}"));
@@ -362,6 +407,68 @@ impl CopyIt {
         cat
     }
 
+    /// Applies the `EditorOutcome::Save` outcome: normalizes the category (falling back
+    /// to "Uncategorized" if blank), updates or inserts the snippet, and persists the
+    /// library. Factored out of `update()` so tests can drive it without a UI context.
+    fn apply_save(&mut self, mut ed: Editor) {
+        let category = {
+            let canonical = self.add_category(&ed.category);
+            if canonical.is_empty() {
+                self.add_category("Uncategorized")
+            } else {
+                canonical
+            }
+        };
+        let title = ed.title.trim().to_string();
+        if let Some(id) = ed.id {
+            if let Some(s) = self.snippets.iter_mut().find(|s| s.id == id) {
+                s.title = title;
+                s.category = category;
+                // The editor is closing, so its buffer can be moved instead of copied —
+                // snippet bodies can be large.
+                s.body = std::mem::take(&mut ed.body);
+            }
+        } else {
+            // The cursor is always a free id (it mirrors the library's max, or a scanned
+            // free id). Use it, then advance it to the next free id from the updated
+            // library — recomputing avoids `cursor + 1` landing on an existing id when
+            // the id space is non-contiguous (e.g. a hand-edited `id == u64::MAX`), and
+            // can never wrap to 0 and collide.
+            let id = self.next_id;
+            self.snippets.push(Snippet {
+                id,
+                title,
+                category,
+                body: std::mem::take(&mut ed.body),
+            });
+            self.next_id = next_snippet_id(&self.snippets);
+        }
+        self.snippets_changed();
+    }
+
+    /// Applies the `EditorOutcome::AddCategory` outcome: registers the new category and,
+    /// if its name is unusable (blank or the reserved "All"), keeps the inline form open
+    /// with an explanatory error instead of silently discarding the input. Returns the
+    /// editor state to store back. Factored out of `update()` so tests can drive it
+    /// without a UI context.
+    fn apply_add_category(&mut self, name: String, mut ed: Editor) -> Editor {
+        let canonical = self.add_category(&name);
+        if !canonical.is_empty() {
+            ed.category = canonical;
+            ed.new_category.clear();
+            ed.adding_category = false;
+            ed.category_error = None;
+        } else {
+            ed.adding_category = true;
+            ed.category_error = Some(if name.trim().is_empty() {
+                "Category can't be blank".to_string()
+            } else {
+                "\"All\" is reserved and can't be used as a category".to_string()
+            });
+        }
+        ed
+    }
+
     /// Moves the snippet identified by `snippet_id` to a new position in the full list, respecting
     /// the drag-and-drop user's intended placement within the *filtered* (visible) subset.
     /// The `target_filtered_gap` is a gap index into the *filtered* (visible after search/category filter)
@@ -508,7 +615,10 @@ impl CopyIt {
                             }
                             ui.add_space(4.0);
                             ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                                ui.label(egui::RichText::new(preview).weak());
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(preview).weak())
+                                        .truncate(true),
+                                );
                             });
                             resp
                         })
@@ -1040,6 +1150,7 @@ impl eframe::App for CopyIt {
                             }
 
                             if ed.adding_category {
+                                let previous_category = ed.new_category.clone();
                                 ui.horizontal(|ui| {
                                     ui.add(
                                         egui::TextEdit::singleline(&mut ed.new_category)
@@ -1052,6 +1163,14 @@ impl eframe::App for CopyIt {
                                         result = EditorResult::AddCategory(ed.new_category.clone());
                                     }
                                 });
+                                // Clear the inline-category warning as the user edits the
+                                // field, so the error doesn't linger while they fix it.
+                                if ed.new_category != previous_category {
+                                    ed.category_error = None;
+                                }
+                                if let Some(err) = &ed.category_error {
+                                    ui.colored_label(WARNING_COLOR, err);
+                                }
                             }
                         });
                     });
@@ -1109,56 +1228,76 @@ impl eframe::App for CopyIt {
             // Pure transition: the button click plus the window's open/close flag
             // decide what happens next; the app only applies the outcome.
             match editor::decide(result, ed, window_open) {
-                editor::EditorOutcome::Save(mut ed) => {
-                    // Normalize category: ensure it's canonical, fall back to "Uncategorized" if empty
-                    let category = {
-                        let canonical = self.add_category(&ed.category);
-                        if canonical.is_empty() {
-                            self.add_category("Uncategorized")
-                        } else {
-                            canonical
-                        }
-                    };
-                    let title = ed.title.trim().to_string();
-                    if let Some(id) = ed.id {
-                        if let Some(s) = self.snippets.iter_mut().find(|s| s.id == id) {
-                            s.title = title;
-                            s.category = category;
-                            // The editor is closing, so its buffer can be moved
-                            // instead of copied — snippet bodies can be large.
-                            s.body = std::mem::take(&mut ed.body);
-                        }
-                    } else {
-                        let id = self.next_id;
-                        self.next_id += 1;
-                        self.snippets.push(Snippet {
-                            id,
-                            title,
-                            category,
-                            body: std::mem::take(&mut ed.body),
-                        });
-                    }
-                    self.snippets_changed();
-                }
+                editor::EditorOutcome::Save(ed) => self.apply_save(ed),
                 editor::EditorOutcome::Delete(id) => {
                     self.snippets.retain(|s| s.id != id);
                     self.snippets_changed();
                 }
                 editor::EditorOutcome::Close => {}
-                editor::EditorOutcome::AddCategory(name, mut ed) => {
-                    let canonical = self.add_category(&name);
-                    if !canonical.is_empty() {
-                        ed.category = canonical;
-                    }
-                    ed.new_category.clear();
-                    ed.adding_category = false;
-                    self.editor = Some(ed);
+                editor::EditorOutcome::AddCategory(name, ed) => {
+                    self.editor = Some(self.apply_add_category(name, ed));
                 }
                 editor::EditorOutcome::Keep(ed) => {
                     self.editor = Some(ed);
                 }
             }
         }
+    }
+}
+
+/// Normalizes a freshly-loaded category list into the canonical form the app filters on:
+/// each entry is normalized, reserved names (blank, "All") are dropped, the list is
+/// deduplicated case-insensitively and sorted. A hand-edited or pre-fix `config.json`
+/// containing `"all"` could otherwise produce a dropdown entry indistinguishable from the
+/// reserved "All" filter sentinel.
+fn sanitize_categories(categories: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for c in categories {
+        let cat = storage::normalize_category(c);
+        if storage::is_reserved_category(&cat) {
+            continue;
+        }
+        if out.iter().any(|existing| storage::same_category(existing, &cat)) {
+            continue;
+        }
+        out.push(cat);
+    }
+    out.sort();
+    out
+}
+
+/// Finds the smallest positive id not present in `snippets`. Only used once the
+/// sequential id space is exhausted (every id up to `u64::MAX` is taken), which in
+/// practice means the library holds a hand-edited `id == u64::MAX`.
+fn next_free_id_from_1(snippets: &[Snippet]) -> u64 {
+    (1u64..)
+        .find(|id| !snippets.iter().any(|s| s.id == *id))
+        .unwrap_or(0)
+}
+
+/// Reassigns ids to duplicates in a library loaded from hand-editable JSON: the first
+/// occurrence of each id is kept, later duplicates get a fresh id. Prevents a duplicate
+/// id from making Delete (`retain(|s| s.id != id)`) remove every copy at once.
+fn dedup_snippet_ids(snippets: &mut [Snippet]) {
+    let mut seen: HashSet<u64> = HashSet::new();
+    for i in 0..snippets.len() {
+        if seen.insert(snippets[i].id) {
+            continue;
+        }
+        snippets[i].id = next_snippet_id(snippets);
+        seen.insert(snippets[i].id);
+    }
+}
+
+/// Picks the id for a brand-new snippet: the largest existing id plus one. If the largest
+/// id is `u64::MAX`, one more would either wrap to 0 (in release) or saturate back to
+/// `u64::MAX` — both collide — so fall back to scanning from 1 for the first free id.
+fn next_snippet_id(snippets: &[Snippet]) -> u64 {
+    let max_id = snippets.iter().map(|s| s.id).max().unwrap_or(0);
+    if max_id == u64::MAX {
+        next_free_id_from_1(snippets)
+    } else {
+        max_id + 1
     }
 }
 
@@ -1174,11 +1313,16 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
-/// Collapses a snippet body into a single-line preview: splits on whitespace, joins with single spaces,
-/// and truncates to max characters. Used to display a short preview in each card.
+/// Collapses a snippet body into a single-line preview: splits on whitespace, joins with
+/// single spaces, and truncates to `max` characters. Used to display a short preview in
+/// each card.
 ///
-/// Collapsing stops as soon as enough characters have been gathered to fill the preview,
-/// so a megabyte-long body costs the same as a one-line one instead of being copied whole.
+/// Collapsing stops as soon as the next word would overflow the preview, so a long,
+/// white-space-separated body costs about the same to render as a one-line one instead of
+/// being copied whole. The one case that can't be shortcut is a single token longer than
+/// `max` (a base64 blob with no spaces, say): the first word is always gathered, but only
+/// a prefix of it is copied — just enough to overflow `max` so `truncate_chars` can clip
+/// it with an ellipsis — never the token in full.
 fn preview_text(body: &str, max: usize) -> String {
     let mut collapsed = String::new();
     let mut chars = 0usize;
@@ -1187,12 +1331,17 @@ fn preview_text(body: &str, max: usize) -> String {
             collapsed.push(' ');
             chars += 1;
         }
-        collapsed.push_str(word);
-        chars += word.chars().count();
-        // One char past the limit is all `truncate_chars` needs to know it must trim.
-        if chars > max {
+        let word_chars = word.chars().count();
+        if chars + word_chars > max {
+            // This word would overflow the preview: copy only a prefix large enough to
+            // push the total past `max`, so `truncate_chars` below clips it with an
+            // ellipsis. A giant token is never copied in full.
+            let room = max.saturating_add(1).saturating_sub(chars);
+            collapsed.push_str(&word.chars().take(room).collect::<String>());
             break;
         }
+        collapsed.push_str(word);
+        chars += word_chars;
     }
     truncate_chars(&collapsed, max)
 }
@@ -1232,7 +1381,7 @@ mod layout_tests {
         let dir = std::env::temp_dir().join(format!("copyit-app-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp data dir");
-        let next_id = snippets.iter().map(|s| s.id).max().unwrap_or(0) + 1;
+        let next_id = next_snippet_id(&snippets);
         let mut app = CopyIt {
             snippets,
             derived: Vec::new(),
@@ -2046,6 +2195,189 @@ mod layout_tests {
         );
         assert_eq!(app.derived[0].preview, "first line second line");
         assert_eq!(app.derived[0].body_lower, "  first    line\nsecond line  ");
+    }
+
+    /// A single gigantic token (no spaces) must be clipped to the preview width, not
+    /// copied in full — the early-exit savings only apply to white-space-separated bodies.
+    #[test]
+    fn preview_text_clips_a_single_gigantic_token() {
+        let blob = "A".repeat(1_000_000);
+        let preview = preview_text(&blob, PREVIEW_CHARS);
+        assert_eq!(preview.chars().count(), PREVIEW_CHARS);
+        assert!(preview.ends_with('\u{2026}'));
+        assert!(preview.starts_with('A'));
+
+        // A huge token after a normal word stops the collapse at the boundary too.
+        let preview = preview_text(&format!("git {blob}"), PREVIEW_CHARS);
+        assert_eq!(preview.chars().count(), PREVIEW_CHARS);
+        assert!(preview.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn sanitize_categories_drops_reserved_and_normalizes() {
+        // "all" is the exact collision CORR-001 was meant to eliminate: without
+        // sanitization it becomes a dropdown entry indistinguishable from the "All" filter.
+        let raw = vec![
+            "all".to_string(),
+            "  GIT ".to_string(),
+            "git".to_string(),
+            "".to_string(),
+            "Prompt".to_string(),
+        ];
+        let clean = sanitize_categories(&raw);
+        assert_eq!(clean, vec!["Git".to_string(), "Prompt".to_string()]);
+        assert!(!clean.iter().any(|c| c.eq_ignore_ascii_case("all")));
+        assert!(!clean.iter().any(|c| c.is_empty()));
+    }
+
+    #[test]
+    fn next_snippet_id_never_wraps_to_zero() {
+        assert_eq!(next_snippet_id(&[]), 1);
+        assert_eq!(next_snippet_id(&[snippet(1, "Git")]), 2);
+        assert_eq!(next_snippet_id(&[snippet(5, "Git")]), 6);
+
+        // A hand-edited `id == u64::MAX` must not wrap to 0 (which would collide): scan
+        // from 1 upward for the first id not present in the library.
+        let saturated = vec![snippet(u64::MAX, "Git"), snippet(2, "Git")];
+        assert_eq!(next_snippet_id(&saturated), 1);
+        assert_eq!(next_free_id_from_1(&saturated), 1);
+    }
+
+    /// Deleting a snippet by id removes every snippet bearing that id, so duplicate ids
+    /// loaded from hand-edited JSON must be reassigned at load — otherwise one Delete
+    /// clears all copies.
+    #[test]
+    fn dedup_snippet_ids_keeps_the_first_and_reassigns_duplicates() {
+        let mut lib = vec![
+            snippet(1, "Git"),
+            snippet(1, "Git"),
+            snippet(2, "Prompt"),
+            snippet(2, "Prompt"),
+        ];
+        dedup_snippet_ids(&mut lib);
+        assert_eq!(lib[0].id, 1, "first occurrence of 1 is kept");
+        assert_eq!(lib[2].id, 2, "first occurrence of 2 is kept");
+        let ids: Vec<u64> = lib.iter().map(|s| s.id).collect();
+        let mut uniq = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), lib.len(), "every id must stay unique");
+        assert_eq!(uniq, vec![1, 2, 3, 4], "duplicates get fresh ids from the sequence");
+    }
+
+    #[test]
+    fn dedup_snippet_ids_handles_a_saturated_id_space_without_wrapping() {
+        let mut lib = vec![snippet(u64::MAX, "Git"), snippet(u64::MAX, "Git")];
+        dedup_snippet_ids(&mut lib);
+        assert_eq!(lib[0].id, u64::MAX);
+        assert_eq!(lib[1].id, 1, "must not wrap to 0 on a saturated id space");
+    }
+
+    /// The editor Save outcome, applied to a real app, adds the snippet, registers the
+    /// category, and persists the library to disk.
+    #[test]
+    fn apply_save_adds_a_new_snippet_and_persists() {
+        let mut app = test_app("apply-save-add", vec![], vec!["Git".into()]);
+        let mut ed = Editor::blank(&app.categories);
+        ed.title = "New prompt".into();
+        ed.category = "Git".into();
+        ed.body = "some body".into();
+        app.apply_save(ed);
+
+        assert_eq!(ids(&app), vec![1]);
+        assert_eq!(app.snippets[0].title, "New prompt");
+        assert_eq!(app.snippets[0].body, "some body");
+        assert!(app.save_error.is_none());
+        match storage::load(&app.store.snippets_path) {
+            storage::Load::Loaded(snips) => {
+                assert_eq!(snips.len(), 1);
+                assert_eq!(snips[0].title, "New prompt");
+            }
+            _ => panic!("saved library should load back"),
+        }
+    }
+
+    #[test]
+    fn apply_save_updates_an_existing_snippet() {
+        let mut app = test_app(
+            "apply-save-update",
+            vec![snippet(1, "Git")],
+            vec!["Git".into()],
+        );
+        let mut ed = Editor::from_snippet(&app.snippets[0], &app.categories);
+        ed.title = "Renamed".into();
+        ed.body = "new body".into();
+        ed.category = "Prompt".into();
+        app.apply_save(ed);
+
+        assert_eq!(ids(&app), vec![1], "editing must not change the id");
+        assert_eq!(app.snippets[0].title, "Renamed");
+        assert_eq!(app.snippets[0].body, "new body");
+        assert_eq!(app.snippets[0].category, "Prompt");
+        assert!(app.categories.contains(&"Prompt".to_string()));
+    }
+
+    #[test]
+    fn apply_add_category_registers_a_valid_category() {
+        let mut app = test_app("apply-add-cat-valid", vec![], vec!["Git".into()]);
+        let ed = Editor::blank(&app.categories);
+        let ed = app.apply_add_category("Docker".into(), ed);
+        assert!(!ed.adding_category);
+        assert_eq!(ed.category, "Docker");
+        assert!(ed.category_error.is_none());
+        assert!(app.categories.contains(&"Docker".to_string()));
+    }
+
+    /// New snippets minted after a hand-edited `id == u64::MAX` saturates the sequential
+    /// id space must never wrap to 0 or collide with an existing id.
+    #[test]
+    fn apply_save_mints_unique_ids_across_a_saturated_library() {
+        let mut app = test_app(
+            "apply-save-saturated",
+            vec![snippet(u64::MAX, "Git"), snippet(2, "Git")],
+            vec!["Git".into()],
+        );
+        // next_id is derived at load: the first free id is 1 (the library has MAX and 2).
+        assert_eq!(app.next_id, 1);
+
+        let mut ed = Editor::blank(&app.categories);
+        ed.title = "First".into();
+        ed.body = "b".into();
+        app.apply_save(ed);
+        assert_eq!(app.snippets[2].id, 1);
+
+        let mut ed = Editor::blank(&app.categories);
+        ed.title = "Second".into();
+        ed.body = "b".into();
+        app.apply_save(ed);
+        // The advanced cursor is the next free id (3), not 2 — which is already in the
+        // library, so a naive `cursor + 1` would collide.
+        assert_eq!(app.snippets[3].id, 3);
+
+        let mut ids: Vec<u64> = app.snippets.iter().map(|s| s.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), app.snippets.len(), "no id collisions");
+    }
+
+    /// The inline "Add new category" form must not silently swallow a reserved name: it
+    /// keeps the form open and explains why, mirroring the top bar's error.
+    #[test]
+    fn apply_add_category_rejects_reserved_names_with_an_error() {
+        let mut app = test_app("apply-add-cat-all", vec![], vec!["Git".into()]);
+        let ed = Editor::blank(&app.categories);
+        let ed = app.apply_add_category("all".into(), ed);
+        assert!(ed.adding_category, "the form must stay open");
+        assert_eq!(
+            ed.category_error.as_deref(),
+            Some("\"All\" is reserved and can't be used as a category")
+        );
+        assert!(!app.categories.iter().any(|c| c.eq_ignore_ascii_case("all")));
+
+        // A blank name is rejected too, with its own message.
+        let ed = app.apply_add_category("   ".into(), ed);
+        assert!(ed.adding_category);
+        assert_eq!(ed.category_error.as_deref(), Some("Category can't be blank"));
     }
 
     #[test]

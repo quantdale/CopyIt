@@ -196,12 +196,13 @@ impl fmt::Display for Theme {
     }
 }
 
-/// Parses a theme name from config.json (case-insensitive, handles underscores/spaces). Returns Err(()) on unknown theme.
+/// Parses a theme name from config.json (case-insensitive, handles underscores/spaces,
+/// tolerates surrounding whitespace). Returns Err(()) on unknown theme.
 impl FromStr for Theme {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
+        match s.trim().to_lowercase().as_str() {
             "dark" => Ok(Theme::Dark),
             "light" => Ok(Theme::Light),
             "nord" => Ok(Theme::Nord),
@@ -743,8 +744,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn has_at_least_twenty_new_themes() {
-        assert!(Theme::all().len() >= 27);
+    fn all_themes_are_enumerated() {
+        // Keep in sync with the enum variants in `Theme`: every theme declared in
+        // the enum must be present in `Theme::all()` exactly once. Removing a theme
+        // from either place now fails this test.
+        assert_eq!(Theme::all().len(), 37);
+    }
+
+    #[test]
+    fn from_str_tolerates_surrounding_whitespace() {
+        // Hand-edited config.json entries often carry stray spaces; a padded theme
+        // name must parse to the same theme instead of falling back to Dark.
+        assert_eq!("  Dark  ".parse::<Theme>().unwrap(), Theme::Dark);
+        assert_eq!("  Nord ".parse::<Theme>().unwrap(), Theme::Nord);
+        assert_eq!("\tSolarized Dark\n".parse::<Theme>().unwrap(), Theme::SolarizedDark);
+        // A genuinely unknown name still fails.
+        assert_eq!("Not A Real Theme".parse::<Theme>(), Err(()));
     }
 
     #[test]
