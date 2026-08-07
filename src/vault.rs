@@ -9,9 +9,10 @@
 //! stays plain JSON.
 //!
 //! Security model: the derived key exists only while the state is `Unlocked` and
-//! is dropped by `lock()`. The password itself is never stored in any form; a
-//! candidate password is verified by attempting to decrypt the canary — correct
-//! iff the authenticated decryption succeeds.
+//! is securely zeroized by `Drop` (and by `lock()`) using the `zeroize` crate.
+//! The password itself is never stored in any form; a candidate password is
+//! verified by attempting to decrypt the canary — correct iff the authenticated
+//! decryption succeeds.
 
 use crate::model::Protection;
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -21,6 +22,7 @@ use chacha20poly1305::aead::{Aead, Key, Nonce};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 /// Fixed plaintext used as the canary. It must never change: a canary written by
 /// an old build has to decode with the current one, or every unlock would fail.
@@ -38,6 +40,9 @@ pub const HINT_MIN_BODY_CHARS: usize = 12;
 pub const HINT_CHARS: usize = 5;
 /// Masking suffix appended to a hint on censored cards.
 pub const MASKED_SUFFIX: &str = "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}";
+/// Minimum vault password length (enforced only at creation time; unlock works
+/// with any length to avoid breaking vaults created by older versions).
+pub const MIN_VAULT_PASSWORD_LEN: usize = 8;
 
 /// Error type for every vault operation. Each variant carries a human-readable
 /// detail; the app surfaces these (inline in the unlock modal or in the top-bar
@@ -52,15 +57,18 @@ pub enum VaultError {
     Encryption(String),
     /// Authenticated decryption failed (wrong key, tampered ciphertext, ...).
     Decryption(String),
+    /// Password is too short for vault creation.
+    WeakPassword(String),
 }
 
 impl std::fmt::Display for VaultError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VaultError::KeyDerivation(e) => write!(f, "key derivation failed ({e})"),
-            VaultError::Encoding(e) => write!(f, "invalid base64 data ({e})"),
+            VaultError::Encoding(e) => write!(f, "vault data is corrupt ({e})"),
             VaultError::Encryption(e) => write!(f, "encryption failed ({e})"),
-            VaultError::Decryption(e) => write!(f, "decryption failed ({e})"),
+            VaultError::Decryption(e) => write!(f, "wrong password or damaged data ({e})"),
+            VaultError::WeakPassword(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -80,14 +88,22 @@ pub struct VaultMeta {
     pub canary: String,
 }
 
-/// Session lock state. The key (`[u8; 32]`) is memory-only: `lock()` drops it and
-/// the vault starts `Locked` on every launch.
+/// Session lock state. The key (`[u8; 32]`) is memory-only: `lock()` zeroizes it
+/// and the vault starts `Locked` on every launch.
 #[derive(Clone, PartialEq)]
 pub enum VaultState {
     /// No key in memory; protected actions prompt for the password.
     Locked,
     /// The derived key is cached for the rest of the session.
     Unlocked([u8; 32]),
+}
+
+impl Drop for VaultState {
+    fn drop(&mut self) {
+        if let VaultState::Unlocked(key) = self {
+            key.zeroize();
+        }
+    }
 }
 
 impl VaultState {
@@ -112,8 +128,11 @@ impl VaultState {
         }
     }
 
-    /// Drops the cached key, locking the vault.
+    /// Zeroizes the cached key, then locks the vault.
     pub fn lock(&mut self) {
+        if let VaultState::Unlocked(key) = self {
+            key.zeroize();
+        }
         *self = VaultState::Locked;
     }
 
@@ -223,12 +242,13 @@ pub fn decrypt_body(key: &[u8; KEY_LEN], protection: &Protection) -> Result<Stri
     String::from_utf8(bytes).map_err(|e| VaultError::Encoding(e.to_string()))
 }
 
-/// The hint rule: the body's first 5 characters when it is at least 12 characters
-/// long (so a 7-char password doesn't give away most of itself), else the empty
-/// string.
+/// The hint rule: after skipping leading whitespace, the body's first 5
+/// characters when the significant portion is at least 12 characters long (so a
+/// 7-char password doesn't give away most of itself), else the empty string.
 pub fn hint_for(body: &str) -> String {
-    if body.chars().count() >= HINT_MIN_BODY_CHARS {
-        body.chars().take(HINT_CHARS).collect()
+    let trimmed = body.trim_start();
+    if trimmed.chars().count() >= HINT_MIN_BODY_CHARS {
+        trimmed.chars().take(HINT_CHARS).collect()
     } else {
         String::new()
     }
@@ -247,6 +267,11 @@ pub fn masked_preview(hint: &str) -> String {
 /// the encrypted canary. Returns the `VaultMeta` to persist in `config.json` and
 /// the key to keep in memory.
 pub fn create_vault(password: &str) -> Result<(VaultMeta, [u8; KEY_LEN]), VaultError> {
+    if password.len() < MIN_VAULT_PASSWORD_LEN {
+        return Err(VaultError::WeakPassword(format!(
+            "Password must be at least {MIN_VAULT_PASSWORD_LEN} characters"
+        )));
+    }
     let salt = random_bytes::<SALT_LEN>()?;
     let key = derive_key(password, &salt)?;
     let (nonce, canary) = encrypt(&key, CANARY_PLAINTEXT)?;
@@ -339,8 +364,8 @@ mod tests {
 
     #[test]
     fn encrypt_body_round_trips_and_canary_matches() {
-        let (meta, key) = create_vault("hunter2").unwrap();
-        assert_eq!(verify_password("hunter2", &meta).unwrap(), key);
+        let (meta, key) = create_vault("hunter2x").unwrap();
+        assert_eq!(verify_password("hunter2x", &meta).unwrap(), key);
         let protection = encrypt_body(&key, "a body long enough to have a hint").unwrap();
         assert_eq!(protection.hint, "a bod");
         assert_eq!(decrypt_body(&key, &protection).unwrap(), "a body long enough to have a hint");
@@ -369,13 +394,33 @@ mod tests {
 
     #[test]
     fn create_vault_uses_a_fresh_salt_each_time() {
-        let (m1, _) = create_vault("pw").unwrap();
-        let (m2, _) = create_vault("pw").unwrap();
+        let (m1, _) = create_vault("password1").unwrap();
+        let (m2, _) = create_vault("password1").unwrap();
         assert_ne!(m1.salt, m2.salt);
         assert_ne!(m1.nonce, m2.nonce);
         assert_ne!(m1.canary, m2.canary);
-        assert!(verify_password("pw", &m1).is_ok());
-        assert!(verify_password("pw", &m2).is_ok());
+        assert!(verify_password("password1", &m1).is_ok());
+        assert!(verify_password("password1", &m2).is_ok());
+    }
+
+    #[test]
+    fn create_vault_rejects_short_passwords() {
+        assert!(
+            matches!(create_vault(""), Err(VaultError::WeakPassword(_))),
+            "empty password should be rejected"
+        );
+        assert!(
+            matches!(create_vault("short"), Err(VaultError::WeakPassword(_))),
+            "7-char password should be rejected"
+        );
+        assert!(
+            create_vault("12345678").is_ok(),
+            "8-char password should be accepted"
+        );
+        assert!(
+            create_vault("password1").is_ok(),
+            "long password should be accepted"
+        );
     }
 
     #[test]
@@ -391,6 +436,17 @@ mod tests {
     }
 
     #[test]
+    fn hint_for_skips_leading_whitespace() {
+        // Leading whitespace is trimmed before counting and extracting.
+        assert_eq!(hint_for("  123456789012"), "12345");
+        assert_eq!(hint_for("  \t\n123456789012"), "12345");
+        // 11 significant chars after trim → no hint.
+        assert_eq!(hint_for("   12345678901"), "");
+        // Body that is only whitespace.
+        assert_eq!(hint_for("   "), "");
+    }
+
+    #[test]
     fn masked_preview_follows_the_hint_rule() {
         assert_eq!(masked_preview("ghp_x"), "ghp_x\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}");
         assert_eq!(masked_preview(""), "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}");
@@ -399,7 +455,7 @@ mod tests {
 
     #[test]
     fn vault_state_starts_locked_and_wrong_password_keeps_it_locked() {
-        let (meta, _) = create_vault("pw").unwrap();
+        let (meta, _) = create_vault("password1").unwrap();
         let mut state = VaultState::new();
         assert!(state.is_locked());
         assert!(!state.is_unlocked());
@@ -409,7 +465,7 @@ mod tests {
         assert!(state.is_locked(), "wrong password must not change the state");
         assert!(state.key().is_none());
 
-        assert!(state.unlock("pw", &meta).is_ok());
+        assert!(state.unlock("password1", &meta).is_ok());
         assert!(state.is_unlocked());
         assert_eq!(state.key().unwrap().len(), KEY_LEN);
 
@@ -436,12 +492,12 @@ mod tests {
 
     #[test]
     fn vault_meta_round_trips_through_json() {
-        let (meta, key) = create_vault("pw").unwrap();
+        let (meta, key) = create_vault("password1").unwrap();
         let json = serde_json::to_string(&meta).unwrap();
         let back: VaultMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(back.salt, meta.salt);
         assert_eq!(back.nonce, meta.nonce);
         assert_eq!(back.canary, meta.canary);
-        assert_eq!(verify_password("pw", &back).unwrap(), key);
+        assert_eq!(verify_password("password1", &back).unwrap(), key);
     }
 }

@@ -149,7 +149,10 @@ The app drives its own UI headlessly: `src/sim/` wraps the real `CopyIt` UI behi
 - **No password recovery.** A forgotten vault password means the protected bodies are unrecoverable, by design.
 - Documented leaks: the hint (a card's first 5 body characters, only when the body is ≥ 12 chars long) and the cleartext metadata (title/category) are visible without unlocking — keep secrets out of titles.
 - Downgrade caveat: an older CopyIt reading a file with protected cards sees empty bodies (see Data and storage behavior).
-- `storage::save` and `storage::save_config` return `io::Result<()>`; callers in `app.rs` surface failures via the `save_error` field, shown as a warning banner in the top bar, instead of silently discarding them.
+- `storage::save` and `storage::save_config` return `io::Result<()>`; callers in `app.rs` surface failures via the `save_error: Vec<String>` field, shown as a warning banner in the top bar, instead of silently discarding them.
+- Vault passwords must be at least 8 characters (`MIN_VAULT_PASSWORD_LEN`). `VaultError::WeakPassword` is returned for shorter passwords.
+- `CopyIt::new()` acquires an instance lock (`file.try_lock()`) in the data directory. A second CopyIt instance exits immediately. `CopyIt::from_store()` does not acquire the lock (used by tests and the sim harness).
+- `storage::sweep_stale_tmp()` deletes stale `*.tmp` files in the data directory at startup to clean up after crashed writes.
 - Clipboard content is set through egui's `output_mut(|o| o.copied_text = text)`. It stays in the system clipboard until overwritten by something else.
 
 ## Deployment / distribution

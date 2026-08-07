@@ -27,7 +27,9 @@ Nine modules in `src/`, with a strict separation of concerns:
   - Frame-rate hot paths are cached, not recomputed per repaint: `Derived` (per-snippet lowercase text + card preview) and `FilterCache` (the visible-card index list). The card grid also only lays out the rows in view.
 - `editor.rs` — the add/edit modal's state (`Editor`), the clicks it can produce (`EditorResult`), and the pure `decide()` mapping clicks to an `EditorOutcome` the app applies. No egui here, so transitions are unit-testable.
 - `grid.rs` — card grid geometry: `CARD_*` constants, `cols_for`, `grid_card_rect`, `visible_rows` (virtualization), gap/insertion-line math, and the `DragMachine` drag state machine.
-- `model.rs` — `Snippet { id, title, category, body }`.
+- `model.rs` — `Snippet { id, title, category, body, protection }` where `protection: Option<Protection>` holds the on-disk ciphertext for vault-protected cards.
+- `vault.rs` — pure crypto + vault state: Argon2id KDF, XChaCha20-Poly1305 AEAD encrypt/decrypt, canary verification, session lock/unlock. Min password length: 8 characters.
+- `src/sim/` — in-process user simulation (`cfg(any(test, feature = "sim"))` only): headless harness (`SimApp`), persona timing profiles, journey DSL, headed CLI mode (`--simulate`), and run reporting. 13 journeys exercise the shipped UI code, not mocks.
 - `storage.rs` — low-level JSON persistence. `data_dir()` resolves `%APPDATA%\CopyIt` (falls back to next-to-exe when `APPDATA` is unset, e.g. non-Windows dev). `load`/`save` for `snippets.json`, `load_config`/`save_config` for `config.json`, atomic writes, corrupt-file tri-state, and the category helpers (`normalize_category`, `same_category`, `is_reserved_category`, `canonical_category`).
 - `store.rs` — the persistence seam above `storage.rs`: owns the data paths (`Store::at` / `Store::open`), the one-time legacy migration, and the load/save calls. `app.rs` never touches paths.
 - `seed.rs` — default snippet library seeded on first launch.

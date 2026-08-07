@@ -159,18 +159,20 @@ impl Report {
         // without needing the temp store.
         copy_if_exists(&self.store.snippets_path, &dir.join("snippets.json"))?;
         copy_if_exists(&self.store.config_path, &dir.join("config.json"))?;
-        // Any `.corrupt` backups made by the app also ship.
-        if let Some(name) = self.store.snippets_path.file_name() {
-            let mut glob = name.to_os_string();
-            glob.push(".corrupt");
-            if let Some(corrupt) = self
-                .store
-                .snippets_path
-                .parent()
-                .map(|p| p.join(&glob))
-                .filter(|p| p.exists())
-            {
-                copy_if_exists(&corrupt, &dir.join("snippets.json.corrupt"))?;
+        // Any `.corrupt` / `.corrupt.1` / `.corrupt.2` backups made by the app
+        // also ship, so the failure bundle includes every backup variant.
+        if let Some(parent) = self.store.snippets_path.parent() {
+            if let Ok(entries) = fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    if let Some(fname) = entry.file_name().to_str() {
+                        if fname.starts_with("snippets.json.corrupt") {
+                            copy_if_exists(
+                                &entry.path(),
+                                &dir.join(fname),
+                            )?;
+                        }
+                    }
+                }
             }
         }
         Ok(())

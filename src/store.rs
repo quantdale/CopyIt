@@ -84,14 +84,23 @@ fn migrate_path_from(new_path: &Path, filename: &str, candidates: &[PathBuf]) {
         }
         if let Ok(data) = std::fs::read_to_string(&candidate) {
             let trimmed = data.trim();
-            // Skip empty or dummy JSON (e.g. "[]" or "{}" from a failed write).
-            if trimmed.is_empty() || trimmed == "[]" || trimmed == "{}" {
+            // Skip zero-byte / whitespace-only files (nothing to lose). A valid
+            // empty array "[]" or object "{}" is real data and gets migrated.
+            if trimmed.is_empty() {
                 continue;
             }
             // Write atomically so a crash mid-migration can't leave a truncated
-            // stable file. On write failure, stop rather than swallow it: the
+            // stable file. On write failure, continue to the next candidate: the
             // legacy source stays intact for the next launch to retry.
             if storage::write_atomic(new_path, &data).is_ok() {
+                // Best-effort: rename the legacy source so it isn't re-migrated
+                // on the next launch. Failure is harmless — the data is already
+                // safely in the stable location.
+                if let Some(name) = candidate.file_name() {
+                    let mut new_name = name.to_owned();
+                    new_name.push(".migrated");
+                    let _ = std::fs::rename(&candidate, candidate.with_file_name(new_name));
+                }
                 return; // Success: migrate and stop searching
             }
         }
@@ -199,10 +208,10 @@ mod tests {
     }
 
     #[test]
-    fn migrate_skips_empty_and_placeholder_legacy_files() {
+    fn migrate_skips_empty_files_but_migrates_empty_json() {
         let dir = temp_dir("migrate_skip");
-        // Three candidate dirs, each holding a "snippets.json"; all are empty or
-        // dummy JSON, so nothing should be migrated.
+        // Empty / whitespace-only files are truly empty and skipped.
+        // Valid-but-empty JSON ("[]", "{}") is real data and gets migrated.
         let empty = dir.join("empty");
         let array = dir.join("array");
         let object = dir.join("object");
@@ -214,12 +223,22 @@ mod tests {
         std::fs::write(object.join("snippets.json"), "{}").unwrap();
 
         let new_path = dir.join("new").join("snippets.json");
+        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
         migrate_path_from(
             &new_path,
             "snippets.json",
             &[empty.clone(), array.clone(), object.clone()],
         );
-        assert!(!new_path.exists());
+        // The first non-empty candidate ("[]") should have been migrated,
+        // and its legacy source renamed to .migrated.
+        assert!(new_path.exists());
+        assert_eq!(std::fs::read_to_string(&new_path).unwrap(), "[]");
+        assert!(
+            array.join("snippets.json.migrated").exists(),
+            "legacy source renamed after migration"
+        );
+        // The empty candidate was skipped (not migrated, not renamed).
+        assert!(empty.join("snippets.json").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

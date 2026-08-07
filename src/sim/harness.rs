@@ -59,9 +59,13 @@ pub fn sim_root() -> PathBuf {
 
 /// The per-run store directory: `<temp>/copyit-sim/<pid>/<run>`.
 pub fn run_dir_for(name: &str, seed: u64) -> PathBuf {
+    let safe_name: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
     sim_root()
         .join(std::process::id().to_string())
-        .join(format!("{name}-{seed}"))
+        .join(format!("{safe_name}-{seed}"))
 }
 
 impl SimApp {
@@ -293,7 +297,7 @@ impl SimApp {
     }
 
     /// A single typed character with a seeded cadence delay and a text event.
-    fn type_char(&mut self, ch: char) {
+    pub(crate) fn type_char(&mut self, ch: char) {
         let ms = self.persona.type_ms(&mut self.rng);
         self.time_ms = self.time_ms.saturating_add(ms);
         self.pump(vec![Event::Text(ch.to_string())]);
@@ -380,17 +384,27 @@ impl SimApp {
     }
 
     /// Asserts a label is visible on screen.
+    /// Asserts a label is visible on screen. Tries exact match first, then
+    /// substring, so `expect_visible("Add")` matches a button labelled exactly
+    /// "Add" rather than "+ Add new category".
     pub fn expect_visible(&self, text: &str) -> Result<(), String> {
-        if self.visible_texts().iter().any(|(t, _)| t.contains(text)) {
+        let texts = self.visible_texts();
+        let found = texts.iter().any(|(t, _)| t.trim() == text)
+            || texts.iter().any(|(t, _)| t.contains(text));
+        if found {
             Ok(())
         } else {
             Err(format!("expected `{text}` visible; on screen: {}", self.on_screen()))
         }
     }
 
-    /// Asserts a label is absent from screen.
+    /// Asserts a label is absent from screen. Tries exact match first, then
+    /// substring.
     pub fn expect_absent(&self, text: &str) -> Result<(), String> {
-        if self.visible_texts().iter().any(|(t, _)| t.contains(text)) {
+        let texts = self.visible_texts();
+        let found = texts.iter().any(|(t, _)| t.trim() == text)
+            || texts.iter().any(|(t, _)| t.contains(text));
+        if found {
             Err(format!("expected `{text}` absent, but it is visible"))
         } else {
             Ok(())
@@ -475,9 +489,14 @@ impl SimApp {
     pub fn click_card_copy(&mut self, title: &str) -> Result<(), String> {
         let card = self.card_rect_for_title(title)?;
         let texts = self.visible_texts();
+        // Try to locate the "Copy" button text inside the card. egui button text
+        // is rendered as part of a galley — it may or may not appear as a
+        // standalone Shape::Text — so fall back to the known card layout position
+        // (Copy is top-right, ~40px from right edge, ~22px from top).
         let target = texts
             .iter()
-            .find(|(t, r)| t.contains("Copy") && card.contains_rect(*r))
+            .find(|(t, r)| t.trim() == "Copy" && card.intersects(*r))
+            .or_else(|| texts.iter().find(|(t, r)| t.contains("Copy") && card.intersects(*r)))
             .map(|(_, r)| r.center())
             .unwrap_or_else(|| Pos2::new(card.right() - 40.0, card.top() + 22.0));
         self.think();
@@ -488,11 +507,13 @@ impl SimApp {
     pub fn click_card_edit(&mut self, title: &str) -> Result<(), String> {
         let card = self.card_rect_for_title(title)?;
         let texts = self.visible_texts();
-        // The Edit button sits bottom-left; its label is the only "Edit" inside
-        // the card.
+        // The Edit button sits bottom-left; fall back to the known card layout
+        // position (left+40px, bottom-30px) if the text isn't in the output
+        // shapes.
         let target = texts
             .iter()
-            .find(|(t, r)| t.contains("Edit") && card.contains_rect(*r))
+            .find(|(t, r)| t.trim() == "Edit" && card.intersects(*r))
+            .or_else(|| texts.iter().find(|(t, r)| t.contains("Edit") && card.intersects(*r)))
             .map(|(_, r)| r.center())
             .unwrap_or_else(|| Pos2::new(card.left() + 40.0, card.bottom() - 30.0));
         self.think();
@@ -537,6 +558,7 @@ impl SimApp {
     /// Clicks just left of a located label — used to focus an inline text field
     /// whose hint text is no longer visible (it already has content), e.g. the
     /// header's "New category" field after submitting a rejected name.
+    #[allow(dead_code)] // retained as a public sim-harness utility
     pub fn click_left_of(&mut self, label: &str) -> Result<(), String> {
         let rect = self.locate(label)?;
         self.think();

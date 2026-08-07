@@ -2,7 +2,7 @@
 
 Terms the codebase uses for its domain concepts. Architecture discussions and code should use these names.
 
-- **Snippet** — a stored item: `{ id, title, category, body }`. The unit of data in the library; persisted in `snippets.json`.
+- **Snippet** — a stored item: `{ id, title, category, body, protection? }`. The unit of data in the library; persisted in `snippets.json`. Protected snippets have `body` empty on disk; the real text lives as ciphertext under the vault key.
 - **Library** — the set of snippets the app manages. Persisted automatically after every add, edit, delete, or reorder.
 - **Category** — a label attached to snippets. Canonical form is title-cased, trimmed, sorted, and deduplicated case-insensitively. `"All"` is reserved for the filter's show-everything value; empty input is rejected. All category rules live in `storage.rs` (`normalize_category`, `same_category`, `is_reserved_category`, `canonical_category`); the app keeps the canonical list as a plain sorted `Vec<String>`.
 - **Grid** — the card grid module (`grid.rs`): layout constants, column math, virtualization (`visible_rows`), gap/drop geometry (`gap_point`, `nearest_gap`), insertion-line drawing, and the `DragMachine` state machine. The `app.rs` render loop stays thin.

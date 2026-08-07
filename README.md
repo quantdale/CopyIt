@@ -66,6 +66,8 @@ editing a protected card asks for the vault password once per session; the top b
 - Release profile is tuned for a small binary and fast startup
   (`opt-level = "z"`, LTO, stripped).
 - **No password recovery.** Forget the vault password and protected bodies are unrecoverable. Titles and categories stay visible, and a protected card shows its first 5 body characters as a hint (bodies under 12 characters show none) — keep secrets out of titles.
+- **Vault passwords must be at least 8 characters.** Shorter passwords are rejected at creation time.
+- **Single instance.** Only one CopyIt window can run at a time — a second launch exits immediately.
 - Unprotected snippets remain plaintext JSON, so the "don't store credentials" rule applies to *unprotected* cards. An older version of CopyIt reading a file with protected cards sees empty bodies — don't downgrade after protecting.
 
 ## For contributors

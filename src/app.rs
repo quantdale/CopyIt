@@ -7,6 +7,7 @@ use crate::theme::Theme;
 use crate::vault::{self, VaultMeta, VaultState};
 use eframe::egui;
 use std::collections::HashSet;
+use std::sync::mpsc;
 
 /// Prefix of the banner message for a failed `snippets.json` write. Shared so a later
 /// successful snippet save can retire exactly its own error and nothing else.
@@ -117,10 +118,17 @@ pub struct CopyIt {
     adding_header_category: bool, // True when the user is typing a new category in the top bar
     new_header_category: String, // Input buffer for the new category name in the top bar
     category_error: Option<String>, // Validation error for the new category (e.g., "All" is reserved)
-    save_error: Option<String>,     // File I/O error message to display at the top
+    save_error: Vec<String>,     // File I/O error messages to display at the top
     vault: VaultState,              // Session lock state; starts locked on every launch
     vault_meta: Option<VaultMeta>,  // KDF salt + canary loaded from config.json; None until first protect
     vault_prompt: Option<VaultPrompt>, // Unlock / create-vault modal; None when closed
+    any_protected: bool,              // Cached from rebuild_derived; used in UI vault indicator
+    #[allow(dead_code)]
+    vault_work: Option<mpsc::Receiver<Result<[u8; 32], crate::vault::VaultError>>>, // For async KDF
+    theme_raw: Option<String>,         // Preserves original theme string when parse fails
+    #[allow(dead_code)]
+    refuse_overwrite: bool,            // Set true when backup_corrupt failed at startup
+    _instance_lock: Option<std::fs::File>, // Holds the file lock handle for single-instance
 }
 
 /// Tracks an in-progress drag operation. Initialized when the user clicks and holds on a card,
@@ -196,6 +204,16 @@ impl VaultPrompt {
             pending: Some(pending),
         }
     }
+
+    fn unlock_with_no_pending() -> Self {
+        VaultPrompt {
+            mode: VaultPromptMode::Unlock,
+            password: String::new(),
+            confirm: String::new(),
+            error: None,
+            pending: None,
+        }
+    }
 }
 
 /// Layout and response data returned from rendering a single snippet card.
@@ -238,7 +256,22 @@ impl CopyIt {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let store = Store::open();
         store.migrate_legacy();
-        Self::from_store(store, &cc.egui_ctx)
+        let mut app = Self::from_store(store, &cc.egui_ctx);
+        let lock_path = app.store.snippets_path.parent().unwrap().join(".copyit.lock");
+        #[allow(clippy::suspicious_open_options)] // lock file: no truncate needed
+        match std::fs::OpenOptions::new().write(true).create(true).open(&lock_path) {
+            Ok(file) => {
+                if file.try_lock().is_err() {
+                    eprintln!("CopyIt is already running (another instance holds the lock).");
+                    std::process::exit(1);
+                }
+                app._instance_lock = Some(file);
+            }
+            Err(e) => {
+                eprintln!("Could not create instance lock: {e}");
+            }
+        }
+        app
     }
 
     /// Constructs a fully initialized app from an explicit store, shared by
@@ -252,7 +285,7 @@ impl CopyIt {
     /// the UI. Unlike `new`, it never runs legacy migration — that is `new`'s
     /// job, and the harness must not touch legacy locations.
     pub fn from_store(store: Store, ctx: &egui::Context) -> Self {
-        let mut save_error: Option<String> = None;
+        let mut save_error: Vec<String> = Vec::new();
 
         // A file that exists but doesn't parse is *not* a first launch: preserve it
         // before the seeded defaults claim its name, and tell the user where it went.
@@ -265,7 +298,7 @@ impl CopyIt {
             storage::Load::Corrupt(e) => {
                 let (note, backed_up) =
                     describe_corrupt_file(&store.snippets_path, "snippets.json", &e);
-                save_error = Some(note);
+                save_error.push(note);
                 (crate::seed::defaults(), backed_up)
             }
         };
@@ -295,10 +328,7 @@ impl CopyIt {
                     describe_corrupt_file(&store.config_path, "config.json", &e);
                 // When both data files are corrupt, surface both notices: the config
                 // was moved aside too, and the user needs to know where it went.
-                save_error = Some(match save_error.take() {
-                    Some(prev) => format!("{prev}\n{note}"),
-                    None => note,
-                });
+                save_error.push(note);
                 (Config::from_snippets(&snippets), backed_up)
             }
         };
@@ -316,10 +346,14 @@ impl CopyIt {
         let config_changed = matches!(&loaded_categories, Some(loaded) if *loaded != config.categories);
         if config_write_ok || config_changed {
             if let Err(e) = store.save_config(&config) {
-                save_error = Some(format!("{CONFIG_SAVE_ERROR}: {e}"));
+                save_error.push(format!("{CONFIG_SAVE_ERROR}: {e}"));
             }
         }
 
+        // After loading snippets, sweep any stale temp files from a previous crashed write.
+        storage::sweep_stale_tmp(store.snippets_path.parent().unwrap());
+
+        let theme_raw = if config.theme.is_empty() { None } else { Some(config.theme.clone()) };
         let theme = config.theme.parse::<Theme>().unwrap_or(Theme::Dark);
         ctx.set_visuals(theme.visuals());
 
@@ -333,11 +367,12 @@ impl CopyIt {
         let next_id = next_snippet_id(&snippets);
         if seeded {
             if let Err(e) = store.save_snippets(&snippets) {
-                save_error = Some(format!("{SNIPPETS_SAVE_ERROR}: {e}"));
+                save_error.push(format!("{SNIPPETS_SAVE_ERROR}: {e}"));
             }
         }
 
         let derived = snippets.iter().map(Derived::new).collect();
+        let any_protected = snippets.iter().any(|s| s.protection.is_some());
 
         Self {
             snippets,
@@ -360,6 +395,11 @@ impl CopyIt {
             vault: VaultState::new(),
             vault_meta,
             vault_prompt: None,
+            any_protected,
+            vault_work: None,
+            theme_raw,
+            refuse_overwrite: !config_write_ok,
+            _instance_lock: None,
         }
     }
 
@@ -370,6 +410,7 @@ impl CopyIt {
         self.derived.clear();
         self.derived.reserve(self.snippets.len());
         self.derived.extend(self.snippets.iter().map(Derived::new));
+        self.any_protected = self.snippets.iter().any(|s| s.protection.is_some());
         self.generation = self.generation.wrapping_add(1);
         self.filter.valid = false;
     }
@@ -440,36 +481,41 @@ impl CopyIt {
     fn save_snippets(&mut self) {
         match self.store.save_snippets(&self.snippets) {
             Ok(()) => self.clear_save_error(SNIPPETS_SAVE_ERROR),
-            Err(e) => self.save_error = Some(format!("{SNIPPETS_SAVE_ERROR}: {e}")),
+            Err(e) => self.save_error.push(format!("{SNIPPETS_SAVE_ERROR}: {e}")),
         }
     }
 
     /// Persists the config (categories and theme selection) to config.json.
     /// Separated from snippets.json so snippet data stays backward-compatible.
-    /// Updates save_error if an I/O error occurs.
-    fn save_config(&mut self) {
+    /// Returns an error if the write fails; the caller decides how to surface it.
+    fn save_config(&mut self) -> std::io::Result<()> {
+        if self.vault_meta.is_none() {
+            if let storage::Load::Loaded(disk_config) = self.store.load_config() {
+                if disk_config.vault.is_some() {
+                    self.vault_meta = disk_config.vault;
+                }
+            }
+        }
+        let theme_str = if let Some(ref raw) = self.theme_raw {
+            if raw.parse::<Theme>().is_err() { raw.clone() } else { self.theme.to_string() }
+        } else {
+            self.theme.to_string()
+        };
         let config = Config {
             categories: self.categories.clone(),
-            theme: self.theme.to_string(),
+            theme: theme_str,
             vault: self.vault_meta.clone(),
         };
-        match self.store.save_config(&config) {
-            Ok(()) => self.clear_save_error(CONFIG_SAVE_ERROR),
-            Err(e) => self.save_error = Some(format!("{CONFIG_SAVE_ERROR}: {e}")),
-        }
+        self.store.save_config(&config)?;
+        self.clear_save_error(CONFIG_SAVE_ERROR);
+        Ok(())
     }
 
     /// Retires the warning banner only when it is reporting a failure of the kind that
     /// just succeeded. Clearing it unconditionally let an incidental config write (say,
     /// switching themes) hide the fact that the snippet library still isn't on disk.
     fn clear_save_error(&mut self, prefix: &str) {
-        if self
-            .save_error
-            .as_deref()
-            .is_some_and(|e| e.starts_with(prefix))
-        {
-            self.save_error = None;
-        }
+        self.save_error.retain(|e| !e.starts_with(prefix));
     }
 
     /// Clears the inline category warning as soon as the user starts editing
@@ -497,7 +543,7 @@ impl CopyIt {
         }
         self.categories.push(cat.clone());
         self.categories.sort();
-        self.save_config();
+        let _ = self.save_config();
         cat
     }
 
@@ -529,14 +575,14 @@ impl CopyIt {
                 Some(key) => match vault::encrypt_body(key, &ed.body) {
                     Ok(p) => Some(p),
                     Err(e) => {
-                        self.save_error =
-                            Some(format!("Couldn't protect a snippet: the vault failed ({e})"));
+                        self.save_error.push(format!("Couldn't protect a snippet: the vault failed ({e})"));
+                        self.editor = Some(ed);
                         return;
                     }
                 },
                 None => {
-                    self.save_error =
-                        Some("Couldn't protect a snippet: the vault isn't unlocked".to_string());
+                    self.save_error.push("Couldn't protect a snippet: the vault isn't unlocked".to_string());
+                    self.editor = Some(ed);
                     return;
                 }
             }
@@ -559,6 +605,8 @@ impl CopyIt {
                     // copied — snippet bodies can be large.
                     s.body = std::mem::take(&mut ed.body);
                 }
+            } else {
+                self.save_error.push(format!("Snippet with id {id} not found; it may have been deleted"));
             }
         } else {
             // The cursor is always a free id (it mirrors the library's max, or a scanned
@@ -616,14 +664,13 @@ impl CopyIt {
             None => s.body.clone(),
             Some(p) => {
                 let Some(key) = self.vault.key() else {
-                    self.save_error =
-                        Some("Couldn't copy: the vault is locked, unlock it first".to_string());
+                    self.save_error.push("Couldn't copy: the vault is locked, unlock it first".to_string());
                     return;
                 };
                 match vault::decrypt_body(key, p) {
                     Ok(plaintext) => plaintext,
                     Err(e) => {
-                        self.save_error = Some(format!(
+                        self.save_error.push(format!(
                             "Couldn't copy \"{}\": the protected snippet can't be decrypted ({e})",
                             s.title
                         ));
@@ -641,6 +688,9 @@ impl CopyIt {
     /// editor shows the plaintext body (the protection is kept on the editor's
     /// checkbox). An AEAD failure refuses the edit with a warning banner.
     fn edit_snippet(&mut self, id: u64) {
+        if self.editor.is_some() {
+            return;
+        }
         let Some(s) = self.snippets.iter().find(|s| s.id == id) else {
             return;
         };
@@ -648,8 +698,7 @@ impl CopyIt {
             None => Editor::from_snippet(s, &self.categories),
             Some(p) => {
                 let Some(key) = self.vault.key() else {
-                    self.save_error =
-                        Some("Couldn't edit: the vault is locked, unlock it first".to_string());
+                    self.save_error.push("Couldn't edit: the vault is locked, unlock it first".to_string());
                     return;
                 };
                 match vault::decrypt_body(key, p) {
@@ -659,7 +708,7 @@ impl CopyIt {
                         Editor::from_snippet(&copy, &self.categories)
                     }
                     Err(e) => {
-                        self.save_error = Some(format!(
+                        self.save_error.push(format!(
                             "Couldn't edit \"{}\": the protected snippet can't be decrypted ({e})",
                             s.title
                         ));
@@ -675,6 +724,9 @@ impl CopyIt {
     /// the action pending; everything else acts immediately. The gating predicate is
     /// `editor::card_action_requires_vault` (pure, unit-tested).
     fn dispatch_action(&mut self, action: Action, ctx: &egui::Context, now: f64) {
+        if self.vault_prompt.is_some() {
+            return;
+        }
         match action {
             Action::Copy(id) => {
                 let protected = self
@@ -718,17 +770,10 @@ impl CopyIt {
         let (meta, key) = vault::create_vault(password).map_err(|e| e.to_string())?;
         self.vault_meta = Some(meta);
         self.vault.unlock_with_key(key);
-        self.save_config();
-        if self
-            .save_error
-            .as_deref()
-            .is_some_and(|e| e.starts_with(CONFIG_SAVE_ERROR))
-        {
+        if let Err(e) = self.save_config() {
             self.vault_meta = None;
             self.vault.lock();
-            return Err(format!(
-                "{CONFIG_SAVE_ERROR}: the vault couldn't be written, so nothing was protected"
-            ));
+            return Err(format!("{CONFIG_SAVE_ERROR}: {e}"));
         }
         Ok(())
     }
@@ -747,6 +792,10 @@ impl CopyIt {
             VaultPromptMode::Create => {
                 if prompt.password.is_empty() {
                     prompt.error = Some("Password can't be empty".to_string());
+                    return Some(prompt);
+                }
+                if prompt.password.len() < vault::MIN_VAULT_PASSWORD_LEN {
+                    prompt.error = Some(format!("Password must be at least {} characters", vault::MIN_VAULT_PASSWORD_LEN));
                     return Some(prompt);
                 }
                 if prompt.password != prompt.confirm {
@@ -781,8 +830,12 @@ impl CopyIt {
                         }
                         None
                     }
-                    Err(_) => {
-                        prompt.error = Some("Wrong password. Try again.".to_string());
+                    Err(e) => {
+                        let msg = match &e {
+                            vault::VaultError::Encoding(_) => "Vault data is corrupt — cannot unlock".to_string(),
+                            _ => "Wrong password. Try again.".to_string(),
+                        };
+                        prompt.error = Some(msg);
                         Some(prompt)
                     }
                 }
@@ -854,7 +907,14 @@ impl CopyIt {
         };
         let target_abs = target_abs.min(self.snippets.len());
         self.snippets.insert(target_abs, snippet);
-        self.snippets_changed();
+        if origin_index < self.derived.len() {
+            let d = self.derived.remove(origin_index);
+            let insert_at = target_abs.min(self.derived.len());
+            self.derived.insert(insert_at, d);
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.filter.valid = false;
+        self.save_snippets();
     }
 
     /// Renders a single snippet card with all visual elements: title (strong, truncated), category badge
@@ -916,7 +976,7 @@ impl CopyIt {
                                 let resp = ui.button(if recently {
                                     "\u{2714} Copied"
                                 } else {
-                                    "\u{29C9} Copy"
+                                    "Copy"
                                 });
                                 if resp.clicked() {
                                     actions.push(Action::Copy(s.id));
@@ -1164,7 +1224,7 @@ impl CopyIt {
                         .hint_text("Search title, text, category\u{2026}")
                         .desired_width(260.0),
                 );
-                if !self.search.is_empty() && ui.button("\u{2715}").clicked() {
+                if !self.search.is_empty() && ui.button("\u{00D7}").clicked() {
                     self.search.clear();
                 }
                 ui.add_space(12.0);
@@ -1253,51 +1313,58 @@ impl CopyIt {
                     // The top bar above has already been painted with the old visuals, so
                     // ask for one more frame to redraw everything with the new ones.
                     ctx.request_repaint();
-                    self.save_config();
+                    let _ = self.save_config();
                 }
 
                 // Vault state, shown only when at least one snippet is protected. The
                 // indicator uses plain labels (the padlock emoji isn't reliably in
                 // egui's default fonts); while unlocked a Lock button drops the key.
-                if self.snippets.iter().any(|s| s.protection.is_some()) {
+                if self.any_protected {
                     ui.add_space(12.0);
                     match &self.vault {
                         VaultState::Locked => {
-                            ui.label(
+                            // H-07: Make "Vault locked" clickable to open unlock prompt
+                            if ui.button(
                                 egui::RichText::new("Vault locked")
                                     .color(egui::Color32::from_rgb(0xef, 0x44, 0x44)),
-                            );
+                            ).clicked() {
+                                self.vault_prompt = Some(VaultPrompt::unlock_with_no_pending());
+                            }
                         }
                         VaultState::Unlocked(_) => {
                             ui.label(
                                 egui::RichText::new("Vault unlocked")
                                     .color(egui::Color32::from_rgb(0x10, 0xb9, 0x81)),
                             );
-                            if ui.button("Lock Vault").clicked() {
-                                self.vault.lock();
-                            }
+                            // H-02: Disable Lock button while editor is open
+                            ui.add_enabled_ui(self.editor.is_none(), |ui| {
+                                if ui.button("Lock Vault").clicked() {
+                                    self.vault.lock();
+                                }
+                            });
                         }
                     }
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("\u{FF0B} New").clicked() {
+                    if ui.button("+ New").clicked() && self.editor.is_none() {
                         self.editor = Some(Editor::blank(&self.categories));
                     }
                 });
             });
             // Borrow the message instead of cloning it every frame; the dismiss click is
             // recorded in a local and applied after the closure releases the borrow.
-            if let Some(err) = self.save_error.as_deref() {
+            if !self.save_error.is_empty() {
                 ui.add_space(4.0);
                 let mut dismissed = false;
                 ui.horizontal(|ui| {
                     ui.add_space(16.0);
-                    ui.colored_label(WARNING_COLOR, format!("\u{26A0} {err}"));
+                    let joined = self.save_error.join("\n");
+                    ui.colored_label(WARNING_COLOR, format!("\u{26A0} {joined}"));
                     // Startup notices (e.g. a recovered corrupt file) are not tied to a
                     // later successful save, so give the user a way to acknowledge them.
                     if ui
-                        .small_button("\u{2715}")
+                        .small_button("\u{00D7}")
                         .on_hover_text("Dismiss")
                         .clicked()
                     {
@@ -1305,7 +1372,7 @@ impl CopyIt {
                     }
                 });
                 if dismissed {
-                    self.save_error = None;
+                    self.save_error.clear();
                 }
             }
             ui.add_space(6.0);
@@ -1326,7 +1393,11 @@ impl CopyIt {
                 self.drag = None;
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("No snippets match.").weak());
+                    if self.snippets.is_empty() && self.search.is_empty() && self.category_filter == "All" {
+                        ui.label(egui::RichText::new("Your library is empty. Click \"+ New\" to add your first snippet.").weak());
+                    } else {
+                        ui.label(egui::RichText::new("No snippets match your search or filter.").weak());
+                    }
                 });
                 return;
             }
@@ -1372,6 +1443,11 @@ impl CopyIt {
             let card_screen_rects: &[egui::Rect] = &scroll_output.inner.1;
             let grid_area = scroll_output.inner_rect;
             let cols = scroll_output.inner.0;
+
+            // C2-01: Cancel drag if pointer is lost (e.g., window lost focus, Alt-Tab)
+            if self.drag.is_some() && !ctx.input(|i| i.pointer.any_down()) && ctx.input(|i| i.pointer.interact_pos().is_none()) {
+                self.drag = None;
+            }
 
             // Update drag threshold: the machine promotes itself to a real
             // drag once the pointer has moved far enough past the start.
@@ -1495,7 +1571,7 @@ impl CopyIt {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label("Title");
-                            ui.add(egui::TextEdit::singleline(&mut ed.title).desired_width(280.0));
+                            ui.add(egui::TextEdit::singleline(&mut ed.title).desired_width(280.0).char_limit(200));
                         });
 
                         ui.add_space(12.0);
@@ -1530,18 +1606,17 @@ impl CopyIt {
 
                             if ed.adding_category {
                                 let previous_category = ed.new_category.clone();
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut ed.new_category)
-                                            .hint_text("New category")
-                                            .desired_width(120.0),
-                                    );
-                                    if ui.button("Add").clicked()
-                                        && !ed.new_category.trim().is_empty()
-                                    {
-                                        result = EditorResult::AddCategory(ed.new_category.clone());
-                                    }
-                                });
+                                let input = ui.add(
+                                    egui::TextEdit::singleline(&mut ed.new_category)
+                                        .hint_text("New category")
+                                        .desired_width(120.0),
+                                );
+                                let enter_pressed = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                if (ui.button("Add").clicked() || enter_pressed)
+                                    && !ed.new_category.trim().is_empty()
+                                {
+                                    result = EditorResult::AddCategory(ed.new_category.clone());
+                                }
                                 // Clear the inline-category warning as the user edits the
                                 // field, so the error doesn't linger while they fix it.
                                 if ed.new_category != previous_category {
@@ -1564,7 +1639,8 @@ impl CopyIt {
                                 egui::TextEdit::multiline(&mut ed.body)
                                     .desired_width(f32::INFINITY)
                                     .desired_rows(12)
-                                    .font(egui::TextStyle::Monospace),
+                                    .font(egui::TextStyle::Monospace)
+                                    .char_limit(100_000),
                             );
                         });
                     ui.add_space(10.0);
@@ -1665,20 +1741,28 @@ impl CopyIt {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         ui.label("Password");
-                        ui.add(
+                        let password_input = ui.add(
                             egui::TextEdit::singleline(&mut prompt.password)
                                 .password(true)
                                 .desired_width(220.0),
                         );
+                        let enter_pressed = password_input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if enter_pressed {
+                            submit = true;
+                        }
                     });
                     if matches!(prompt.mode, VaultPromptMode::Create) {
                         ui.horizontal(|ui| {
                             ui.label("Confirm");
-                            ui.add(
+                            let confirm_input = ui.add(
                                 egui::TextEdit::singleline(&mut prompt.confirm)
                                     .password(true)
                                     .desired_width(220.0),
                             );
+                            let enter_pressed = confirm_input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if enter_pressed {
+                                submit = true;
+                            }
                         });
                     }
                     if let Some(err) = &prompt.error {
@@ -2795,7 +2879,7 @@ mod layout_tests {
         assert_eq!(ids(&app), vec![1]);
         assert_eq!(app.snippets[0].title, "New prompt");
         assert_eq!(app.snippets[0].body, "some body");
-        assert!(app.save_error.is_none());
+        assert!(app.save_error.is_empty());
         match storage::load(&app.store.snippets_path) {
             storage::Load::Loaded(snips) => {
                 assert_eq!(snips.len(), 1);
@@ -3151,25 +3235,24 @@ mod layout_tests {
             vec!["Git".into()],
         );
 
-        app.save_error = Some(format!("{SNIPPETS_SAVE_ERROR}: disk full"));
-        app.save_config();
-        assert_eq!(
-            app.save_error.as_deref(),
-            Some("Couldn't save snippets: disk full"),
+        app.save_error.push(format!("{SNIPPETS_SAVE_ERROR}: disk full"));
+        let _ = app.save_config();
+        assert!(
+            app.save_error.iter().any(|e| e == "Couldn't save snippets: disk full"),
             "a config write must not hide a snippet-save failure"
         );
 
         app.save_snippets();
         assert!(
-            app.save_error.is_none(),
+            app.save_error.is_empty(),
             "the snippet save clears its own error"
         );
 
         // Startup notices about recovered data files survive until dismissed.
-        app.save_error = Some("snippets.json couldn't be read".to_string());
+        app.save_error.push("snippets.json couldn't be read".to_string());
         app.save_snippets();
-        app.save_config();
-        assert!(app.save_error.is_some());
+        let _ = app.save_config();
+        assert!(!app.save_error.is_empty());
     }
 
     /// Saves must be crash-safe: a failed write leaves the previous file intact.
@@ -3181,7 +3264,7 @@ mod layout_tests {
             vec!["Git".into()],
         );
         app.save_snippets();
-        assert!(app.save_error.is_none());
+        assert!(app.save_error.is_empty());
 
         let dir = app.store.snippets_path.parent().unwrap().to_path_buf();
         let leftovers: Vec<String> = std::fs::read_dir(&dir)
@@ -3314,7 +3397,7 @@ mod layout_tests {
     /// explicitly). The on-disk `config.json` has no vault section (a fresh library),
     /// matching a first-protect scenario.
     fn protected_test_app(name: &str, body: &str) -> (CopyIt, VaultMeta, [u8; 32]) {
-        let (meta, key) = vault::create_vault("pw").unwrap();
+        let (meta, key) = vault::create_vault("password1").unwrap();
         let protection = vault::encrypt_body(&key, body).unwrap();
         let mut app = test_app(
             name,
@@ -3506,7 +3589,7 @@ mod layout_tests {
             "a failed decrypt must not copy anything"
         );
         assert!(app.copied.is_none());
-        let banner = app.save_error.as_deref().expect("warning banner is set");
+        let banner = app.save_error.join("\n");
         assert!(banner.contains("Secret"), "banner names the card: {banner}");
         assert!(banner.contains("can't be decrypted"));
         assert_eq!(
@@ -3518,7 +3601,7 @@ mod layout_tests {
 
     #[test]
     fn protect_stores_ciphertext_and_censors_the_card() {
-        let (meta, key) = vault::create_vault("pw").unwrap();
+        let (meta, key) = vault::create_vault("password1").unwrap();
         let mut app = test_app("protect-save", vec![], vec!["Git".into()]);
         app.vault_meta = Some(meta);
         app.vault.unlock_with_key(key);
@@ -3588,11 +3671,22 @@ mod layout_tests {
         assert!(matches!(prompt.pending, Some(PendingVaultAction::ProtectSave(_))));
         assert!(app.snippets.is_empty(), "nothing saved before the vault exists");
 
-        // Mismatched confirmation: inline error, no vault, nothing persisted.
+        // Password too short: inline error, no vault, nothing persisted.
         let mut prompt = prompt;
-        prompt.password = "pw".into();
-        prompt.confirm = "different".into();
+        prompt.password = "short".into();
+        prompt.confirm = "short".into();
         let ctx = egui::Context::default();
+        let kept = app
+            .handle_vault_prompt(prompt, &ctx, 0.0)
+            .expect("a short password keeps the modal open");
+        assert!(kept.error.as_ref().unwrap().contains("at least 8 characters"));
+        assert!(app.vault_meta.is_none());
+        assert!(app.snippets.is_empty());
+
+        // Mismatched confirmation: inline error, no vault, nothing persisted.
+        let mut prompt = kept;
+        prompt.password = "password1".into();
+        prompt.confirm = "different".into();
         let kept = app
             .handle_vault_prompt(prompt, &ctx, 0.0)
             .expect("a mismatch keeps the modal open");
@@ -3602,8 +3696,8 @@ mod layout_tests {
 
         // Matching passwords: vault created and persisted, the pending save runs.
         let mut prompt = kept;
-        prompt.password = "pw".into();
-        prompt.confirm = "pw".into();
+        prompt.password = "password1".into();
+        prompt.confirm = "password1".into();
         prompt.error = None;
         assert!(app.handle_vault_prompt(prompt, &ctx, 0.0).is_none(), "modal closes on success");
         assert!(app.vault.is_unlocked());

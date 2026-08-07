@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 /// insertion order (they remain in self.snippets in whatever order the user drags them to).
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snippet {
-    pub id: u64,          // Stable unique identifier; incremented on creation, never reused
+    pub id: u64,          // Stable unique identifier; unique among currently stored snippets
     pub title: String,    // Display name of the snippet
     pub category: String, // User-defined category (normalized to title-case)
     pub body: String,     // The actual content to copy to clipboard

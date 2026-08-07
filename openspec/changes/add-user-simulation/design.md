@@ -79,7 +79,7 @@ Browser automation / API orchestration / auth testing are N/A (no such layers). 
 
 ## Acceptance Criteria
 
-1. `cargo test` runs the full journey suite headlessly; the suite (all personas, ~25 journeys) completes in under 60 s on the CI runner.
+1. `cargo test` runs the full journey suite headlessly; the suite (all personas, 13 journeys) completes in under 60 s on the CI runner.
 2. CI (`windows-latest`) executes the suite on every push/PR and uploads `sim-report/` on failure; `cargo clippy --all-targets -- -D warnings` stays green.
 3. Determinism test passes: two runs of the same journey with the same seed produce identical normalized event logs.
 4. Isolation test passes: after the full suite, no file exists at the real `%APPDATA%\CopyIt` paths that did not exist before (verified by the harness guard never tripping plus an explicit test that journeys cannot construct `Store::open`).

@@ -14,16 +14,31 @@ use eframe::egui;
 use std::path::PathBuf;
 
 /// Parses `--simulate <journey> [--seed N]` from argv. Returns `None` when the
-/// flag is absent (the default app path runs).
+/// flag is absent (the default app path runs). Exits with an error on
+/// unrecognized flags or missing values.
 pub fn parse() -> Option<(String, u64)> {
     let mut args = std::env::args().skip(1);
     let mut journey = None;
     let mut seed = 0u64;
     while let Some(arg) = args.next() {
         if arg == "--simulate" {
-            journey = args.next();
+            journey = args.next().unwrap_or_else(|| {
+                eprintln!("error: --simulate requires a journey name");
+                std::process::exit(1);
+            });
         } else if arg == "--seed" {
-            seed = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let val = args.next().unwrap_or_else(|| {
+                eprintln!("error: --seed requires a numeric value");
+                std::process::exit(1);
+            });
+            seed = val.parse().unwrap_or_else(|_| {
+                eprintln!("error: --seed value must be a number, got '{val}'");
+                std::process::exit(1);
+            });
+        } else {
+            eprintln!("error: unrecognized argument '{arg}'");
+            eprintln!("usage: copyit --simulate <journey> [--seed N]");
+            std::process::exit(1);
         }
     }
     journey.map(|j| (j, seed))
@@ -64,6 +79,7 @@ pub struct SimDriver {
     journey: journey::Journey,
     started: bool,
     screenshot_path: Option<PathBuf>,
+    journey_result: Option<Result<(), String>>,
 }
 
 impl SimDriver {
@@ -82,6 +98,7 @@ impl SimDriver {
             journey,
             started: false,
             screenshot_path: None,
+            journey_result: None,
         }
     }
 }
@@ -92,7 +109,10 @@ impl eframe::App for SimDriver {
             self.started = true;
             // Execute the whole journey headlessly through the same harness the
             // tests use; the window then shows the final app state.
-            let _ = journey::run_into(&mut self.sim, &self.journey);
+            self.journey_result = Some(
+                journey::run_into(&mut self.sim, &self.journey)
+                    .map_err(|e| e.to_string()),
+            );
             self.sim.app.ui(ctx);
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             self.screenshot_path = Some(
@@ -104,16 +124,27 @@ impl eframe::App for SimDriver {
             ctx.request_repaint();
         } else {
             self.sim.app.ui(ctx);
-            if let Some(path) = self.screenshot_path.take() {
+            // Only consume the screenshot path when the Screenshot event actually
+            // arrives; otherwise keep the path for the next frame.
+            if let Some(path) = &self.screenshot_path {
                 let events = ctx.input(|i| i.events.clone());
                 for event in events {
                     if let egui::Event::Screenshot { image, .. } = event {
-                        match report::write_png(&path, &image) {
-                            Ok(()) => eprintln!("screenshot saved to {}", path.display()),
+                        match report::write_png(path, &image) {
+                            Ok(()) => {
+                                eprintln!("screenshot saved to {}", path.display());
+                                self.screenshot_path = None;
+                            }
                             Err(e) => eprintln!("couldn't save screenshot: {e}"),
                         }
                     }
                 }
+            }
+            // Propagate journey failure after the screenshot is captured (or
+            // after a few extra frames to let the screenshot arrive).
+            if let Some(Err(msg)) = &self.journey_result {
+                eprintln!("journey failed: {msg}");
+                std::process::exit(1);
             }
         }
     }

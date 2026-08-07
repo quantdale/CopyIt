@@ -3,20 +3,24 @@ on: [push, pull_request]
 jobs:
   build-test:
     runs-on: windows-latest      # real target: exercises windows_subsystem + %APPDATA% behavior
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: '1.93'
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
-      - run: cargo build --release
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+      - run: cargo build --locked --release
       # The headless journey suite (all sim_journeys_* tests), run serially so
       # the reported timing is deterministic. The same tests already ran in
       # `cargo test --all-targets`; this step makes the suite explicit and its
       # runtime measurable (must stay under 60 s).
-      - run: cargo test --bin copyit sim_journeys -- --test-threads 1
+      - name: Headless journey suite
+        run: cargo test --locked --bin copyit sim_journeys -- --test-threads 1
+        timeout-minutes: 3
       - name: Upload simulation report on failure
         if: failure()
         uses: actions/upload-artifact@v4

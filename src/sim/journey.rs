@@ -67,6 +67,7 @@ pub enum Intent {
     ClickFirstText(&'static str),
     TypeInto(&'static str, &'static str),
     ReplaceField(&'static str, &'static str),
+    #[allow(dead_code)] // retained as a journey-step variant
     PressKey(egui::Key),
     Wait(u64),
     ExpectVisible(&'static str),
@@ -348,7 +349,7 @@ fn snippet(id: u64, title: &str, category: &str, body: &str) -> Snippet {
 
 /// The vault password every vault fixture is created with; a journey "knows" it
 /// the way the app's user would and types it into the unlock modal.
-const VAULT_PASSWORD: &str = "pw";
+const VAULT_PASSWORD: &str = "password1";
 
 /// Types into the unlock modal's password field, clearing any existing content
 /// first (e.g. the failed first attempt in the wrong-password journey). The
@@ -361,8 +362,7 @@ fn type_password(sim: &mut SimApp, password: &str) -> Result<(), String> {
     sim.click(field_center)?;
     sim.clear_focused_field()?;
     for ch in password.chars() {
-        sim.pump(vec![egui::Event::Text(ch.to_string())]);
-        sim.pump(vec![]);
+        sim.type_char(ch);
     }
     Ok(())
 }
@@ -483,7 +483,7 @@ pub fn first_run_explorer() -> Journey {
             Step::Intent(Intent::Wait(1400)),
             Step::Intent(Intent::ExpectAbsent("Copied")),
             // Open and cancel the editor.
-            Step::Intent(Intent::ClickText("\u{FF0B} New")),
+            Step::Intent(Intent::ClickText("+ New")),
             Step::Intent(Intent::ExpectVisible("New snippet")),
             Step::Intent(Intent::ClickText("Cancel")),
             Step::Intent(Intent::ExpectAbsent("New snippet")),
@@ -519,7 +519,7 @@ fn add_snippet_steps(
     category: CategoryTarget,
 ) -> Vec<Step> {
     let mut steps = vec![
-        Step::Intent(Intent::ClickText("\u{FF0B} New")),
+        Step::Intent(Intent::ClickText("+ New")),
         Step::Intent(Intent::ExpectVisible("New snippet")),
         Step::Intent(Intent::TypeInto("Title", title)),
         Step::Intent(Intent::TypeInto("Content", body)),
@@ -838,14 +838,11 @@ pub fn error_reserved_category() -> Journey {
             Step::Intent(Intent::SubmitHeaderCategory("all")),
             Step::Intent(Intent::ExpectVisible("\"All\" is reserved and can't be used as a category")),
             Step::Intent(Intent::ExpectVisible("Add")),
-            // Click back into the field (its hint is hidden because it holds
-            // "all"), select-all and delete, then add a valid category.
+            // Replace the reserved "all" text with a valid category name.
             Step::Custom(Box::new(|sim: &mut SimApp| {
-                sim.click_left_of("Add")?;
-                sim.clear_focused_field()
+                sim.replace_into("all", "Docker")?;
+                sim.press_key(egui::Key::Enter)
             })),
-            Step::Intent(Intent::TypeInto("New category", "Docker")),
-            Step::Intent(Intent::PressKey(egui::Key::Enter)),
             Step::Intent(Intent::ExpectVisible("Docker")),
             Step::Intent(Intent::ExpectStore(Box::new(|store: &Store| match store.load_config() {
                 crate::storage::Load::Loaded(config) => {
@@ -858,7 +855,7 @@ pub fn error_reserved_category() -> Journey {
                 _other => Err("config.json should exist".into()),
             }))),
             // Editor: blank inline category keeps the form open without adding.
-            Step::Intent(Intent::ClickText("\u{FF0B} New")),
+            Step::Intent(Intent::ClickText("+ New")),
             Step::Intent(Intent::ExpectVisible("New snippet")),
             Step::Custom(Box::new(|sim| sim.begin_editor_new_category())),
             Step::Intent(Intent::ClickText("Add")),
@@ -868,15 +865,11 @@ pub fn error_reserved_category() -> Journey {
             Step::Intent(Intent::TypeInto("New category", "all")),
             Step::Intent(Intent::ClickText("Add")),
             Step::Intent(Intent::ExpectVisible("\"All\" is reserved and can't be used as a category")),
-            // Clear and add a valid category, then save the snippet.
-            // Click back into the inline field (it holds "all", so its hint is
-            // hidden), select-all and delete, then add the real category.
+            // Replace the reserved "all" text with a valid category, then submit.
             Step::Custom(Box::new(|sim: &mut SimApp| {
-                sim.click_left_of("Add")?;
-                sim.clear_focused_field()
+                sim.replace_into("all", "Docker")?;
+                sim.click_text("Add")
             })),
-            Step::Intent(Intent::TypeInto("New category", "Docker")),
-            Step::Intent(Intent::ClickText("Add")),
             Step::Intent(Intent::TypeInto("Title", "Docker tip")),
             Step::Intent(Intent::TypeInto("Content", "docker info")),
             Step::Intent(Intent::ClickText("Save")),

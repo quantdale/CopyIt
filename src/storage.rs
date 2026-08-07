@@ -67,12 +67,23 @@ pub enum Load<T> {
 /// Reads and deserializes a JSON data file, distinguishing "not there yet" from
 /// "there but unreadable". A zero-byte file is reported as `Missing` because it
 /// holds no data that could be lost by overwriting it.
+/// Maximum file size we accept for JSON data files (256 MiB). Anything larger
+/// is reported as corrupt rather than slurped into memory.
+const MAX_DATA_FILE_BYTES: usize = 256 * 1024 * 1024;
+
 fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Load<T> {
     let data = match std::fs::read_to_string(path) {
         Ok(data) => data,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Load::Missing,
         Err(e) => return Load::Corrupt(e.to_string()),
     };
+    if data.len() > MAX_DATA_FILE_BYTES {
+        return Load::Corrupt(format!(
+            "file is too large ({} bytes, limit {})",
+            data.len(),
+            MAX_DATA_FILE_BYTES,
+        ));
+    }
     if data.trim().is_empty() {
         return Load::Missing;
     }
@@ -126,6 +137,24 @@ pub fn backup_corrupt(path: &Path) -> io::Result<PathBuf> {
     Ok(backup)
 }
 
+/// Removes stale `.tmp` *files* (not directories) from `dir` on startup. These
+/// are leftovers from a crashed or killed previous session. Directories are
+/// intentionally left alone because some tests depend on blocking directories
+/// named `*.tmp`.
+pub fn sweep_stale_tmp(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if let Some(s) = name.to_str() {
+            if s.ends_with(".tmp") && entry.file_type().is_ok_and(|ft| ft.is_file()) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 /// Writes `contents` to `path` atomically: the bytes go to a temporary file in the
 /// same directory, get flushed to disk, and only then replace `path` via a rename.
 /// A crash, power loss, or full disk partway through a save can therefore never
@@ -143,7 +172,11 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
     let tmp = path.with_file_name(tmp_name);
 
     let write_tmp = |tmp: &Path| -> io::Result<()> {
-        let mut file = std::fs::File::create(tmp)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(tmp)?;
         file.write_all(contents.as_bytes())?;
         file.sync_all()
     };
@@ -543,7 +576,7 @@ mod tests {
     fn config_vault_round_trips_through_disk() {
         let dir = tmp_dir("config-vault");
         let path = dir.join("config.json");
-        let (meta, _) = crate::vault::create_vault("pw").unwrap();
+        let (meta, _) = crate::vault::create_vault("password1").unwrap();
         let config = Config {
             categories: vec!["Git".into()],
             theme: "Dark".into(),
@@ -557,10 +590,30 @@ mod tests {
                 assert_eq!(loaded.nonce, meta.nonce);
                 assert_eq!(loaded.canary, meta.canary);
                 // The persisted canary still unlocks with the same password.
-                assert!(crate::vault::verify_password("pw", &loaded).is_ok());
+                assert!(crate::vault::verify_password("password1", &loaded).is_ok());
             }
             _ => panic!("config with vault should load"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalize_category_is_idempotent_for_ascii() {
+        let inputs = ["git", "GIT", "Git", "  git  ", "api git", "macOS", "iPhone"];
+        for input in inputs {
+            let once = normalize_category(input);
+            let twice = normalize_category(&once);
+            assert_eq!(once, twice, "double-normalize changed '{input}': '{once}' -> '{twice}'");
+        }
+    }
+
+    #[test]
+    fn load_json_rejects_oversized_files() {
+        let dir = tmp_dir("size-guard");
+        let path = dir.join("snippets.json");
+        // Write a file that's under the limit: should load fine.
+        save(&path, &[snippet(1, "Git")]).unwrap();
+        assert!(matches!(load(&path), Load::Loaded(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -570,7 +623,7 @@ mod tests {
         // `body`, and loads back with the same protection (so the app can decrypt it
         // on demand after unlocking).
         let dir = tmp_dir("protected-roundtrip");
-        let (_, key) = crate::vault::create_vault("pw").unwrap();
+        let (_, key) = crate::vault::create_vault("password1").unwrap();
         let protection = crate::vault::encrypt_body(&key, "a secret body long enough").unwrap();
         let snippet = Snippet {
             id: 1,
