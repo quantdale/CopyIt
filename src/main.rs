@@ -1,5 +1,10 @@
 // CopyIt — a native Windows GUI app for storing and quickly copying scripts and AI prompts.
 // Built with egui/eframe for a single-binary, zero-dependency release build.
+// Documentation: this module is the executable entry point for the desktop application.
+// Documentation: application state and UI behavior are implemented primarily in `app`.
+// Documentation: persistence is separated across the `storage` and `store` modules.
+// Documentation: protected snippet handling is isolated in the `vault` module.
+// Documentation: simulation support is excluded from normal release builds unless enabled.
 // Hide the console window on Windows in release builds (GUI app).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
