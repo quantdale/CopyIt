@@ -115,7 +115,12 @@ impl Report {
     /// Writes a per-step snapshot file and keeps the last one in memory.
     pub fn write_snapshot(&mut self, snapshot: Snapshot) -> io::Result<()> {
         let rendered = snapshot.render();
-        fs::write(self.report_dir.join("snapshots").join(format!("step-{:03}.txt", snapshot.step)), rendered)?;
+        fs::write(
+            self.report_dir
+                .join("snapshots")
+                .join(format!("step-{:03}.txt", snapshot.step)),
+            rendered,
+        )?;
         self.last_snapshot = Some(snapshot);
         Ok(())
     }
@@ -149,11 +154,18 @@ impl Report {
         if let Some(snap) = &self.last_snapshot {
             let _ = write!(detail, "{}", snap.render());
         }
-        let _ = writeln!(detail, "repro: cargo run --features sim -- --simulate {} --seed {}", self.journey, self.seed);
+        let _ = writeln!(
+            detail,
+            "repro: cargo run --features sim -- --simulate {} --seed {}",
+            self.journey, self.seed
+        );
         let _ = writeln!(detail, "data dir: {}", self.run_dir.display());
         fs::write(dir.join("failure.log"), detail)?;
         fs::write(dir.join("seed.txt"), self.seed.to_string())?;
-        fs::write(dir.join("REPRO.md"), repro_command(&self.journey, self.seed))?;
+        fs::write(
+            dir.join("REPRO.md"),
+            repro_command(&self.journey, self.seed),
+        )?;
 
         // Copy the run's data files so the failure can be inspected (or replayed)
         // without needing the temp store.
@@ -166,10 +178,7 @@ impl Report {
                 for entry in entries.flatten() {
                     if let Some(fname) = entry.file_name().to_str() {
                         if fname.starts_with("snippets.json.corrupt") {
-                            copy_if_exists(
-                                &entry.path(),
-                                &dir.join(fname),
-                            )?;
+                            copy_if_exists(&entry.path(), &dir.join(fname))?;
                         }
                     }
                 }
@@ -181,7 +190,10 @@ impl Report {
 
 fn append(path: &Path, contents: &str) -> io::Result<()> {
     use std::io::Write;
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     f.write_all(contents.as_bytes())
 }
 
@@ -274,7 +286,11 @@ const CRC_TABLE: [u32; 256] = {
         let mut c = n as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xedb8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         table[n] = c;

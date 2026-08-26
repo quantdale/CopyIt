@@ -173,8 +173,8 @@ fn random_bytes<const N: usize>() -> Result<[u8; N], VaultError> {
 /// Derives the 32-byte vault key from `password` and `salt` with Argon2id
 /// (RFC 9106's moderate parameters: m = 19 MiB, t = 2, p = 1).
 pub fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN], VaultError> {
-    let params = Params::new(19 * 1024, 2, 1, None)
-        .map_err(|e| VaultError::KeyDerivation(e.to_string()))?;
+    let params =
+        Params::new(19 * 1024, 2, 1, None).map_err(|e| VaultError::KeyDerivation(e.to_string()))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = [0u8; KEY_LEN];
     argon
@@ -187,8 +187,7 @@ pub fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN], VaultErr
 /// `(nonce_base64, ciphertext_base64)`.
 pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<(String, String), VaultError> {
     let nonce_bytes = random_bytes::<NONCE_LEN>()?;
-    let cipher =
-        XChaCha20Poly1305::new(Key::<XChaCha20Poly1305>::from_slice(key));
+    let cipher = XChaCha20Poly1305::new(Key::<XChaCha20Poly1305>::from_slice(key));
     let ciphertext = cipher
         .encrypt(
             Nonce::<XChaCha20Poly1305>::from_slice(&nonce_bytes),
@@ -213,8 +212,7 @@ pub fn decrypt(
         )));
     }
     let ciphertext = decode(ciphertext_b64)?;
-    let cipher =
-        XChaCha20Poly1305::new(Key::<XChaCha20Poly1305>::from_slice(key));
+    let cipher = XChaCha20Poly1305::new(Key::<XChaCha20Poly1305>::from_slice(key));
     let plaintext = cipher
         .decrypt(
             Nonce::<XChaCha20Poly1305>::from_slice(&nonce),
@@ -318,7 +316,11 @@ mod tests {
     fn encrypt_decrypt_round_trips() {
         let key = [7u8; KEY_LEN];
         let (nonce, ciphertext) = encrypt(&key, b"hello vault").unwrap();
-        assert_ne!(ciphertext, encode(b"hello vault"), "must not be plaintext in base64");
+        assert_ne!(
+            ciphertext,
+            encode(b"hello vault"),
+            "must not be plaintext in base64"
+        );
         let plaintext = decrypt(&key, &nonce, &ciphertext).unwrap();
         assert_eq!(plaintext, b"hello vault");
     }
@@ -368,7 +370,10 @@ mod tests {
         assert_eq!(verify_password("hunter2x", &meta).unwrap(), key);
         let protection = encrypt_body(&key, "a body long enough to have a hint").unwrap();
         assert_eq!(protection.hint, "a bod");
-        assert_eq!(decrypt_body(&key, &protection).unwrap(), "a body long enough to have a hint");
+        assert_eq!(
+            decrypt_body(&key, &protection).unwrap(),
+            "a body long enough to have a hint"
+        );
     }
 
     #[test]
@@ -378,7 +383,10 @@ mod tests {
         let k2 = derive_key("pw", &[1u8; SALT_LEN]).unwrap();
         assert_eq!(k1, k1_again);
         assert_ne!(k1, k2);
-        assert_ne!(derive_key("pw", &[0u8; SALT_LEN]).unwrap(), derive_key("other", &[0u8; SALT_LEN]).unwrap());
+        assert_ne!(
+            derive_key("pw", &[0u8; SALT_LEN]).unwrap(),
+            derive_key("other", &[0u8; SALT_LEN]).unwrap()
+        );
     }
 
     #[test]
@@ -448,9 +456,18 @@ mod tests {
 
     #[test]
     fn masked_preview_follows_the_hint_rule() {
-        assert_eq!(masked_preview("ghp_x"), "ghp_x\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}");
-        assert_eq!(masked_preview(""), "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}");
-        assert!(!masked_preview("ghp_x").contains("ghp_x1"), "must never add body content");
+        assert_eq!(
+            masked_preview("ghp_x"),
+            "ghp_x\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}"
+        );
+        assert_eq!(
+            masked_preview(""),
+            "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}"
+        );
+        assert!(
+            !masked_preview("ghp_x").contains("ghp_x1"),
+            "must never add body content"
+        );
     }
 
     #[test]
@@ -462,7 +479,10 @@ mod tests {
         assert!(state.key().is_none());
 
         assert!(state.unlock("nope", &meta).is_err());
-        assert!(state.is_locked(), "wrong password must not change the state");
+        assert!(
+            state.is_locked(),
+            "wrong password must not change the state"
+        );
         assert!(state.key().is_none());
 
         assert!(state.unlock("password1", &meta).is_ok());

@@ -7,6 +7,7 @@ use crate::theme::Theme;
 use crate::vault::{self, VaultMeta, VaultState};
 use eframe::egui;
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::mpsc;
 
 /// Prefix of the banner message for a failed `snippets.json` write. Shared so a later
@@ -47,12 +48,7 @@ impl Derived {
             s.body.to_lowercase()
         };
         let preview = if protected {
-            vault::masked_preview(
-                s.protection
-                    .as_ref()
-                    .map(|p| p.hint.as_str())
-                    .unwrap_or(""),
-            )
+            vault::masked_preview(s.protection.as_ref().map(|p| p.hint.as_str()).unwrap_or(""))
         } else {
             preview_text(&s.body, PREVIEW_CHARS)
         };
@@ -118,16 +114,16 @@ pub struct CopyIt {
     adding_header_category: bool, // True when the user is typing a new category in the top bar
     new_header_category: String, // Input buffer for the new category name in the top bar
     category_error: Option<String>, // Validation error for the new category (e.g., "All" is reserved)
-    save_error: Vec<String>,     // File I/O error messages to display at the top
+    save_error: Vec<String>,        // File I/O error messages to display at the top
     vault: VaultState,              // Session lock state; starts locked on every launch
-    vault_meta: Option<VaultMeta>,  // KDF salt + canary loaded from config.json; None until first protect
+    vault_meta: Option<VaultMeta>, // KDF salt + canary loaded from config.json; None until first protect
     vault_prompt: Option<VaultPrompt>, // Unlock / create-vault modal; None when closed
-    any_protected: bool,              // Cached from rebuild_derived; used in UI vault indicator
+    any_protected: bool,           // Cached from rebuild_derived; used in UI vault indicator
     #[allow(dead_code)]
     vault_work: Option<mpsc::Receiver<Result<[u8; 32], crate::vault::VaultError>>>, // For async KDF
-    theme_raw: Option<String>,         // Preserves original theme string when parse fails
-    #[allow(dead_code)]
-    refuse_overwrite: bool,            // Set true when backup_corrupt failed at startup
+    theme_raw: Option<String>,     // Preserves original theme string when parse fails
+    refuse_snippets_overwrite: bool, // Set when a corrupt snippets file could not be backed up
+    refuse_config_overwrite: bool, // Set when a corrupt config file could not be backed up
     _instance_lock: Option<std::fs::File>, // Holds the file lock handle for single-instance
 }
 
@@ -249,17 +245,36 @@ fn describe_corrupt_file(path: &std::path::Path, filename: &str, error: &str) ->
     }
 }
 
+/// Returns the error used when a corrupt data file could not be moved aside. Keeping the
+/// original bytes in place is safer than letting a later automatic save replace the only
+/// remaining copy of the user's data.
+fn refuse_overwrite_error(filename: &str) -> std::io::Error {
+    std::io::Error::other(format!(
+        "{filename} is corrupt and could not be backed up; copy it elsewhere before making changes"
+    ))
+}
+
 impl CopyIt {
     /// Creates a new CopyIt instance on app launch: opens the real store, runs
     /// the one-time legacy migration, then constructs the app via
     /// [`Self::from_store`].
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let store = Store::open();
-        store.migrate_legacy();
+        let (store, init_error) = Store::open_initialized();
+        let migration = store.migrate_legacy();
         let mut app = Self::from_store(store, &cc.egui_ctx);
-        let lock_path = app.store.snippets_path.parent().unwrap().join(".copyit.lock");
+        app.note_startup_problems(init_error.as_ref(), &migration);
+        let lock_path = app
+            .store
+            .snippets_path
+            .parent()
+            .unwrap()
+            .join(".copyit.lock");
         #[allow(clippy::suspicious_open_options)] // lock file: no truncate needed
-        match std::fs::OpenOptions::new().write(true).create(true).open(&lock_path) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+        {
             Ok(file) => {
                 if file.try_lock().is_err() {
                     eprintln!("CopyIt is already running (another instance holds the lock).");
@@ -292,14 +307,14 @@ impl CopyIt {
         // `seeded` is true only when writing the defaults over the file is safe — the
         // file was missing, or its corrupt copy was successfully moved aside. If the
         // backup rename fails, the corrupt file stays on disk untouched.
-        let (mut snippets, seeded) = match store.load_snippets() {
-            storage::Load::Loaded(snippets) => (snippets, false),
-            storage::Load::Missing => (crate::seed::defaults(), true),
+        let (mut snippets, seeded, refuse_snippets_overwrite) = match store.load_snippets() {
+            storage::Load::Loaded(snippets) => (snippets, false, false),
+            storage::Load::Missing => (crate::seed::defaults(), true, false),
             storage::Load::Corrupt(e) => {
                 let (note, backed_up) =
                     describe_corrupt_file(&store.snippets_path, "snippets.json", &e);
                 save_error.push(note);
-                (crate::seed::defaults(), backed_up)
+                (crate::seed::defaults(), backed_up, !backed_up)
             }
         };
         for s in &mut snippets {
@@ -317,19 +332,19 @@ impl CopyIt {
         // loaded categories were, verbatim, so a save happens only when the canonical
         // config actually differs from what's on disk.
         let mut loaded_categories: Option<Vec<String>> = None;
-        let (mut config, config_write_ok) = match store.load_config() {
+        let (mut config, config_write_ok, refuse_config_overwrite) = match store.load_config() {
             storage::Load::Loaded(config) => {
                 loaded_categories = Some(config.categories.clone());
-                (config, false)
+                (config, false, false)
             }
-            storage::Load::Missing => (Config::from_snippets(&snippets), true),
+            storage::Load::Missing => (Config::from_snippets(&snippets), true, false),
             storage::Load::Corrupt(e) => {
                 let (note, backed_up) =
                     describe_corrupt_file(&store.config_path, "config.json", &e);
                 // When both data files are corrupt, surface both notices: the config
                 // was moved aside too, and the user needs to know where it went.
                 save_error.push(note);
-                (Config::from_snippets(&snippets), backed_up)
+                (Config::from_snippets(&snippets), backed_up, !backed_up)
             }
         };
         // Hand-edited or pre-fix config can carry non-canonical category names ("all",
@@ -343,7 +358,8 @@ impl CopyIt {
         // canonical config differs from what was loaded. Writing a freshly derived
         // config over a corrupt original that couldn't be backed up would destroy the
         // only copy of the user's settings.
-        let config_changed = matches!(&loaded_categories, Some(loaded) if *loaded != config.categories);
+        let config_changed =
+            matches!(&loaded_categories, Some(loaded) if *loaded != config.categories);
         if config_write_ok || config_changed {
             if let Err(e) = store.save_config(&config) {
                 save_error.push(format!("{CONFIG_SAVE_ERROR}: {e}"));
@@ -353,7 +369,11 @@ impl CopyIt {
         // After loading snippets, sweep any stale temp files from a previous crashed write.
         storage::sweep_stale_tmp(store.snippets_path.parent().unwrap());
 
-        let theme_raw = if config.theme.is_empty() { None } else { Some(config.theme.clone()) };
+        let theme_raw = if config.theme.is_empty() {
+            None
+        } else {
+            Some(config.theme.clone())
+        };
         let theme = config.theme.parse::<Theme>().unwrap_or(Theme::Dark);
         ctx.set_visuals(theme.visuals());
 
@@ -398,8 +418,41 @@ impl CopyIt {
             any_protected,
             vault_work: None,
             theme_raw,
-            refuse_overwrite: !config_write_ok,
+            refuse_snippets_overwrite,
+            refuse_config_overwrite,
             _instance_lock: None,
+        }
+    }
+
+    /// Records startup-level storage problems in the warning banner: failure to
+    /// create the stable data directory, and legacy files that exist but could
+    /// not be migrated. Without this, a failed migration would look exactly like
+    /// a clean first launch while the user's real library sits unmigrated.
+    /// Called only from `new` — the simulation harness never touches real paths.
+    fn note_startup_problems(
+        &mut self,
+        init_error: Option<&std::io::Error>,
+        migration: &crate::store::LegacyMigration,
+    ) {
+        if let Some(e) = init_error {
+            let dir = self.store.snippets_path.parent().unwrap_or(Path::new("."));
+            self.save_error.push(format!(
+                "Couldn't create the data folder {}: {e}. Settings and snippets can't be saved.",
+                dir.display()
+            ));
+        }
+        for (filename, outcome) in [
+            ("snippets.json", &migration.snippets),
+            ("config.json", &migration.config),
+        ] {
+            if let crate::store::MigrationOutcome::Blocked { source, reason } = outcome {
+                self.save_error.push(format!(
+                    "A previous {filename} was found at {} but couldn't be brought into the \
+                     data folder ({reason}). It was left untouched — copy it into the data \
+                     folder manually, then restart CopyIt.",
+                    source.display()
+                ));
+            }
         }
     }
 
@@ -477,18 +530,30 @@ impl CopyIt {
     }
 
     /// Persists the full snippet library to snippets.json in the stable data directory.
-    /// Updates save_error if an I/O error occurs; the error is shown in the top bar.
+    /// Updates save_error (deduplicated) if an I/O error occurs; shown in the top bar.
     fn save_snippets(&mut self) {
+        if self.refuse_snippets_overwrite {
+            let e = refuse_overwrite_error("snippets.json");
+            self.push_save_error_once(format!("{SNIPPETS_SAVE_ERROR}: {e}"));
+            return;
+        }
         match self.store.save_snippets(&self.snippets) {
             Ok(()) => self.clear_save_error(SNIPPETS_SAVE_ERROR),
-            Err(e) => self.save_error.push(format!("{SNIPPETS_SAVE_ERROR}: {e}")),
+            Err(e) => self.push_save_error_once(format!("{SNIPPETS_SAVE_ERROR}: {e}")),
         }
     }
 
     /// Persists the config (categories and theme selection) to config.json.
     /// Separated from snippets.json so snippet data stays backward-compatible.
-    /// Returns an error if the write fails; the caller decides how to surface it.
+    /// Returns an error for callers that need it (e.g. vault creation rolls back);
+    /// every failure — refusal or I/O — is already surfaced in the warning banner,
+    /// so flows with no extra handling must not and cannot discard it silently.
     fn save_config(&mut self) -> std::io::Result<()> {
+        if self.refuse_config_overwrite {
+            let e = refuse_overwrite_error("config.json");
+            self.push_save_error_once(format!("{CONFIG_SAVE_ERROR}: {e}"));
+            return Err(e);
+        }
         if self.vault_meta.is_none() {
             if let storage::Load::Loaded(disk_config) = self.store.load_config() {
                 if disk_config.vault.is_some() {
@@ -497,7 +562,11 @@ impl CopyIt {
             }
         }
         let theme_str = if let Some(ref raw) = self.theme_raw {
-            if raw.parse::<Theme>().is_err() { raw.clone() } else { self.theme.to_string() }
+            if raw.parse::<Theme>().is_err() {
+                raw.clone()
+            } else {
+                self.theme.to_string()
+            }
         } else {
             self.theme.to_string()
         };
@@ -506,9 +575,33 @@ impl CopyIt {
             theme: theme_str,
             vault: self.vault_meta.clone(),
         };
-        self.store.save_config(&config)?;
-        self.clear_save_error(CONFIG_SAVE_ERROR);
-        Ok(())
+        match self.store.save_config(&config) {
+            Ok(()) => {
+                self.clear_save_error(CONFIG_SAVE_ERROR);
+                Ok(())
+            }
+            Err(e) => {
+                self.push_save_error_once(format!("{CONFIG_SAVE_ERROR}: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    /// Persists the config on behalf of flows that have no extra handling to perform
+    /// on failure (theme selection, category registration). `save_config` already
+    /// surfaces every failure in the deduplicated warning banner, so there is
+    /// deliberately no result here to ignore or mishandle.
+    fn persist_config(&mut self) {
+        let _reported_in_banner = self.save_config();
+    }
+
+    /// Appends `message` to the warning banner unless an identical entry is already
+    /// shown. Repeated failures (every refused save re-raises its error) must not
+    /// grow duplicate copies of the same message across frames or actions.
+    fn push_save_error_once(&mut self, message: String) {
+        if !self.save_error.iter().any(|e| *e == message) {
+            self.save_error.push(message);
+        }
     }
 
     /// Retires the warning banner only when it is reporting a failure of the kind that
@@ -543,7 +636,9 @@ impl CopyIt {
         }
         self.categories.push(cat.clone());
         self.categories.sort();
-        let _ = self.save_config();
+        // A failed write is surfaced (deduplicated) by save_config itself; the
+        // category stays registered in memory so the user can keep working.
+        self.persist_config();
         cat
     }
 
@@ -575,13 +670,16 @@ impl CopyIt {
                 Some(key) => match vault::encrypt_body(key, &ed.body) {
                     Ok(p) => Some(p),
                     Err(e) => {
-                        self.save_error.push(format!("Couldn't protect a snippet: the vault failed ({e})"));
+                        self.save_error.push(format!(
+                            "Couldn't protect a snippet: the vault failed ({e})"
+                        ));
                         self.editor = Some(ed);
                         return;
                     }
                 },
                 None => {
-                    self.save_error.push("Couldn't protect a snippet: the vault isn't unlocked".to_string());
+                    self.save_error
+                        .push("Couldn't protect a snippet: the vault isn't unlocked".to_string());
                     self.editor = Some(ed);
                     return;
                 }
@@ -606,7 +704,9 @@ impl CopyIt {
                     s.body = std::mem::take(&mut ed.body);
                 }
             } else {
-                self.save_error.push(format!("Snippet with id {id} not found; it may have been deleted"));
+                self.save_error.push(format!(
+                    "Snippet with id {id} not found; it may have been deleted"
+                ));
             }
         } else {
             // The cursor is always a free id (it mirrors the library's max, or a scanned
@@ -646,8 +746,7 @@ impl CopyIt {
             // anything is written. The editor rides along in the pending action.
             self.vault_prompt = Some(VaultPrompt::create_for(PendingVaultAction::ProtectSave(ed)));
         } else if self.vault.is_locked() {
-            self.vault_prompt =
-                Some(VaultPrompt::unlock_for(PendingVaultAction::ProtectSave(ed)));
+            self.vault_prompt = Some(VaultPrompt::unlock_for(PendingVaultAction::ProtectSave(ed)));
         } else {
             self.apply_save(ed);
         }
@@ -664,7 +763,8 @@ impl CopyIt {
             None => s.body.clone(),
             Some(p) => {
                 let Some(key) = self.vault.key() else {
-                    self.save_error.push("Couldn't copy: the vault is locked, unlock it first".to_string());
+                    self.save_error
+                        .push("Couldn't copy: the vault is locked, unlock it first".to_string());
                     return;
                 };
                 match vault::decrypt_body(key, p) {
@@ -698,7 +798,8 @@ impl CopyIt {
             None => Editor::from_snippet(s, &self.categories),
             Some(p) => {
                 let Some(key) = self.vault.key() else {
-                    self.save_error.push("Couldn't edit: the vault is locked, unlock it first".to_string());
+                    self.save_error
+                        .push("Couldn't edit: the vault is locked, unlock it first".to_string());
                     return;
                 };
                 match vault::decrypt_body(key, p) {
@@ -754,7 +855,12 @@ impl CopyIt {
     }
 
     /// Runs the action suspended behind a vault prompt once the vault is available.
-    fn run_pending_vault_action(&mut self, pending: PendingVaultAction, ctx: &egui::Context, now: f64) {
+    fn run_pending_vault_action(
+        &mut self,
+        pending: PendingVaultAction,
+        ctx: &egui::Context,
+        now: f64,
+    ) {
         match pending {
             PendingVaultAction::Copy(id) => self.copy_snippet(id, ctx, now),
             PendingVaultAction::Edit(id) => self.edit_snippet(id),
@@ -795,7 +901,10 @@ impl CopyIt {
                     return Some(prompt);
                 }
                 if prompt.password.len() < vault::MIN_VAULT_PASSWORD_LEN {
-                    prompt.error = Some(format!("Password must be at least {} characters", vault::MIN_VAULT_PASSWORD_LEN));
+                    prompt.error = Some(format!(
+                        "Password must be at least {} characters",
+                        vault::MIN_VAULT_PASSWORD_LEN
+                    ));
                     return Some(prompt);
                 }
                 if prompt.password != prompt.confirm {
@@ -832,7 +941,9 @@ impl CopyIt {
                     }
                     Err(e) => {
                         let msg = match &e {
-                            vault::VaultError::Encoding(_) => "Vault data is corrupt — cannot unlock".to_string(),
+                            vault::VaultError::Encoding(_) => {
+                                "Vault data is corrupt — cannot unlock".to_string()
+                            }
                             _ => "Wrong password. Try again.".to_string(),
                         };
                         prompt.error = Some(msg);
@@ -973,11 +1084,8 @@ impl CopyIt {
                                 .copied
                                 .is_some_and(|(cid, t)| cid == s.id && now - t < 1.2);
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let resp = ui.button(if recently {
-                                    "\u{2714} Copied"
-                                } else {
-                                    "Copy"
-                                });
+                                let resp =
+                                    ui.button(if recently { "\u{2714} Copied" } else { "Copy" });
                                 if resp.clicked() {
                                     actions.push(Action::Copy(s.id));
                                 }
@@ -1313,7 +1421,9 @@ impl CopyIt {
                     // The top bar above has already been painted with the old visuals, so
                     // ask for one more frame to redraw everything with the new ones.
                     ctx.request_repaint();
-                    let _ = self.save_config();
+                    // A failed write is surfaced (deduplicated) by save_config itself;
+                    // the theme stays active in memory but is reported as not persisted.
+                    self.persist_config();
                 }
 
                 // Vault state, shown only when at least one snippet is protected. The
@@ -1324,10 +1434,13 @@ impl CopyIt {
                     match &self.vault {
                         VaultState::Locked => {
                             // H-07: Make "Vault locked" clickable to open unlock prompt
-                            if ui.button(
-                                egui::RichText::new("Vault locked")
-                                    .color(egui::Color32::from_rgb(0xef, 0x44, 0x44)),
-                            ).clicked() {
+                            if ui
+                                .button(
+                                    egui::RichText::new("Vault locked")
+                                        .color(egui::Color32::from_rgb(0xef, 0x44, 0x44)),
+                                )
+                                .clicked()
+                            {
                                 self.vault_prompt = Some(VaultPrompt::unlock_with_no_pending());
                             }
                         }
@@ -1375,6 +1488,37 @@ impl CopyIt {
                     self.save_error.clear();
                 }
             }
+            // Recovery mode: a corrupt file whose backup rename failed is write-protected
+            // for the rest of the session. This notice is deliberately not dismissable —
+            // saves for that file are being refused, so hiding it would present a
+            // successful-save experience that isn't real.
+            if self.refuse_snippets_overwrite || self.refuse_config_overwrite {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    let mut msg = String::from("\u{26D4} Recovery mode:");
+                    if self.refuse_snippets_overwrite {
+                        msg.push_str(
+                            " snippets.json couldn't be backed up while corrupt, so it was left \
+                             untouched — the cards below are a fallback library and changes to \
+                             them are NOT saved.",
+                        );
+                    }
+                    if self.refuse_config_overwrite {
+                        if self.refuse_snippets_overwrite {
+                            msg.push_str(" Also:");
+                        }
+                        msg.push_str(
+                            " config.json couldn't be backed up while corrupt, so it was left \
+                             untouched — theme/category/vault changes will revert on restart.",
+                        );
+                    }
+                    msg.push_str(
+                        " Copy the file elsewhere, fix or remove it, then restart CopyIt.",
+                    );
+                    ui.colored_label(WARNING_COLOR, msg);
+                });
+            }
             ui.add_space(6.0);
         });
 
@@ -1393,10 +1537,20 @@ impl CopyIt {
                 self.drag = None;
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| {
-                    if self.snippets.is_empty() && self.search.is_empty() && self.category_filter == "All" {
-                        ui.label(egui::RichText::new("Your library is empty. Click \"+ New\" to add your first snippet.").weak());
+                    if self.snippets.is_empty()
+                        && self.search.is_empty()
+                        && self.category_filter == "All"
+                    {
+                        ui.label(
+                            egui::RichText::new(
+                                "Your library is empty. Click \"+ New\" to add your first snippet.",
+                            )
+                            .weak(),
+                        );
                     } else {
-                        ui.label(egui::RichText::new("No snippets match your search or filter.").weak());
+                        ui.label(
+                            egui::RichText::new("No snippets match your search or filter.").weak(),
+                        );
                     }
                 });
                 return;
@@ -1445,7 +1599,10 @@ impl CopyIt {
             let cols = scroll_output.inner.0;
 
             // C2-01: Cancel drag if pointer is lost (e.g., window lost focus, Alt-Tab)
-            if self.drag.is_some() && !ctx.input(|i| i.pointer.any_down()) && ctx.input(|i| i.pointer.interact_pos().is_none()) {
+            if self.drag.is_some()
+                && !ctx.input(|i| i.pointer.any_down())
+                && ctx.input(|i| i.pointer.interact_pos().is_none())
+            {
                 self.drag = None;
             }
 
@@ -1571,7 +1728,11 @@ impl CopyIt {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label("Title");
-                            ui.add(egui::TextEdit::singleline(&mut ed.title).desired_width(280.0).char_limit(200));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut ed.title)
+                                    .desired_width(280.0)
+                                    .char_limit(200),
+                            );
                         });
 
                         ui.add_space(12.0);
@@ -1611,7 +1772,8 @@ impl CopyIt {
                                         .hint_text("New category")
                                         .desired_width(120.0),
                                 );
-                                let enter_pressed = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                let enter_pressed = input.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
                                 if (ui.button("Add").clicked() || enter_pressed)
                                     && !ed.new_category.trim().is_empty()
                                 {
@@ -1746,7 +1908,8 @@ impl CopyIt {
                                 .password(true)
                                 .desired_width(220.0),
                         );
-                        let enter_pressed = password_input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let enter_pressed = password_input.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         if enter_pressed {
                             submit = true;
                         }
@@ -1759,7 +1922,8 @@ impl CopyIt {
                                     .password(true)
                                     .desired_width(220.0),
                             );
-                            let enter_pressed = confirm_input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            let enter_pressed = confirm_input.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
                             if enter_pressed {
                                 submit = true;
                             }
@@ -1816,7 +1980,10 @@ fn sanitize_categories(categories: &[String]) -> Vec<String> {
         if storage::is_reserved_category(&cat) {
             continue;
         }
-        if out.iter().any(|existing| storage::same_category(existing, &cat)) {
+        if out
+            .iter()
+            .any(|existing| storage::same_category(existing, &cat))
+        {
             continue;
         }
         out.push(cat);
@@ -1948,11 +2115,11 @@ fn protected_chip(ui: &mut egui::Ui) {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
-    use crate::model::Protection;
     use crate::grid::{
         gap_point, grid_card_rect, nearest_gap, visible_rows, CARD_H, CARD_SPACING, CARD_W,
         GRID_TOP_SPACE, ROW_PITCH,
     };
+    use crate::model::Protection;
 
     /// Builds an app whose data files live in a throwaway temp directory, so tests that
     /// exercise the auto-save paths never write into the repository or clobber real user data.
@@ -1964,7 +2131,9 @@ mod layout_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp data dir");
         let store = Store::at(dir.clone());
-        store.save_snippets(&snippets).expect("seed fixture snippets");
+        store
+            .save_snippets(&snippets)
+            .expect("seed fixture snippets");
         store
             .save_config(&Config {
                 categories,
@@ -2854,7 +3023,11 @@ mod layout_tests {
         uniq.sort_unstable();
         uniq.dedup();
         assert_eq!(uniq.len(), lib.len(), "every id must stay unique");
-        assert_eq!(uniq, vec![1, 2, 3, 4], "duplicates get fresh ids from the sequence");
+        assert_eq!(
+            uniq,
+            vec![1, 2, 3, 4],
+            "duplicates get fresh ids from the sequence"
+        );
     }
 
     #[test]
@@ -2969,7 +3142,10 @@ mod layout_tests {
         // A blank name is rejected too, with its own message.
         let ed = app.apply_add_category("   ".into(), ed);
         assert!(ed.adding_category);
-        assert_eq!(ed.category_error.as_deref(), Some("Category can't be blank"));
+        assert_eq!(
+            ed.category_error.as_deref(),
+            Some("Category can't be blank")
+        );
     }
 
     #[test]
@@ -3235,10 +3411,13 @@ mod layout_tests {
             vec!["Git".into()],
         );
 
-        app.save_error.push(format!("{SNIPPETS_SAVE_ERROR}: disk full"));
+        app.save_error
+            .push(format!("{SNIPPETS_SAVE_ERROR}: disk full"));
         let _ = app.save_config();
         assert!(
-            app.save_error.iter().any(|e| e == "Couldn't save snippets: disk full"),
+            app.save_error
+                .iter()
+                .any(|e| e == "Couldn't save snippets: disk full"),
             "a config write must not hide a snippet-save failure"
         );
 
@@ -3249,10 +3428,301 @@ mod layout_tests {
         );
 
         // Startup notices about recovered data files survive until dismissed.
-        app.save_error.push("snippets.json couldn't be read".to_string());
+        app.save_error
+            .push("snippets.json couldn't be read".to_string());
         app.save_snippets();
         let _ = app.save_config();
         assert!(!app.save_error.is_empty());
+    }
+
+    /// If startup could not move a corrupt file aside, later automatic saves must not
+    /// replace the only remaining copy with in-memory defaults or edited state. The flags
+    /// model the result of that failed backup; normal loaded files leave them false.
+    #[test]
+    fn failed_corrupt_backup_blocks_later_automatic_overwrites() {
+        let mut app = test_app(
+            "refuse-corrupt-overwrite",
+            vec![snippet(1, "Git")],
+            vec!["Git".into()],
+        );
+        assert!(!app.refuse_snippets_overwrite);
+        assert!(!app.refuse_config_overwrite);
+
+        let corrupt_snippets = "preserve this snippets recovery copy";
+        let corrupt_config = "preserve this config recovery copy";
+        std::fs::write(&app.store.snippets_path, corrupt_snippets).unwrap();
+        std::fs::write(&app.store.config_path, corrupt_config).unwrap();
+
+        // Simulate from_store observing a corrupt file whose backup rename failed.
+        app.refuse_snippets_overwrite = true;
+        app.refuse_config_overwrite = true;
+        app.save_snippets();
+        let config_error = app.save_config().expect_err("config save must be refused");
+
+        assert!(config_error.to_string().contains("could not be backed up"));
+        assert_eq!(
+            std::fs::read_to_string(&app.store.snippets_path).unwrap(),
+            corrupt_snippets,
+            "a snippet save must preserve the corrupt recovery copy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&app.store.config_path).unwrap(),
+            corrupt_config,
+            "a config save must preserve the corrupt recovery copy"
+        );
+        assert!(app
+            .save_error
+            .iter()
+            .any(|message| message.contains("snippets.json is corrupt")));
+        assert!(app
+            .save_error
+            .iter()
+            .any(|message| message.contains("config.json is corrupt")));
+    }
+
+    /// Every class of library mutation (add/edit/delete/reorder) must refuse to touch a
+    /// corrupt snippets.json whose backup rename failed at startup.
+    #[test]
+    fn blocked_snippets_file_survives_every_mutation_class() {
+        let mut app = test_app(
+            "refuse-every-mutation",
+            vec![snippet(1, "Git"), snippet(2, "Git")],
+            vec!["Git".into()],
+        );
+        let original = "original corrupt bytes";
+        std::fs::write(&app.store.snippets_path, original).unwrap();
+        app.refuse_snippets_overwrite = true;
+        let snippets_path = app.store.snippets_path.clone();
+        let preserved = || {
+            assert_eq!(
+                std::fs::read_to_string(&snippets_path).unwrap(),
+                original,
+                "the corrupt recovery copy must stay byte-for-byte intact"
+            );
+        };
+
+        // Add: a fresh snippet goes through apply_save like the editor does.
+        let mut added = Editor::blank(&app.categories);
+        added.title = "Added while blocked".into();
+        app.apply_save(added);
+        assert_eq!(app.snippets.len(), 3, "mutation applies in memory");
+        preserved();
+
+        // Edit: change an existing snippet through the same path.
+        let mut edited = Editor::from_snippet(&app.snippets[0], &app.categories);
+        edited.title = "Edited while blocked".into();
+        app.apply_save(edited);
+        preserved();
+
+        // Delete.
+        app.snippets.retain(|s| s.id != 2);
+        app.snippets_changed();
+        preserved();
+
+        // Reorder.
+        let order: Vec<usize> = (0..app.snippets.len()).collect();
+        app.reorder(app.snippets[order[0]].id, order.len() - 1, &order);
+        preserved();
+
+        // The refusal error keeps re-surfacing on every refused save.
+        assert!(app
+            .save_error
+            .iter()
+            .any(|message| message.contains("snippets.json is corrupt")));
+    }
+
+    /// Theme/category/vault operations must not replace a corrupt config.json whose
+    /// backup rename failed at startup.
+    #[test]
+    fn blocked_config_file_survives_settings_changes() {
+        let mut app = test_app(
+            "refuse-config-changes",
+            vec![snippet(1, "Git")],
+            vec!["Git".into()],
+        );
+        let original = "original config recovery bytes";
+        std::fs::write(&app.store.config_path, original).unwrap();
+        app.refuse_config_overwrite = true;
+
+        // Theme selection: the same persistence call the selector makes on change.
+        app.theme_raw = None;
+        let _ = app.save_config();
+        assert_eq!(
+            std::fs::read_to_string(&app.store.config_path).unwrap(),
+            original,
+            "a theme change must preserve the corrupt config"
+        );
+
+        // Category creation.
+        let canonical = app.add_category("prompt");
+        assert_eq!(canonical, "Prompt", "category registers in memory");
+        assert!(app.categories.contains(&"Prompt".to_string()));
+        assert_eq!(
+            std::fs::read_to_string(&app.store.config_path).unwrap(),
+            original,
+            "a category change must preserve the corrupt config"
+        );
+        assert!(app
+            .save_error
+            .iter()
+            .any(|message| message.contains("config.json is corrupt")));
+    }
+
+    /// With both files blocked simultaneously, neither file's protection may be
+    /// lifted or hidden by the other file's save outcomes.
+    #[test]
+    fn both_files_blocked_stay_independently_blocked() {
+        let mut app = test_app(
+            "refuse-both-files",
+            vec![snippet(1, "Git")],
+            vec!["Git".into()],
+        );
+        let corrupt_snippets = "snippets recovery copy";
+        let corrupt_config = "config recovery copy";
+        std::fs::write(&app.store.snippets_path, corrupt_snippets).unwrap();
+        std::fs::write(&app.store.config_path, corrupt_config).unwrap();
+        app.refuse_snippets_overwrite = true;
+        app.refuse_config_overwrite = true;
+
+        app.save_snippets();
+        let _ = app.save_config();
+        assert!(app.refuse_snippets_overwrite && app.refuse_config_overwrite);
+        assert!(app
+            .save_error
+            .iter()
+            .any(|m| m.contains("snippets.json is corrupt")));
+        assert!(app
+            .save_error
+            .iter()
+            .any(|m| m.contains("config.json is corrupt")));
+        assert_eq!(
+            std::fs::read_to_string(&app.store.snippets_path).unwrap(),
+            corrupt_snippets
+        );
+        assert_eq!(
+            std::fs::read_to_string(&app.store.config_path).unwrap(),
+            corrupt_config
+        );
+    }
+
+    /// A failed settings write must produce a visible warning (the in-memory change
+    /// stays active but is not durable), never a silent discard.
+    #[test]
+    fn config_save_failures_are_surfaced_not_swallowed() {
+        let mut app = test_app(
+            "config-failure-visible",
+            vec![snippet(1, "Git")],
+            vec!["Git".into()],
+        );
+        app.refuse_config_overwrite = true;
+
+        // Theme selection keeps the new look in memory but reports non-persistence.
+        app.theme_raw = None;
+        app.persist_config();
+        assert!(app
+            .save_error
+            .iter()
+            .any(|m| m.starts_with(CONFIG_SAVE_ERROR)),
+            "a failed theme write must be surfaced");
+
+        // Category registration behaves the same.
+        let canonical = app.add_category("prompt");
+        assert_eq!(canonical, "Prompt");
+        assert!(app
+            .save_error
+            .iter()
+            .any(|m| m.starts_with(CONFIG_SAVE_ERROR)));
+    }
+
+    /// Repeated failures must not grow duplicate copies of the same warning in the
+    /// banner: every refused save re-raises its error, but identical text is deduped.
+    #[test]
+    fn repeated_save_failures_dont_duplicate_banner_entries() {
+        let mut app = test_app(
+            "banner-dedup",
+            vec![snippet(1, "Git")],
+            vec!["Git".into()],
+        );
+        app.refuse_snippets_overwrite = true;
+        app.refuse_config_overwrite = true;
+
+        for _ in 0..3 {
+            app.save_snippets();
+            app.persist_config();
+        }
+        let snippets_errors = app
+            .save_error
+            .iter()
+            .filter(|m| m.contains("snippets.json is corrupt"))
+            .count();
+        let config_errors = app
+            .save_error
+            .iter()
+            .filter(|m| m.contains("config.json is corrupt"))
+            .count();
+        assert_eq!(snippets_errors, 1, "snippets refusal shown once, got {snippets_errors}");
+        assert_eq!(config_errors, 1, "config refusal shown once, got {config_errors}");
+    }
+
+    /// A later successful save retires only its own class of error: a successful
+    /// config write must not clear snippet-save errors or recovery notices.
+    #[test]
+    fn successful_config_save_retires_only_its_own_error() {
+        let mut app = test_app(
+            "retire-config-only",
+            vec![snippet(1, "Git")],
+            vec!["Git".into()],
+        );
+        app.save_error.push(format!("{CONFIG_SAVE_ERROR}: disk full"));
+        app.save_error.push(format!("{SNIPPETS_SAVE_ERROR}: disk full"));
+        app.save_error
+            .push("snippets.json couldn't be read (recovered)".to_string());
+
+        app.persist_config();
+        assert!(!app
+            .save_error
+            .iter()
+            .any(|m| m.starts_with(CONFIG_SAVE_ERROR)));
+        assert!(app
+            .save_error
+            .iter()
+            .any(|m| m.starts_with(SNIPPETS_SAVE_ERROR)));
+        assert!(app
+            .save_error
+            .iter()
+            .any(|m| m.contains("couldn't be read")));
+    }
+
+    /// A known failed legacy migration must be reported at startup instead of
+    /// masquerading as a clean first launch; a clean migration stays silent.
+    #[test]
+    fn failed_migration_is_reported_not_hidden() {
+        let mut app = test_app("migration-report", vec![], vec![]);
+        assert!(app.save_error.is_empty());
+
+        let blocked = crate::store::LegacyMigration {
+            snippets: crate::store::MigrationOutcome::Blocked {
+                source: std::path::PathBuf::from("legacy").join("snippets.json"),
+                reason: "access is denied".into(),
+            },
+            config: crate::store::MigrationOutcome::NoSource,
+        };
+        app.note_startup_problems(None, &blocked);
+        assert_eq!(app.save_error.len(), 1, "clean outcomes stay silent");
+        assert!(app.save_error[0].contains("snippets.json"));
+        assert!(app.save_error[0].contains("left untouched"));
+
+        // A data-directory initialization failure names the target folder.
+        let init_error = std::io::Error::other("the parameter is incorrect");
+        let clean = crate::store::LegacyMigration {
+            snippets: crate::store::MigrationOutcome::NoSource,
+            config: crate::store::MigrationOutcome::NoSource,
+        };
+        app.note_startup_problems(Some(&init_error), &clean);
+        assert!(app
+            .save_error
+            .iter()
+            .any(|m| m.contains("Couldn't create the data folder") && m.contains("snippets")));
     }
 
     /// Saves must be crash-safe: a failed write leaves the previous file intact.
@@ -3447,7 +3917,11 @@ mod layout_tests {
 
         // The hint is cleartext metadata, not searchable text.
         app.search = "ghp_x".into();
-        assert_eq!(app.take_filtered(), Vec::<usize>::new(), "hint must never enter search");
+        assert_eq!(
+            app.take_filtered(),
+            Vec::<usize>::new(),
+            "hint must never enter search"
+        );
         app.restore_filtered(Vec::new());
         // Title and category stay searchable.
         app.search = "AWS".into();
@@ -3462,7 +3936,10 @@ mod layout_tests {
     fn masked_preview_follows_the_hint_rule_for_protected_cards() {
         let app = test_app(
             "masked-preview",
-            vec![protected_snippet(1, "Git", "ghp_x"), protected_snippet(2, "Git", "")],
+            vec![
+                protected_snippet(1, "Git", "ghp_x"),
+                protected_snippet(2, "Git", ""),
+            ],
             vec!["Git".into()],
         );
         assert_eq!(
@@ -3521,7 +3998,10 @@ mod layout_tests {
             app.vault_prompt.as_ref().unwrap().pending,
             Some(PendingVaultAction::Edit(1))
         ));
-        assert!(app.editor.is_none(), "the editor must not open while locked");
+        assert!(
+            app.editor.is_none(),
+            "the editor must not open while locked"
+        );
     }
 
     #[test]
@@ -3621,7 +4101,10 @@ mod layout_tests {
         assert_eq!(app.derived[0].preview, vault::masked_preview("a sec"));
         // On disk: ciphertext only, no plaintext.
         let raw = std::fs::read_to_string(&app.store.snippets_path).unwrap();
-        assert!(!raw.contains("a secret body long enough"), "secret on disk: {raw}");
+        assert!(
+            !raw.contains("a secret body long enough"),
+            "secret on disk: {raw}"
+        );
         assert!(raw.contains("ciphertext"));
         // Round-trips through the store.
         match storage::load(&app.store.snippets_path) {
@@ -3638,7 +4121,10 @@ mod layout_tests {
         let (mut app, _, key) = protected_test_app("unprotect", "a secret body long enough");
         app.vault.unlock_with_key(key);
         let mut ed = Editor::from_snippet(&app.snippets[0], &app.categories);
-        assert!(ed.protect, "the checkbox starts checked on a protected card");
+        assert!(
+            ed.protect,
+            "the checkbox starts checked on a protected card"
+        );
         ed.protect = false;
         ed.body = "now plaintext".into();
         app.apply_save(ed);
@@ -3668,8 +4154,14 @@ mod layout_tests {
         app.handle_editor_save(ed);
         let prompt = app.vault_prompt.take().expect("create prompt opens");
         assert!(matches!(prompt.mode, VaultPromptMode::Create));
-        assert!(matches!(prompt.pending, Some(PendingVaultAction::ProtectSave(_))));
-        assert!(app.snippets.is_empty(), "nothing saved before the vault exists");
+        assert!(matches!(
+            prompt.pending,
+            Some(PendingVaultAction::ProtectSave(_))
+        ));
+        assert!(
+            app.snippets.is_empty(),
+            "nothing saved before the vault exists"
+        );
 
         // Password too short: inline error, no vault, nothing persisted.
         let mut prompt = prompt;
@@ -3679,7 +4171,11 @@ mod layout_tests {
         let kept = app
             .handle_vault_prompt(prompt, &ctx, 0.0)
             .expect("a short password keeps the modal open");
-        assert!(kept.error.as_ref().unwrap().contains("at least 8 characters"));
+        assert!(kept
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("at least 8 characters"));
         assert!(app.vault_meta.is_none());
         assert!(app.snippets.is_empty());
 
@@ -3699,7 +4195,10 @@ mod layout_tests {
         prompt.password = "password1".into();
         prompt.confirm = "password1".into();
         prompt.error = None;
-        assert!(app.handle_vault_prompt(prompt, &ctx, 0.0).is_none(), "modal closes on success");
+        assert!(
+            app.handle_vault_prompt(prompt, &ctx, 0.0).is_none(),
+            "modal closes on success"
+        );
         assert!(app.vault.is_unlocked());
         assert!(app.vault_meta.is_some());
         assert_eq!(app.snippets.len(), 1);

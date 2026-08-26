@@ -8,18 +8,16 @@ use std::path::{Path, PathBuf};
 /// (blank, or the reserved "All" filter label).
 pub const UNCATEGORIZED: &str = "Uncategorized";
 
-/// Resolves the stable per-user directory where snippets.json and config.json live.
-/// Uses `%APPDATA%\CopyIt` on Windows (preferred: survives git checkouts, cargo clean, etc.),
-/// falling back to the directory containing the running .exe on non-Windows or when APPDATA
-/// is unset or empty (e.g., in dev/CI environments). This strategy decouples data persistence
-/// from build artifacts: users can freely update/rebuild the application without losing their
-/// saved snippets. The directory is created on first access if it doesn't exist.
+/// Resolves the preferred stable per-user directory where snippets.json and config.json
+/// live, WITHOUT creating it: `%APPDATA%\CopyIt` on Windows (preferred: survives git
+/// checkouts, cargo clean, etc.), falling back to the directory containing the running
+/// .exe on non-Windows or when APPDATA is unset or empty (e.g., in dev/CI environments).
+/// This strategy decouples data persistence from build artifacts: users can freely
+/// update/rebuild the application without losing their saved snippets.
 pub fn data_dir() -> PathBuf {
     if let Ok(appdata) = std::env::var("APPDATA") {
         if !appdata.is_empty() {
-            let dir = PathBuf::from(appdata).join("CopyIt");
-            let _ = std::fs::create_dir_all(&dir);
-            return dir;
+            return PathBuf::from(appdata).join("CopyIt");
         }
     }
     if let Ok(exe) = std::env::current_exe() {
@@ -28,6 +26,18 @@ pub fn data_dir() -> PathBuf {
         }
     }
     PathBuf::from(".") // Last-resort fallback: current working directory
+}
+
+/// Resolves the data directory and makes sure it exists, returning the path plus any
+/// creation failure for the caller to surface. A failure here means saves will fail
+/// later anyway — reporting it at startup is clearer than letting the first write
+/// discover it (or silently falling back to an unexpected location).
+pub fn ensure_data_dir() -> (PathBuf, Option<std::io::Error>) {
+    let dir = data_dir();
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => (dir, None),
+        Err(e) => (dir, Some(e)),
+    }
 }
 
 /// Legacy locations `snippets.json`/`config.json` may have been left in by
@@ -71,19 +81,59 @@ pub enum Load<T> {
 /// is reported as corrupt rather than slurped into memory.
 const MAX_DATA_FILE_BYTES: usize = 256 * 1024 * 1024;
 
-fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Load<T> {
-    let data = match std::fs::read_to_string(path) {
-        Ok(data) => data,
+/// Reads at most `limit + 1` bytes from `path`. Returns `Ok(Some(data))` when the
+/// whole file fit within `limit`, `Ok(None)` when anything exists beyond it, and an
+/// error for open/read/UTF-8 failures. This is what makes `MAX_DATA_FILE_BYTES` a
+/// real bound rather than a post-hoc check: the buffer is capped by the *limit*,
+/// never sized from untrusted file metadata, and reading one extra byte proves
+/// whether anything exists beyond it.
+///
+/// Split out from [`load_json`] with an injectable limit so regression tests can use
+/// tiny limits instead of multi-hundred-MB fixtures.
+fn read_bounded(path: &Path, limit: usize) -> io::Result<Option<String>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > limit.saturating_add(1) {
+            // Over the limit: stop here. At most limit+1 bytes were ever held.
+            return Ok(None);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    // Invalid UTF-8 stays an error (as `read_to_string` behaved), not lossy text.
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// [`load_json`] with an explicit byte limit; the public loaders fix the limit at
+/// `MAX_DATA_FILE_BYTES`, while tests inject small ones.
+fn load_json_limited<T: serde::de::DeserializeOwned>(path: &Path, limit: usize) -> Load<T> {
+    // Fast-path rejection with the exact size when metadata is available. This is an
+    // optimization only — the bounded read below remains the real guarantee, because
+    // the file can change between the two calls.
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > limit as u64 {
+            return Load::Corrupt(format!(
+                "file is too large ({} bytes, limit {limit})",
+                meta.len()
+            ));
+        }
+    }
+    let data = match read_bounded(path, limit) {
+        Ok(Some(data)) => data,
+        Ok(None) => {
+            return Load::Corrupt(format!("file is too large (limit {limit})"));
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Load::Missing,
         Err(e) => return Load::Corrupt(e.to_string()),
     };
-    if data.len() > MAX_DATA_FILE_BYTES {
-        return Load::Corrupt(format!(
-            "file is too large ({} bytes, limit {})",
-            data.len(),
-            MAX_DATA_FILE_BYTES,
-        ));
-    }
     if data.trim().is_empty() {
         return Load::Missing;
     }
@@ -91,6 +141,10 @@ fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Load<T> {
         Ok(value) => Load::Loaded(value),
         Err(e) => Load::Corrupt(e.to_string()),
     }
+}
+
+fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Load<T> {
+    load_json_limited(path, MAX_DATA_FILE_BYTES)
 }
 
 /// Loads the snippet library from a JSON file.
@@ -464,7 +518,10 @@ mod tests {
         assert_eq!(second.file_name().unwrap(), "snippets.json.corrupt.1");
 
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "first corruption");
-        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second corruption");
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "second corruption"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -603,7 +660,10 @@ mod tests {
         for input in inputs {
             let once = normalize_category(input);
             let twice = normalize_category(&once);
-            assert_eq!(once, twice, "double-normalize changed '{input}': '{once}' -> '{twice}'");
+            assert_eq!(
+                once, twice,
+                "double-normalize changed '{input}': '{once}' -> '{twice}'"
+            );
         }
     }
 
@@ -614,6 +674,70 @@ mod tests {
         // Write a file that's under the limit: should load fine.
         save(&path, &[snippet(1, "Git")]).unwrap();
         assert!(matches!(load(&path), Load::Loaded(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The size limit must be a real bound: a file over the limit is rejected after
+    /// reading at most limit+1 bytes, while a file at exactly the limit loads.
+    /// A small injected limit keeps the fixture tiny.
+    #[test]
+    fn bounded_loader_rejects_limit_plus_one_and_accepts_exact_limit() {
+        let dir = tmp_dir("bounded-loader");
+        let path = dir.join("snippets.json");
+
+        // Exactly at the limit: valid JSON, must load.
+        std::fs::write(&path, "[]").unwrap();
+        let exact: Load<Vec<Snippet>> = load_json_limited(&path, 2);
+        match exact {
+            Load::Loaded(snippets) => assert!(snippets.is_empty()),
+            _ => panic!("a file exactly at the limit should load"),
+        }
+
+        // One byte over: rejected as too large, not parsed, not reported missing.
+        std::fs::write(&path, "[] ").unwrap(); // 3 bytes > limit 2
+        let over: Load<Vec<Snippet>> = load_json_limited(&path, 2);
+        match over {
+            Load::Corrupt(message) => {
+                assert!(message.contains("too large"), "got: {message}");
+            }
+            _ => panic!("limit+1 must be rejected"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bounded loading preserves the small-file semantics: zero-byte and
+    /// whitespace-only files are Missing; invalid UTF-8 and invalid JSON are
+    /// Corrupt with their usual messages; valid files round-trip.
+    #[test]
+    fn bounded_loader_preserves_missing_corrupt_semantics() {
+        let dir = tmp_dir("bounded-semantics");
+        let path = dir.join("snippets.json");
+        const LIMIT: usize = 4096;
+
+        std::fs::write(&path, "").unwrap();
+        let result: Load<Vec<Snippet>> = load_json_limited(&path, LIMIT);
+        assert!(matches!(result, Load::Missing));
+
+        std::fs::write(&path, "   \n\t ").unwrap();
+        let result: Load<Vec<Snippet>> = load_json_limited(&path, LIMIT);
+        assert!(matches!(result, Load::Missing));
+
+        std::fs::write(&path, [0xff_u8, 0xfe, 0xfd]).unwrap();
+        let result: Load<Vec<Snippet>> = load_json_limited(&path, LIMIT);
+        assert!(matches!(result, Load::Corrupt(_)));
+
+        std::fs::write(&path, "[{not json").unwrap();
+        let result: Load<Vec<Snippet>> = load_json_limited(&path, LIMIT);
+        assert!(matches!(result, Load::Corrupt(_)));
+
+        save(&path, &[snippet(9, "Git")]).unwrap();
+        let round_trip: Load<Vec<Snippet>> = load_json_limited(&path, LIMIT);
+        match round_trip {
+            Load::Loaded(snippets) => assert_eq!(snippets[0].id, 9),
+            _ => panic!("valid file should round-trip"),
+        }
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -645,7 +769,10 @@ mod tests {
             Load::Loaded(loaded) => {
                 assert_eq!(loaded.len(), 1);
                 assert!(loaded[0].body.is_empty());
-                let p = loaded[0].protection.as_ref().expect("protection round-trips");
+                let p = loaded[0]
+                    .protection
+                    .as_ref()
+                    .expect("protection round-trips");
                 assert_eq!(p.hint, protection.hint);
                 assert_eq!(p.nonce, protection.nonce);
                 assert_eq!(p.ciphertext, protection.ciphertext);

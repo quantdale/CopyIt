@@ -17,9 +17,7 @@ use crate::app::CopyIt;
 use crate::grid::{CARD_H, CARD_W};
 use crate::store::Store;
 use eframe::egui;
-use eframe::egui::{
-    Event, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, Vec2,
-};
+use eframe::egui::{Event, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, Vec2};
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
@@ -61,7 +59,13 @@ pub fn sim_root() -> PathBuf {
 pub fn run_dir_for(name: &str, seed: u64) -> PathBuf {
     let safe_name: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     sim_root()
         .join(std::process::id().to_string())
@@ -137,7 +141,10 @@ impl SimApp {
     /// frame state here.
     pub fn pump_with_modifiers(&mut self, events: Vec<Event>, modifiers: Modifiers) {
         let raw = RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(SCREEN_W, SCREEN_H))),
+            screen_rect: Some(Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(SCREEN_W, SCREEN_H),
+            )),
             time: Some(self.time_ms as f64 / 1000.0),
             modifiers,
             events,
@@ -208,7 +215,10 @@ impl SimApp {
                 return Ok(*rect);
             }
         }
-        Err(format!("label `{label}` not visible; on screen: {}", self.on_screen()))
+        Err(format!(
+            "label `{label}` not visible; on screen: {}",
+            self.on_screen()
+        ))
     }
 
     /// Locates the first (earliest-rendered, usually topmost-in-panels) match —
@@ -226,7 +236,10 @@ impl SimApp {
                 return Ok(*rect);
             }
         }
-        Err(format!("label `{label}` not visible; on screen: {}", self.on_screen()))
+        Err(format!(
+            "label `{label}` not visible; on screen: {}",
+            self.on_screen()
+        ))
     }
 
     /// Clicks the center of a located label.
@@ -394,7 +407,10 @@ impl SimApp {
         if found {
             Ok(())
         } else {
-            Err(format!("expected `{text}` visible; on screen: {}", self.on_screen()))
+            Err(format!(
+                "expected `{text}` visible; on screen: {}",
+                self.on_screen()
+            ))
         }
     }
 
@@ -429,10 +445,7 @@ impl SimApp {
     }
 
     /// Asserts something about the persisted store, reloading from disk.
-    pub fn expect_store(
-        &self,
-        pred: &dyn Fn(&Store) -> Result<(), String>,
-    ) -> Result<(), String> {
+    pub fn expect_store(&self, pred: &dyn Fn(&Store) -> Result<(), String>) -> Result<(), String> {
         pred(&self.store)
     }
 
@@ -496,7 +509,11 @@ impl SimApp {
         let target = texts
             .iter()
             .find(|(t, r)| t.trim() == "Copy" && card.intersects(*r))
-            .or_else(|| texts.iter().find(|(t, r)| t.contains("Copy") && card.intersects(*r)))
+            .or_else(|| {
+                texts
+                    .iter()
+                    .find(|(t, r)| t.contains("Copy") && card.intersects(*r))
+            })
             .map(|(_, r)| r.center())
             .unwrap_or_else(|| Pos2::new(card.right() - 40.0, card.top() + 22.0));
         self.think();
@@ -513,7 +530,11 @@ impl SimApp {
         let target = texts
             .iter()
             .find(|(t, r)| t.trim() == "Edit" && card.intersects(*r))
-            .or_else(|| texts.iter().find(|(t, r)| t.contains("Edit") && card.intersects(*r)))
+            .or_else(|| {
+                texts
+                    .iter()
+                    .find(|(t, r)| t.contains("Edit") && card.intersects(*r))
+            })
             .map(|(_, r)| r.center())
             .unwrap_or_else(|| Pos2::new(card.left() + 40.0, card.bottom() - 30.0));
         self.think();

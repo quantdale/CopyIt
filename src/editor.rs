@@ -211,7 +211,10 @@ mod tests {
             protection: None,
         };
         let ed = Editor::from_snippet(&s, &["Café".to_string()]);
-        assert_eq!(ed.category, "Café", "must match using full Unicode case folding");
+        assert_eq!(
+            ed.category, "Café",
+            "must match using full Unicode case folding"
+        );
     }
 
     #[test]
@@ -224,7 +227,9 @@ mod tests {
             body: "b".into(),
             protection: None,
         };
-        assert!(Editor::from_snippet(&s, &categories()).category_error.is_none());
+        assert!(Editor::from_snippet(&s, &categories())
+            .category_error
+            .is_none());
     }
 
     #[test]

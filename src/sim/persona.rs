@@ -81,9 +81,15 @@ mod tests {
         let mut rng_a = StdRng::seed_from_u64(1);
         let mut rng_b = StdRng::seed_from_u64(1);
         for _ in 0..100 {
-            let (a, b) = (FIRST_RUN_EXPLORER.think_ms(&mut rng_a), FIRST_RUN_EXPLORER.think_ms(&mut rng_b));
+            let (a, b) = (
+                FIRST_RUN_EXPLORER.think_ms(&mut rng_a),
+                FIRST_RUN_EXPLORER.think_ms(&mut rng_b),
+            );
             assert_eq!(a, b);
-            let (a, b) = (FIRST_RUN_EXPLORER.type_ms(&mut rng_a), FIRST_RUN_EXPLORER.type_ms(&mut rng_b));
+            let (a, b) = (
+                FIRST_RUN_EXPLORER.type_ms(&mut rng_a),
+                FIRST_RUN_EXPLORER.type_ms(&mut rng_b),
+            );
             assert_eq!(a, b);
         }
     }
@@ -93,9 +99,14 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(2);
         for _ in 0..200 {
             let t = POWER_ORGANIZER.think_ms(&mut rng);
-            assert!((POWER_ORGANIZER.think_ms.0 as u64) <= t && t <= (POWER_ORGANIZER.think_ms.1 as u64));
+            assert!(
+                (POWER_ORGANIZER.think_ms.0 as u64) <= t
+                    && t <= (POWER_ORGANIZER.think_ms.1 as u64)
+            );
             let t = POWER_ORGANIZER.type_ms(&mut rng);
-            assert!((POWER_ORGANIZER.type_ms.0 as u64) <= t && t <= (POWER_ORGANIZER.type_ms.1 as u64));
+            assert!(
+                (POWER_ORGANIZER.type_ms.0 as u64) <= t && t <= (POWER_ORGANIZER.type_ms.1 as u64)
+            );
         }
     }
 

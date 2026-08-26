@@ -578,7 +578,10 @@ mod tests {
         assert!((0..=rects.len()).contains(&ng));
 
         // Empty card list with cols: 0 must also be safe.
-        assert_eq!(gap_point(0, &[], 0, CARD_SPACING, CARD_W, pos2(0.0, 0.0)), pos2(0.0, 0.0));
+        assert_eq!(
+            gap_point(0, &[], 0, CARD_SPACING, CARD_W, pos2(0.0, 0.0)),
+            pos2(0.0, 0.0)
+        );
         assert_eq!(nearest_gap(pos2(0.0, 0.0), &[], 0, CARD_SPACING, CARD_W), 0);
     }
 
@@ -619,11 +622,11 @@ mod tests {
         assert_eq!(visible_rows(clip, origin_y, row_pitch, 0), (0, 0));
 
         // An infinite clip is non-finite geometry, so it falls back to every row.
-        let inf_clip = Rect::from_min_max(
-            pos2(0.0, f32::INFINITY),
-            pos2(1000.0, f32::INFINITY),
+        let inf_clip = Rect::from_min_max(pos2(0.0, f32::INFINITY), pos2(1000.0, f32::INFINITY));
+        assert_eq!(
+            visible_rows(inf_clip, origin_y, row_pitch, rows),
+            (0, rows - 1)
         );
-        assert_eq!(visible_rows(inf_clip, origin_y, row_pitch, rows), (0, rows - 1));
     }
 
     #[test]
