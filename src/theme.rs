@@ -757,7 +757,10 @@ mod tests {
         // name must parse to the same theme instead of falling back to Dark.
         assert_eq!("  Dark  ".parse::<Theme>().unwrap(), Theme::Dark);
         assert_eq!("  Nord ".parse::<Theme>().unwrap(), Theme::Nord);
-        assert_eq!("\tSolarized Dark\n".parse::<Theme>().unwrap(), Theme::SolarizedDark);
+        assert_eq!(
+            "\tSolarized Dark\n".parse::<Theme>().unwrap(),
+            Theme::SolarizedDark
+        );
         // A genuinely unknown name still fails.
         assert_eq!("Not A Real Theme".parse::<Theme>(), Err(()));
     }

@@ -9,10 +9,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app; // Main UI and interaction logic; handles rendering, user input, and state updates
+mod clipboard; // Clipboard abstraction with bounded protected-copy lifetime
 mod editor; // Snippet add/edit modal: state, constructors, and the transition decision
 mod grid; // Card grid geometry, virtualization, insertion lines, and the drag state machine
 mod model; // Core data structure: Snippet (id, title, category, body)
 mod seed; // Default snippet library seeded on first launch for new users
+mod sqlite; // Canonical SQLite engine backing the shared copyit.db store
 mod storage; // JSON persistence, data directory resolution, and category normalization
 mod store; // Persistence seam: paths, legacy migration, load/save of snippets and config
 mod theme; // 37 selectable color themes via custom egui::Visuals

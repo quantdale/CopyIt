@@ -1,13 +1,18 @@
+use crate::clipboard::{self, ClipboardBackend};
+#[cfg(test)]
+use crate::clipboard::{SimClipboard, SimHandle};
 use crate::editor::{self, Editor, EditorResult};
 use crate::grid;
 use crate::model::Snippet;
 use crate::storage::{self, Config};
-use crate::store::Store;
+use crate::store::{LegacyMigration, MigrationOutcome, Store};
 use crate::theme::Theme;
 use crate::vault::{self, VaultMeta, VaultState};
 use eframe::egui;
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::mpsc;
+use zeroize::Zeroize;
 
 /// Prefix of the banner message for a failed `snippets.json` write. Shared so a later
 /// successful snippet save can retire exactly its own error and nothing else.
@@ -18,6 +23,8 @@ const CONFIG_SAVE_ERROR: &str = "Couldn't save settings";
 const WARNING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xef, 0x44, 0x44);
 /// Characters of a snippet body shown in a card's preview line.
 const PREVIEW_CHARS: usize = 220;
+/// Window (seconds) after which a still-current protected clipboard copy is cleared.
+const CLIPBOARD_SECURITY_WINDOW_SECS: f64 = clipboard::SECURITY_WINDOW_SECS;
 
 /// Per-snippet data derived from the snippet's own text: the lowercase forms the
 /// search filter matches against, and the collapsed one-line card preview.
@@ -47,12 +54,7 @@ impl Derived {
             s.body.to_lowercase()
         };
         let preview = if protected {
-            vault::masked_preview(
-                s.protection
-                    .as_ref()
-                    .map(|p| p.hint.as_str())
-                    .unwrap_or(""),
-            )
+            vault::masked_preview(s.protection.as_ref().map(|p| p.hint.as_str()).unwrap_or(""))
         } else {
             preview_text(&s.body, PREVIEW_CHARS)
         };
@@ -118,17 +120,89 @@ pub struct CopyIt {
     adding_header_category: bool, // True when the user is typing a new category in the top bar
     new_header_category: String, // Input buffer for the new category name in the top bar
     category_error: Option<String>, // Validation error for the new category (e.g., "All" is reserved)
-    save_error: Vec<String>,     // File I/O error messages to display at the top
+    save_error: Vec<String>,        // File I/O error messages to display at the top
     vault: VaultState,              // Session lock state; starts locked on every launch
-    vault_meta: Option<VaultMeta>,  // KDF salt + canary loaded from config.json; None until first protect
+    vault_meta: Option<VaultMeta>, // KDF salt + canary loaded from config.json; None until first protect
     vault_prompt: Option<VaultPrompt>, // Unlock / create-vault modal; None when closed
-    any_protected: bool,              // Cached from rebuild_derived; used in UI vault indicator
-    #[allow(dead_code)]
-    vault_work: Option<mpsc::Receiver<Result<[u8; 32], crate::vault::VaultError>>>, // For async KDF
-    theme_raw: Option<String>,         // Preserves original theme string when parse fails
-    #[allow(dead_code)]
-    refuse_overwrite: bool,            // Set true when backup_corrupt failed at startup
+    any_protected: bool,           // Cached from rebuild_derived; used in UI vault indicator
+    vault_work: Option<VaultWork>,
+    vault_work_gen: u64,
+    theme_raw: Option<String>, // Preserves original theme string when parse fails
+    /// Set when a corrupt snippets/config file could not be backed up; the original
+    /// bytes are never overwritten for that file for the rest of the process.
+    refuse_snippets_overwrite: bool,
+    refuse_config_overwrite: bool,
+    /// Clipboard backend (Sim in tests; Windows backend in production). The only
+    /// retained state for a protected copy is its scheduled clear deadline + the
+    /// clipboard sequence token captured at copy time (never the plaintext).
+    pub(crate) clipboard: Box<dyn ClipboardBackend>,
+    /// When Some, a protected copy is awaiting its security-window clear.
+    protected_copy: Option<ProtectedCopyGuard>,
     _instance_lock: Option<std::fs::File>, // Holds the file lock handle for single-instance
+}
+
+/// Remembers a pending clear of a protected clipboard copy: when it expires we
+/// clear ONLY if the clipboard still holds CopyIt's own copy (sequence unchanged).
+#[derive(Clone, Copy)]
+struct ProtectedCopyGuard {
+    expires_at: f64,
+    sequence: u64,
+}
+
+/// Vault KDF work running off the UI thread. One job at a time; stale results are discarded.
+enum VaultWorkKind {
+    Unlock,
+    Create,
+}
+
+enum VaultWorkOutput {
+    Unlocked([u8; 32]),
+    Created(VaultMeta, [u8; 32]),
+}
+
+struct VaultWork {
+    gen: u64,
+    kind: VaultWorkKind,
+    pending: Option<PendingVaultAction>,
+    rx: mpsc::Receiver<Result<VaultWorkOutput, vault::VaultError>>,
+}
+
+fn spawn_vault_unlock(
+    password: String,
+    meta: VaultMeta,
+) -> mpsc::Receiver<Result<VaultWorkOutput, vault::VaultError>> {
+    let (tx, rx) = mpsc::channel();
+    let work = move || {
+        let mut pw = password;
+        let res = vault::verify_password(&pw, &meta).map(VaultWorkOutput::Unlocked);
+        pw.zeroize();
+        let _ = tx.send(res);
+    };
+    // Deterministic immediate execution for tests/sim; thread for production.
+    if cfg!(any(test, feature = "sim")) {
+        work();
+    } else {
+        std::thread::spawn(work);
+    }
+    rx
+}
+
+fn spawn_vault_create(
+    password: String,
+) -> mpsc::Receiver<Result<VaultWorkOutput, vault::VaultError>> {
+    let (tx, rx) = mpsc::channel();
+    let work = move || {
+        let mut pw = password;
+        let res = vault::create_vault(&pw).map(|(meta, key)| VaultWorkOutput::Created(meta, key));
+        pw.zeroize();
+        let _ = tx.send(res);
+    };
+    if cfg!(any(test, feature = "sim")) {
+        work();
+    } else {
+        std::thread::spawn(work);
+    }
+    rx
 }
 
 /// Tracks an in-progress drag operation. Initialized when the user clicks and holds on a card,
@@ -225,6 +299,15 @@ struct CardWidgets {
     edit: egui::Response,   // Response from the Edit button; checked for clicks
 }
 
+/// Returns the error used when a corrupt data file could not be moved aside. Keeping the
+/// original bytes in place is safer than letting a later automatic save replace the only
+/// remaining copy of the user's data.
+fn refuse_overwrite_error(filename: &str) -> std::io::Error {
+    std::io::Error::other(format!(
+        "{filename} is corrupt and could not be backed up; copy it elsewhere before making changes"
+    ))
+}
+
 /// Builds the banner text for a data file that exists but couldn't be parsed, moving the
 /// original aside first so it is never silently replaced by the seeded defaults.
 /// Returns the banner text and whether the backup rename succeeded. When it fails
@@ -254,12 +337,22 @@ impl CopyIt {
     /// the one-time legacy migration, then constructs the app via
     /// [`Self::from_store`].
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let store = Store::open();
-        store.migrate_legacy();
+        let (store, init_error) = Store::open_initialized();
+        let migration = store.migrate_legacy();
         let mut app = Self::from_store(store, &cc.egui_ctx);
-        let lock_path = app.store.snippets_path.parent().unwrap().join(".copyit.lock");
+        app.note_startup_problems(init_error.as_ref(), &migration);
+        let lock_path = app
+            .store
+            .snippets_path
+            .parent()
+            .unwrap()
+            .join(".copyit.lock");
         #[allow(clippy::suspicious_open_options)] // lock file: no truncate needed
-        match std::fs::OpenOptions::new().write(true).create(true).open(&lock_path) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+        {
             Ok(file) => {
                 if file.try_lock().is_err() {
                     eprintln!("CopyIt is already running (another instance holds the lock).");
@@ -272,6 +365,38 @@ impl CopyIt {
             }
         }
         app
+    }
+
+    /// Records startup-level storage problems in the warning banner: failure to
+    /// create the stable data directory, and legacy files that exist but could
+    /// not be migrated. Without this, a failed migration would look exactly like
+    /// a clean first launch while the user's real library sits unmigrated.
+    /// Called only from `new` — the simulation harness never touches real paths.
+    fn note_startup_problems(
+        &mut self,
+        init_error: Option<&std::io::Error>,
+        migration: &LegacyMigration,
+    ) {
+        if let Some(e) = init_error {
+            let dir = self.store.snippets_path.parent().unwrap_or(Path::new("."));
+            self.save_error.push(format!(
+                "Couldn't create the data folder {}: {e}. Settings and snippets can't be saved.",
+                dir.display()
+            ));
+        }
+        for (filename, outcome) in [
+            ("snippets.json", &migration.snippets),
+            ("config.json", &migration.config),
+        ] {
+            if let MigrationOutcome::Blocked { source, reason } = outcome {
+                self.save_error.push(format!(
+                    "A previous {filename} was found at {} but couldn't be brought into the \
+                     data folder ({reason}). It was left untouched — copy it into the data \
+                     folder manually, then restart CopyIt.",
+                    source.display()
+                ));
+            }
+        }
     }
 
     /// Constructs a fully initialized app from an explicit store, shared by
@@ -292,14 +417,14 @@ impl CopyIt {
         // `seeded` is true only when writing the defaults over the file is safe — the
         // file was missing, or its corrupt copy was successfully moved aside. If the
         // backup rename fails, the corrupt file stays on disk untouched.
-        let (mut snippets, seeded) = match store.load_snippets() {
-            storage::Load::Loaded(snippets) => (snippets, false),
-            storage::Load::Missing => (crate::seed::defaults(), true),
+        let (mut snippets, seeded, refuse_snippets_overwrite) = match store.load_snippets() {
+            storage::Load::Loaded(snippets) => (snippets, false, false),
+            storage::Load::Missing => (crate::seed::defaults(), true, false),
             storage::Load::Corrupt(e) => {
                 let (note, backed_up) =
                     describe_corrupt_file(&store.snippets_path, "snippets.json", &e);
                 save_error.push(note);
-                (crate::seed::defaults(), backed_up)
+                (crate::seed::defaults(), backed_up, !backed_up)
             }
         };
         for s in &mut snippets {
@@ -317,19 +442,19 @@ impl CopyIt {
         // loaded categories were, verbatim, so a save happens only when the canonical
         // config actually differs from what's on disk.
         let mut loaded_categories: Option<Vec<String>> = None;
-        let (mut config, config_write_ok) = match store.load_config() {
+        let (mut config, config_write_ok, refuse_config_overwrite) = match store.load_config() {
             storage::Load::Loaded(config) => {
                 loaded_categories = Some(config.categories.clone());
-                (config, false)
+                (config, false, false)
             }
-            storage::Load::Missing => (Config::from_snippets(&snippets), true),
+            storage::Load::Missing => (Config::from_snippets(&snippets), true, false),
             storage::Load::Corrupt(e) => {
                 let (note, backed_up) =
                     describe_corrupt_file(&store.config_path, "config.json", &e);
                 // When both data files are corrupt, surface both notices: the config
                 // was moved aside too, and the user needs to know where it went.
                 save_error.push(note);
-                (Config::from_snippets(&snippets), backed_up)
+                (Config::from_snippets(&snippets), backed_up, !backed_up)
             }
         };
         // Hand-edited or pre-fix config can carry non-canonical category names ("all",
@@ -343,7 +468,8 @@ impl CopyIt {
         // canonical config differs from what was loaded. Writing a freshly derived
         // config over a corrupt original that couldn't be backed up would destroy the
         // only copy of the user's settings.
-        let config_changed = matches!(&loaded_categories, Some(loaded) if *loaded != config.categories);
+        let config_changed =
+            matches!(&loaded_categories, Some(loaded) if *loaded != config.categories);
         if config_write_ok || config_changed {
             if let Err(e) = store.save_config(&config) {
                 save_error.push(format!("{CONFIG_SAVE_ERROR}: {e}"));
@@ -353,7 +479,11 @@ impl CopyIt {
         // After loading snippets, sweep any stale temp files from a previous crashed write.
         storage::sweep_stale_tmp(store.snippets_path.parent().unwrap());
 
-        let theme_raw = if config.theme.is_empty() { None } else { Some(config.theme.clone()) };
+        let theme_raw = if config.theme.is_empty() {
+            None
+        } else {
+            Some(config.theme.clone())
+        };
         let theme = config.theme.parse::<Theme>().unwrap_or(Theme::Dark);
         ctx.set_visuals(theme.visuals());
 
@@ -397,8 +527,12 @@ impl CopyIt {
             vault_prompt: None,
             any_protected,
             vault_work: None,
+            vault_work_gen: 0,
             theme_raw,
-            refuse_overwrite: !config_write_ok,
+            clipboard: clipboard::platform_default(),
+            protected_copy: None,
+            refuse_snippets_overwrite,
+            refuse_config_overwrite,
             _instance_lock: None,
         }
     }
@@ -478,17 +612,31 @@ impl CopyIt {
 
     /// Persists the full snippet library to snippets.json in the stable data directory.
     /// Updates save_error if an I/O error occurs; the error is shown in the top bar.
+    /// If a corrupt snippets.json could not be backed up, never writes over the only
+    /// remaining original: refuse and surface the recovery error instead.
     fn save_snippets(&mut self) {
+        if self.refuse_snippets_overwrite {
+            let e = refuse_overwrite_error("snippets.json");
+            self.push_save_error_once(format!("{SNIPPETS_SAVE_ERROR}: {e}"));
+            return;
+        }
         match self.store.save_snippets(&self.snippets) {
             Ok(()) => self.clear_save_error(SNIPPETS_SAVE_ERROR),
-            Err(e) => self.save_error.push(format!("{SNIPPETS_SAVE_ERROR}: {e}")),
+            Err(e) => self.push_save_error_once(format!("{SNIPPETS_SAVE_ERROR}: {e}")),
         }
     }
 
     /// Persists the config (categories and theme selection) to config.json.
     /// Separated from snippets.json so snippet data stays backward-compatible.
     /// Returns an error if the write fails; the caller decides how to surface it.
+    /// If a corrupt config.json could not be backed up, never writes over the only
+    /// remaining original: refuse and surface the recovery error instead.
     fn save_config(&mut self) -> std::io::Result<()> {
+        if self.refuse_config_overwrite {
+            let e = refuse_overwrite_error("config.json");
+            self.push_save_error_once(format!("{CONFIG_SAVE_ERROR}: {e}"));
+            return Err(e);
+        }
         if self.vault_meta.is_none() {
             if let storage::Load::Loaded(disk_config) = self.store.load_config() {
                 if disk_config.vault.is_some() {
@@ -497,7 +645,11 @@ impl CopyIt {
             }
         }
         let theme_str = if let Some(ref raw) = self.theme_raw {
-            if raw.parse::<Theme>().is_err() { raw.clone() } else { self.theme.to_string() }
+            if raw.parse::<Theme>().is_err() {
+                raw.clone()
+            } else {
+                self.theme.to_string()
+            }
         } else {
             self.theme.to_string()
         };
@@ -516,6 +668,15 @@ impl CopyIt {
     /// switching themes) hide the fact that the snippet library still isn't on disk.
     fn clear_save_error(&mut self, prefix: &str) {
         self.save_error.retain(|e| !e.starts_with(prefix));
+    }
+
+    /// Appends `message` to the warning banner unless an identical entry is already
+    /// shown. Repeated failures (every refused save re-raises its error) must not grow
+    /// duplicate copies of the same message across frames or actions.
+    fn push_save_error_once(&mut self, message: String) {
+        if !self.save_error.contains(&message) {
+            self.save_error.push(message);
+        }
     }
 
     /// Clears the inline category warning as soon as the user starts editing
@@ -575,13 +736,16 @@ impl CopyIt {
                 Some(key) => match vault::encrypt_body(key, &ed.body) {
                     Ok(p) => Some(p),
                     Err(e) => {
-                        self.save_error.push(format!("Couldn't protect a snippet: the vault failed ({e})"));
+                        self.save_error.push(format!(
+                            "Couldn't protect a snippet: the vault failed ({e})"
+                        ));
                         self.editor = Some(ed);
                         return;
                     }
                 },
                 None => {
-                    self.save_error.push("Couldn't protect a snippet: the vault isn't unlocked".to_string());
+                    self.save_error
+                        .push("Couldn't protect a snippet: the vault isn't unlocked".to_string());
                     self.editor = Some(ed);
                     return;
                 }
@@ -606,7 +770,9 @@ impl CopyIt {
                     s.body = std::mem::take(&mut ed.body);
                 }
             } else {
-                self.save_error.push(format!("Snippet with id {id} not found; it may have been deleted"));
+                self.save_error.push(format!(
+                    "Snippet with id {id} not found; it may have been deleted"
+                ));
             }
         } else {
             // The cursor is always a free id (it mirrors the library's max, or a scanned
@@ -623,6 +789,7 @@ impl CopyIt {
             self.snippets.push(Snippet {
                 id,
                 title,
+                description: String::new(),
                 category,
                 body,
                 protection,
@@ -646,8 +813,7 @@ impl CopyIt {
             // anything is written. The editor rides along in the pending action.
             self.vault_prompt = Some(VaultPrompt::create_for(PendingVaultAction::ProtectSave(ed)));
         } else if self.vault.is_locked() {
-            self.vault_prompt =
-                Some(VaultPrompt::unlock_for(PendingVaultAction::ProtectSave(ed)));
+            self.vault_prompt = Some(VaultPrompt::unlock_for(PendingVaultAction::ProtectSave(ed)));
         } else {
             self.apply_save(ed);
         }
@@ -656,15 +822,24 @@ impl CopyIt {
     /// Copies a snippet's body to the clipboard. Protected snippets are decrypted on
     /// demand; an AEAD failure refuses the copy, names the card in the warning banner,
     /// and leaves the file untouched.
+    ///
+    /// A protected copy is placed via the clipboard backend and, because its plaintext
+    /// would otherwise live on the clipboard forever, a best-effort clear is scheduled
+    /// after a fixed security window — but only if the clipboard still holds CopyIt's own
+    /// copy (proved by an unchanged sequence token). A plaintext copy uses the normal
+    /// persistent clipboard path and is never auto-cleared.
+    #[allow(clippy::needless_return)] // the `return` in the Err arm is required to skip the non-backend path
     fn copy_snippet(&mut self, id: u64, ctx: &egui::Context, now: f64) {
         let Some(s) = self.snippets.iter().find(|s| s.id == id) else {
             return;
         };
+        let is_protected = s.protection.is_some();
         let text = match &s.protection {
             None => s.body.clone(),
             Some(p) => {
                 let Some(key) = self.vault.key() else {
-                    self.save_error.push("Couldn't copy: the vault is locked, unlock it first".to_string());
+                    self.save_error
+                        .push("Couldn't copy: the vault is locked, unlock it first".to_string());
                     return;
                 };
                 match vault::decrypt_body(key, p) {
@@ -679,9 +854,66 @@ impl CopyIt {
                 }
             }
         };
-        ctx.output_mut(|o| o.copied_text = text);
-        self.copied = Some((id, now));
-        ctx.request_repaint_after(std::time::Duration::from_millis(1300));
+        // In tests/sim, route every copy through the deterministic backend so the harness
+        // can observe clipboard content without touching the real system clipboard. In the
+        // shipped product, only protected copies use the backend (so they can be auto-cleared);
+        // unprotected copies keep egui's normal persistent clipboard behavior.
+        let use_backend = is_protected || cfg!(test) || cfg!(feature = "sim");
+        if use_backend {
+            match self.clipboard.set_text(&text) {
+                Ok(()) => {
+                    self.copied = Some((id, now));
+                    if is_protected {
+                        let sequence = self.clipboard.sequence().unwrap_or(0);
+                        self.protected_copy = Some(ProtectedCopyGuard {
+                            expires_at: now + CLIPBOARD_SECURITY_WINDOW_SECS,
+                            sequence,
+                        });
+                        ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                            CLIPBOARD_SECURITY_WINDOW_SECS,
+                        ));
+                    } else {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(1300));
+                    }
+                }
+                Err(e) => {
+                    self.push_save_error_once(format!(
+                        "Couldn't place the protected copy on the clipboard ({e}). Copy it manually if needed."
+                    ));
+                    return;
+                }
+            }
+        } else {
+            ctx.output_mut(|o| o.copied_text = text);
+            self.copied = Some((id, now));
+            ctx.request_repaint_after(std::time::Duration::from_millis(1300));
+        }
+    }
+
+    /// Each frame: if a scheduled protected-copy clear is due, clear the clipboard only
+    /// when it still holds CopyIt's own copy (sequence unchanged). If the user or another
+    /// app changed the clipboard in the meantime, do nothing — never clobber newer content.
+    fn tick_clipboard(&mut self, now: f64) {
+        let Some(guard) = self.protected_copy else {
+            return;
+        };
+        if now >= guard.expires_at {
+            let guard = self.protected_copy.take().unwrap();
+            if self.clipboard.sequence() == Some(guard.sequence) {
+                let _ = self.clipboard.clear();
+            }
+        }
+    }
+
+    /// Locks the vault and (best-effort) clears a still-current protected clipboard copy
+    /// immediately, so a locked vault never leaves secrets on the clipboard.
+    fn lock_vault(&mut self) {
+        self.vault.lock();
+        if let Some(guard) = self.protected_copy.take() {
+            if self.clipboard.sequence() == Some(guard.sequence) {
+                let _ = self.clipboard.clear();
+            }
+        }
     }
 
     /// Opens the editor on a snippet. Protected snippets are decrypted first so the
@@ -698,7 +930,8 @@ impl CopyIt {
             None => Editor::from_snippet(s, &self.categories),
             Some(p) => {
                 let Some(key) = self.vault.key() else {
-                    self.save_error.push("Couldn't edit: the vault is locked, unlock it first".to_string());
+                    self.save_error
+                        .push("Couldn't edit: the vault is locked, unlock it first".to_string());
                     return;
                 };
                 match vault::decrypt_body(key, p) {
@@ -754,7 +987,12 @@ impl CopyIt {
     }
 
     /// Runs the action suspended behind a vault prompt once the vault is available.
-    fn run_pending_vault_action(&mut self, pending: PendingVaultAction, ctx: &egui::Context, now: f64) {
+    fn run_pending_vault_action(
+        &mut self,
+        pending: PendingVaultAction,
+        ctx: &egui::Context,
+        now: f64,
+    ) {
         match pending {
             PendingVaultAction::Copy(id) => self.copy_snippet(id, ctx, now),
             PendingVaultAction::Edit(id) => self.edit_snippet(id),
@@ -766,6 +1004,7 @@ impl CopyIt {
     /// metadata in memory, and persists `config.json` atomically. Returns an error
     /// (and rolls the in-memory state back) if the config write fails — protecting a
     /// card under a vault that would vanish on relaunch would destroy the secret.
+    #[allow(dead_code)]
     fn create_vault_and_unlock(&mut self, password: &str) -> Result<(), String> {
         let (meta, key) = vault::create_vault(password).map_err(|e| e.to_string())?;
         self.vault_meta = Some(meta);
@@ -779,15 +1018,23 @@ impl CopyIt {
     }
 
     /// Handles the outcome of the unlock / create-vault modal after the user clicked
-    /// its submit button. Returns `Some(prompt)` when the modal should stay open with
-    /// an inline error, `None` when it succeeded and closed (running the pending
-    /// action). `prompt` is owned so the caller can put it back or drop it.
+    /// its submit button. The KDF is now off the UI thread: validated submissions
+    /// spawn a bounded worker (one at a time) and keep the modal open in a busy
+    /// state; the result is polled in `poll_vault_work`. Stale/canceled results are
+    /// discarded without running pending actions. Returns `Some(prompt)` while the
+    /// modal should stay open (busy or inline error), `None` when it succeeded and
+    /// closed (pending action already run). `prompt` is owned so the caller can put
+    /// it back or drop it.
     fn handle_vault_prompt(
         &mut self,
         mut prompt: VaultPrompt,
         ctx: &egui::Context,
-        now: f64,
+        _now: f64,
     ) -> Option<VaultPrompt> {
+        // One job at a time: duplicate submits while busy are ignored.
+        if self.vault_work.is_some() {
+            return Some(prompt);
+        }
         match prompt.mode {
             VaultPromptMode::Create => {
                 if prompt.password.is_empty() {
@@ -795,25 +1042,30 @@ impl CopyIt {
                     return Some(prompt);
                 }
                 if prompt.password.len() < vault::MIN_VAULT_PASSWORD_LEN {
-                    prompt.error = Some(format!("Password must be at least {} characters", vault::MIN_VAULT_PASSWORD_LEN));
+                    prompt.error = Some(format!(
+                        "Password must be at least {} characters",
+                        vault::MIN_VAULT_PASSWORD_LEN
+                    ));
                     return Some(prompt);
                 }
                 if prompt.password != prompt.confirm {
                     prompt.error = Some("Passwords don't match".to_string());
                     return Some(prompt);
                 }
-                match self.create_vault_and_unlock(&prompt.password) {
-                    Ok(()) => {
-                        if let Some(pending) = prompt.pending.take() {
-                            self.run_pending_vault_action(pending, ctx, now);
-                        }
-                        None
-                    }
-                    Err(e) => {
-                        prompt.error = Some(e);
-                        Some(prompt)
-                    }
-                }
+                let pending = prompt.pending.take();
+                let pw = prompt.password.clone();
+                let gen = self.vault_work_gen.wrapping_add(1);
+                self.vault_work_gen = gen;
+                let rx = spawn_vault_create(pw);
+                self.vault_work = Some(VaultWork {
+                    gen,
+                    kind: VaultWorkKind::Create,
+                    pending,
+                    rx,
+                });
+                prompt.error = None;
+                ctx.request_repaint();
+                Some(prompt)
             }
             VaultPromptMode::Unlock => {
                 let Some(meta) = self.vault_meta.clone() else {
@@ -823,22 +1075,121 @@ impl CopyIt {
                     );
                     return Some(prompt);
                 };
-                match self.vault.unlock(&prompt.password, &meta) {
-                    Ok(()) => {
-                        if let Some(pending) = prompt.pending.take() {
-                            self.run_pending_vault_action(pending, ctx, now);
+                let pending = prompt.pending.take();
+                let pw = prompt.password.clone();
+                let gen = self.vault_work_gen.wrapping_add(1);
+                self.vault_work_gen = gen;
+                let rx = spawn_vault_unlock(pw, meta);
+                self.vault_work = Some(VaultWork {
+                    gen,
+                    kind: VaultWorkKind::Unlock,
+                    pending,
+                    rx,
+                });
+                prompt.error = None;
+                ctx.request_repaint();
+                Some(prompt)
+            }
+        }
+    }
+
+    /// Polls the off-thread vault KDF work, handling completion without a busy loop.
+    /// Called once per frame from `ui`. A canceled/stale result never executes a
+    /// pending action or leaves the vault unlocked; persistence failures on create
+    /// roll back in-memory key/meta. Requests a repaint while work is outstanding.
+    fn poll_vault_work(&mut self, ctx: &egui::Context, now: f64) {
+        let gen = match &self.vault_work {
+            Some(w) => w.gen,
+            None => return,
+        };
+        // Stale/canceled: the prompt was closed (user hit Cancel/close). Discard
+        // the pending action but still need to wait for the worker to finish so we
+        // don't leak a thread; we keep polling until the channel delivers, then
+        // drop the result without unlocking.
+        let prompt_exists = self.vault_prompt.is_some();
+        let ready = {
+            let w = self.vault_work.as_ref().unwrap();
+            w.rx.try_recv()
+        };
+        match ready {
+            Ok(Ok(output)) => {
+                let work = self.vault_work.take().unwrap();
+                // Stale generation or canceled prompt: discard without side effects.
+                if work.gen != gen || !prompt_exists {
+                    // If it was a successful create, its key was already produced but
+                    // we must not install it; just drop. The worker's password was
+                    // zeroized at send time.
+                    ctx.request_repaint();
+                    return;
+                }
+                match (work.kind, output) {
+                    (VaultWorkKind::Create, VaultWorkOutput::Created(meta, key)) => {
+                        self.vault_meta = Some(meta);
+                        self.vault.unlock_with_key(key);
+                        if let Err(e) = self.save_config() {
+                            self.vault_meta = None;
+                            self.vault.lock();
+                            if let Some(p) = self.vault_prompt.as_mut() {
+                                p.error = Some(format!("{CONFIG_SAVE_ERROR}: {e}"));
+                                // Keep pending for retry.
+                                if work.pending.is_some() {
+                                    p.pending = work.pending;
+                                }
+                            }
+                            ctx.request_repaint();
+                            return;
                         }
-                        None
+                        let pending = work.pending;
+                        self.vault_prompt = None;
+                        if let Some(p) = pending {
+                            self.run_pending_vault_action(p, ctx, now);
+                        }
                     }
-                    Err(e) => {
-                        let msg = match &e {
-                            vault::VaultError::Encoding(_) => "Vault data is corrupt — cannot unlock".to_string(),
-                            _ => "Wrong password. Try again.".to_string(),
-                        };
-                        prompt.error = Some(msg);
-                        Some(prompt)
+                    (VaultWorkKind::Unlock, VaultWorkOutput::Unlocked(key)) => {
+                        self.vault.unlock_with_key(key);
+                        let pending = work.pending;
+                        self.vault_prompt = None;
+                        if let Some(p) = pending {
+                            self.run_pending_vault_action(p, ctx, now);
+                        }
+                    }
+                    _ => {
+                        // Mismatched kind/output: keep prompt open with error.
+                        if let Some(p) = self.vault_prompt.as_mut() {
+                            p.error = Some("Internal vault error".to_string());
+                        }
                     }
                 }
+                ctx.request_repaint();
+            }
+            Ok(Err(e)) => {
+                let mut work = self.vault_work.take().unwrap();
+                if work.gen != gen || !prompt_exists {
+                    ctx.request_repaint();
+                    return;
+                }
+                if let Some(p) = self.vault_prompt.as_mut() {
+                    let msg = match &e {
+                        vault::VaultError::Encoding(_) => {
+                            "Vault data is corrupt — cannot unlock".to_string()
+                        }
+                        _ if matches!(work.kind, VaultWorkKind::Create) => e.to_string(),
+                        _ => "Wrong password. Try again.".to_string(),
+                    };
+                    p.error = Some(msg);
+                    // Keep pending for retry.
+                    if work.pending.is_some() {
+                        p.pending = work.pending.take();
+                    }
+                }
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.vault_work = None;
+                ctx.request_repaint();
             }
         }
     }
@@ -973,11 +1324,8 @@ impl CopyIt {
                                 .copied
                                 .is_some_and(|(cid, t)| cid == s.id && now - t < 1.2);
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let resp = ui.button(if recently {
-                                    "\u{2714} Copied"
-                                } else {
-                                    "Copy"
-                                });
+                                let resp =
+                                    ui.button(if recently { "\u{2714} Copied" } else { "Copy" });
                                 if resp.clicked() {
                                     actions.push(Action::Copy(s.id));
                                 }
@@ -1206,6 +1554,11 @@ impl CopyIt {
     /// drives this same function headlessly through `egui::Context::run`.
     pub fn ui(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
+        // Best-effort clear of a protected clipboard copy whose security window elapsed;
+        // only clears what CopyIt itself still owns (sequence check inside).
+        self.tick_clipboard(now);
+        // Poll off-thread vault KDF work; completion is handled without a busy loop.
+        self.poll_vault_work(ctx, now);
         let previous_theme = self.theme;
         // The visuals are *not* rebuilt here every frame: `Theme::visuals()` constructs a
         // whole `egui::Visuals` (and `set_visuals` clones the context style) for a value
@@ -1324,10 +1677,13 @@ impl CopyIt {
                     match &self.vault {
                         VaultState::Locked => {
                             // H-07: Make "Vault locked" clickable to open unlock prompt
-                            if ui.button(
-                                egui::RichText::new("Vault locked")
-                                    .color(egui::Color32::from_rgb(0xef, 0x44, 0x44)),
-                            ).clicked() {
+                            if ui
+                                .button(
+                                    egui::RichText::new("Vault locked")
+                                        .color(egui::Color32::from_rgb(0xef, 0x44, 0x44)),
+                                )
+                                .clicked()
+                            {
                                 self.vault_prompt = Some(VaultPrompt::unlock_with_no_pending());
                             }
                         }
@@ -1339,7 +1695,7 @@ impl CopyIt {
                             // H-02: Disable Lock button while editor is open
                             ui.add_enabled_ui(self.editor.is_none(), |ui| {
                                 if ui.button("Lock Vault").clicked() {
-                                    self.vault.lock();
+                                    self.lock_vault();
                                 }
                             });
                         }
@@ -1375,6 +1731,37 @@ impl CopyIt {
                     self.save_error.clear();
                 }
             }
+            // Recovery mode: a corrupt file whose backup rename failed is write-protected
+            // for the rest of the session. This notice is deliberately not dismissable —
+            // saves for that file are being refused, so hiding it would present a
+            // successful-save experience that isn't real.
+            if self.refuse_snippets_overwrite || self.refuse_config_overwrite {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    let mut msg = String::from("\u{26D4} Recovery mode:");
+                    if self.refuse_snippets_overwrite {
+                        msg.push_str(
+                            " snippets.json couldn't be backed up while corrupt, so it was left \
+                             untouched — the cards below are a fallback library and changes to \
+                             them are NOT saved.",
+                        );
+                    }
+                    if self.refuse_config_overwrite {
+                        if self.refuse_snippets_overwrite {
+                            msg.push_str(" Also:");
+                        }
+                        msg.push_str(
+                            " config.json couldn't be backed up while corrupt, so it was left \
+                             untouched — theme/category/vault changes will revert on restart.",
+                        );
+                    }
+                    msg.push_str(
+                        " Copy the file elsewhere, fix or remove it, then restart CopyIt.",
+                    );
+                    ui.colored_label(WARNING_COLOR, msg);
+                });
+            }
             ui.add_space(6.0);
         });
 
@@ -1393,10 +1780,20 @@ impl CopyIt {
                 self.drag = None;
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| {
-                    if self.snippets.is_empty() && self.search.is_empty() && self.category_filter == "All" {
-                        ui.label(egui::RichText::new("Your library is empty. Click \"+ New\" to add your first snippet.").weak());
+                    if self.snippets.is_empty()
+                        && self.search.is_empty()
+                        && self.category_filter == "All"
+                    {
+                        ui.label(
+                            egui::RichText::new(
+                                "Your library is empty. Click \"+ New\" to add your first snippet.",
+                            )
+                            .weak(),
+                        );
                     } else {
-                        ui.label(egui::RichText::new("No snippets match your search or filter.").weak());
+                        ui.label(
+                            egui::RichText::new("No snippets match your search or filter.").weak(),
+                        );
                     }
                 });
                 return;
@@ -1445,7 +1842,10 @@ impl CopyIt {
             let cols = scroll_output.inner.0;
 
             // C2-01: Cancel drag if pointer is lost (e.g., window lost focus, Alt-Tab)
-            if self.drag.is_some() && !ctx.input(|i| i.pointer.any_down()) && ctx.input(|i| i.pointer.interact_pos().is_none()) {
+            if self.drag.is_some()
+                && !ctx.input(|i| i.pointer.any_down())
+                && ctx.input(|i| i.pointer.interact_pos().is_none())
+            {
                 self.drag = None;
             }
 
@@ -1571,7 +1971,11 @@ impl CopyIt {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label("Title");
-                            ui.add(egui::TextEdit::singleline(&mut ed.title).desired_width(280.0).char_limit(200));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut ed.title)
+                                    .desired_width(280.0)
+                                    .char_limit(200),
+                            );
                         });
 
                         ui.add_space(12.0);
@@ -1611,7 +2015,8 @@ impl CopyIt {
                                         .hint_text("New category")
                                         .desired_width(120.0),
                                 );
-                                let enter_pressed = input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                let enter_pressed = input.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
                                 if (ui.button("Add").clicked() || enter_pressed)
                                     && !ed.new_category.trim().is_empty()
                                 {
@@ -1715,6 +2120,7 @@ impl CopyIt {
             let mut window_open = true;
             let mut submit = false;
             let mut cancel = false;
+            let busy = self.vault_work.is_some();
             let title = match prompt.mode {
                 VaultPromptMode::Create => "Create vault password",
                 VaultPromptMode::Unlock => "Unlock vault",
@@ -1746,7 +2152,8 @@ impl CopyIt {
                                 .password(true)
                                 .desired_width(220.0),
                         );
-                        let enter_pressed = password_input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let enter_pressed = password_input.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         if enter_pressed {
                             submit = true;
                         }
@@ -1759,11 +2166,15 @@ impl CopyIt {
                                     .password(true)
                                     .desired_width(220.0),
                             );
-                            let enter_pressed = confirm_input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            let enter_pressed = confirm_input.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
                             if enter_pressed {
                                 submit = true;
                             }
                         });
+                    }
+                    if busy {
+                        ui.colored_label(egui::Color32::from_rgb(0x38, 0xb2, 0xac), "Working…");
                     }
                     if let Some(err) = &prompt.error {
                         ui.colored_label(WARNING_COLOR, err);
@@ -1774,9 +2185,11 @@ impl CopyIt {
                             VaultPromptMode::Create => "Create vault",
                             VaultPromptMode::Unlock => "Unlock",
                         };
-                        if ui.button(button_label).clicked() {
-                            submit = true;
-                        }
+                        ui.add_enabled_ui(!busy, |ui| {
+                            if ui.button(button_label).clicked() {
+                                submit = true;
+                            }
+                        });
                         if ui.button("Cancel").clicked() {
                             cancel = true;
                         }
@@ -1789,7 +2202,13 @@ impl CopyIt {
 
             if !window_open {
                 // Cancelled: if an editor was parked here (first-ever protect),
-                // hand it back so the user keeps their draft.
+                // hand it back so the user keeps their draft. While a KDF job is
+                // in flight its pending holds the draft, so check there too.
+                if let Some(work) = self.vault_work.as_mut() {
+                    if let Some(PendingVaultAction::ProtectSave(ed)) = work.pending.take() {
+                        self.editor = Some(ed);
+                    }
+                }
                 if let Some(PendingVaultAction::ProtectSave(ed)) = prompt.pending {
                     self.editor = Some(ed);
                 }
@@ -1816,7 +2235,10 @@ fn sanitize_categories(categories: &[String]) -> Vec<String> {
         if storage::is_reserved_category(&cat) {
             continue;
         }
-        if out.iter().any(|existing| storage::same_category(existing, &cat)) {
+        if out
+            .iter()
+            .any(|existing| storage::same_category(existing, &cat))
+        {
             continue;
         }
         out.push(cat);
@@ -1948,11 +2370,11 @@ fn protected_chip(ui: &mut egui::Ui) {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
-    use crate::model::Protection;
     use crate::grid::{
         gap_point, grid_card_rect, nearest_gap, visible_rows, CARD_H, CARD_SPACING, CARD_W,
         GRID_TOP_SPACE, ROW_PITCH,
     };
+    use crate::model::Protection;
 
     /// Builds an app whose data files live in a throwaway temp directory, so tests that
     /// exercise the auto-save paths never write into the repository or clobber real user data.
@@ -1964,7 +2386,9 @@ mod layout_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp data dir");
         let store = Store::at(dir.clone());
-        store.save_snippets(&snippets).expect("seed fixture snippets");
+        store
+            .save_snippets(&snippets)
+            .expect("seed fixture snippets");
         store
             .save_config(&Config {
                 categories,
@@ -1980,6 +2404,7 @@ mod layout_tests {
         Snippet {
             id,
             title: format!("Snippet {id}"),
+            description: String::new(),
             category: category.to_string(),
             body: format!("body {id}"),
             protection: None,
@@ -1992,6 +2417,7 @@ mod layout_tests {
         Snippet {
             id,
             title: format!("Secret {id}"),
+            description: String::new(),
             category: category.to_string(),
             body: String::new(),
             protection: Some(Protection {
@@ -2655,6 +3081,7 @@ mod layout_tests {
                 Snippet {
                     id: 1,
                     title: "Rebase onto main".into(),
+                    description: String::new(),
                     category: "Git".into(),
                     body: "git rebase origin/MAIN".into(),
                     protection: None,
@@ -2662,6 +3089,7 @@ mod layout_tests {
                 Snippet {
                     id: 2,
                     title: "Summarize".into(),
+                    description: String::new(),
                     category: "Prompt".into(),
                     body: "Summarize the following text".into(),
                     protection: None,
@@ -2669,6 +3097,7 @@ mod layout_tests {
                 Snippet {
                     id: 3,
                     title: "Stash".into(),
+                    description: String::new(),
                     category: "Git".into(),
                     body: "git stash pop".into(),
                     protection: None,
@@ -2779,6 +3208,7 @@ mod layout_tests {
             vec![Snippet {
                 id: 1,
                 title: "T".into(),
+                description: String::new(),
                 category: "Git".into(),
                 body: "  first    line\nsecond line  ".into(),
                 protection: None,
@@ -2854,7 +3284,11 @@ mod layout_tests {
         uniq.sort_unstable();
         uniq.dedup();
         assert_eq!(uniq.len(), lib.len(), "every id must stay unique");
-        assert_eq!(uniq, vec![1, 2, 3, 4], "duplicates get fresh ids from the sequence");
+        assert_eq!(
+            uniq,
+            vec![1, 2, 3, 4],
+            "duplicates get fresh ids from the sequence"
+        );
     }
 
     #[test]
@@ -2880,7 +3314,7 @@ mod layout_tests {
         assert_eq!(app.snippets[0].title, "New prompt");
         assert_eq!(app.snippets[0].body, "some body");
         assert!(app.save_error.is_empty());
-        match storage::load(&app.store.snippets_path) {
+        match app.store.load_snippets() {
             storage::Load::Loaded(snips) => {
                 assert_eq!(snips.len(), 1);
                 assert_eq!(snips[0].title, "New prompt");
@@ -2969,7 +3403,10 @@ mod layout_tests {
         // A blank name is rejected too, with its own message.
         let ed = app.apply_add_category("   ".into(), ed);
         assert!(ed.adding_category);
-        assert_eq!(ed.category_error.as_deref(), Some("Category can't be blank"));
+        assert_eq!(
+            ed.category_error.as_deref(),
+            Some("Category can't be blank")
+        );
     }
 
     #[test]
@@ -3235,10 +3672,13 @@ mod layout_tests {
             vec!["Git".into()],
         );
 
-        app.save_error.push(format!("{SNIPPETS_SAVE_ERROR}: disk full"));
+        app.save_error
+            .push(format!("{SNIPPETS_SAVE_ERROR}: disk full"));
         let _ = app.save_config();
         assert!(
-            app.save_error.iter().any(|e| e == "Couldn't save snippets: disk full"),
+            app.save_error
+                .iter()
+                .any(|e| e == "Couldn't save snippets: disk full"),
             "a config write must not hide a snippet-save failure"
         );
 
@@ -3249,7 +3689,8 @@ mod layout_tests {
         );
 
         // Startup notices about recovered data files survive until dismissed.
-        app.save_error.push("snippets.json couldn't be read".to_string());
+        app.save_error
+            .push("snippets.json couldn't be read".to_string());
         app.save_snippets();
         let _ = app.save_config();
         assert!(!app.save_error.is_empty());
@@ -3277,7 +3718,7 @@ mod layout_tests {
             "temp files left behind: {leftovers:?}"
         );
 
-        match storage::load(&app.store.snippets_path) {
+        match app.store.load_snippets() {
             storage::Load::Loaded(snippets) => {
                 assert_eq!(
                     snippets.iter().map(|s| s.id).collect::<Vec<_>>(),
@@ -3404,6 +3845,7 @@ mod layout_tests {
             vec![Snippet {
                 id: 1,
                 title: "Secret".into(),
+                description: String::new(),
                 category: "Git".into(),
                 body: String::new(),
                 protection: Some(protection),
@@ -3412,6 +3854,16 @@ mod layout_tests {
         );
         app.vault_meta = Some(meta.clone());
         (app, meta, key)
+    }
+
+    /// Installs a deterministic `SimClipboard` backend into the app and returns its shared
+    /// observer handle so tests can assert/control clipboard contents without touching the
+    /// real system clipboard.
+    #[allow(dead_code)] // test-support helper; some test builds don't call it
+    fn with_sim_clipboard(app: &mut CopyIt) -> SimHandle {
+        let (backend, handle) = SimClipboard::new();
+        app.clipboard = Box::new(backend);
+        handle
     }
 
     fn input_frame() -> egui::RawInput {
@@ -3433,6 +3885,7 @@ mod layout_tests {
                 Snippet {
                     id: 2,
                     title: "AWS prod key".into(),
+                    description: String::new(),
                     category: "Secrets".into(),
                     body: String::new(),
                     protection: Some(Protection {
@@ -3447,7 +3900,11 @@ mod layout_tests {
 
         // The hint is cleartext metadata, not searchable text.
         app.search = "ghp_x".into();
-        assert_eq!(app.take_filtered(), Vec::<usize>::new(), "hint must never enter search");
+        assert_eq!(
+            app.take_filtered(),
+            Vec::<usize>::new(),
+            "hint must never enter search"
+        );
         app.restore_filtered(Vec::new());
         // Title and category stay searchable.
         app.search = "AWS".into();
@@ -3462,7 +3919,10 @@ mod layout_tests {
     fn masked_preview_follows_the_hint_rule_for_protected_cards() {
         let app = test_app(
             "masked-preview",
-            vec![protected_snippet(1, "Git", "ghp_x"), protected_snippet(2, "Git", "")],
+            vec![
+                protected_snippet(1, "Git", "ghp_x"),
+                protected_snippet(2, "Git", ""),
+            ],
             vec!["Git".into()],
         );
         assert_eq!(
@@ -3521,20 +3981,27 @@ mod layout_tests {
             app.vault_prompt.as_ref().unwrap().pending,
             Some(PendingVaultAction::Edit(1))
         ));
-        assert!(app.editor.is_none(), "the editor must not open while locked");
+        assert!(
+            app.editor.is_none(),
+            "the editor must not open while locked"
+        );
     }
 
     #[test]
     fn unlocked_copy_places_plaintext_on_the_clipboard() {
         let (mut app, _, key) = protected_test_app("unlocked-copy", "super secret value");
+        let handle = with_sim_clipboard(&mut app);
         app.vault.unlock_with_key(key);
         let ctx = egui::Context::default();
         let output = ctx.run(input_frame(), |ctx| {
             app.dispatch_action(Action::Copy(1), ctx, 0.0);
         });
-        assert_eq!(output.platform_output.copied_text, "super secret value");
+        // In tests every copy routes through the deterministic backend, so observe the
+        // placed text via the shared handle rather than egui's `copied_text`.
+        assert_eq!(handle.text(), "super secret value");
         assert_eq!(app.copied, Some((1, 0.0)));
         assert!(app.vault_prompt.is_none());
+        let _ = output;
     }
 
     #[test]
@@ -3557,6 +4024,15 @@ mod layout_tests {
         prompt.password = "wrong".into();
         let kept = app
             .handle_vault_prompt(prompt, &ctx, 0.0)
+            .expect("modal stays open (busy) on submit");
+        // KDF is now off the UI thread: the prompt stays open with no inline error
+        // until the worker finishes. In tests the worker runs immediately.
+        assert!(kept.error.is_none(), "busy: no error yet");
+        app.vault_prompt = Some(kept);
+        app.poll_vault_work(&ctx, 0.0);
+        let kept = app
+            .vault_prompt
+            .as_ref()
             .expect("modal stays open on a wrong password");
         assert_eq!(kept.error.as_deref(), Some("Wrong password. Try again."));
         assert!(app.vault.is_locked(), "wrong password must not unlock");
@@ -3579,7 +4055,8 @@ mod layout_tests {
         bytes[0] ^= 0xff;
         protection.ciphertext = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
-        let file_before = std::fs::read_to_string(&app.store.snippets_path).unwrap();
+        let db = crate::sqlite::db_path_for(app.store.snippets_path.parent().unwrap());
+        let file_before = std::fs::read(&db).unwrap();
         let ctx = egui::Context::default();
         let output = ctx.run(input_frame(), |ctx| {
             app.dispatch_action(Action::Copy(1), ctx, 0.0);
@@ -3593,7 +4070,7 @@ mod layout_tests {
         assert!(banner.contains("Secret"), "banner names the card: {banner}");
         assert!(banner.contains("can't be decrypted"));
         assert_eq!(
-            std::fs::read_to_string(&app.store.snippets_path).unwrap(),
+            std::fs::read(&db).unwrap(),
             file_before,
             "the failed decrypt must leave the file untouched"
         );
@@ -3620,11 +4097,12 @@ mod layout_tests {
         assert_eq!(app.derived[0].body_lower, "");
         assert_eq!(app.derived[0].preview, vault::masked_preview("a sec"));
         // On disk: ciphertext only, no plaintext.
-        let raw = std::fs::read_to_string(&app.store.snippets_path).unwrap();
-        assert!(!raw.contains("a secret body long enough"), "secret on disk: {raw}");
-        assert!(raw.contains("ciphertext"));
+        let db = crate::sqlite::db_path_for(app.store.snippets_path.parent().unwrap());
+        let raw_bytes = std::fs::read(&db).unwrap();
+        let raw = String::from_utf8_lossy(&raw_bytes);
+        assert!(!raw.contains("a secret body long enough"), "secret on disk");
         // Round-trips through the store.
-        match storage::load(&app.store.snippets_path) {
+        match app.store.load_snippets() {
             storage::Load::Loaded(snips) => {
                 assert!(snips[0].protection.is_some());
                 assert!(snips[0].body.is_empty());
@@ -3638,19 +4116,25 @@ mod layout_tests {
         let (mut app, _, key) = protected_test_app("unprotect", "a secret body long enough");
         app.vault.unlock_with_key(key);
         let mut ed = Editor::from_snippet(&app.snippets[0], &app.categories);
-        assert!(ed.protect, "the checkbox starts checked on a protected card");
+        assert!(
+            ed.protect,
+            "the checkbox starts checked on a protected card"
+        );
         ed.protect = false;
         ed.body = "now plaintext".into();
         app.apply_save(ed);
 
         assert!(app.snippets[0].protection.is_none());
         assert_eq!(app.snippets[0].body, "now plaintext");
-        let raw = std::fs::read_to_string(&app.store.snippets_path).unwrap();
-        assert!(raw.contains("now plaintext"));
-        assert!(raw.contains("\"body\": \"now plaintext\""));
-        assert!(!raw.contains("ciphertext"));
-        // The card renders normally again.
         assert_eq!(app.derived[0].body_lower, "now plaintext");
+        // On disk: the body is restored as plaintext and the vault is dropped.
+        match app.store.load_snippets() {
+            storage::Load::Loaded(snips) => {
+                assert!(snips[0].protection.is_none());
+                assert_eq!(snips[0].body, "now plaintext");
+            }
+            _ => panic!("saved library should load back"),
+        }
     }
 
     #[test]
@@ -3668,8 +4152,14 @@ mod layout_tests {
         app.handle_editor_save(ed);
         let prompt = app.vault_prompt.take().expect("create prompt opens");
         assert!(matches!(prompt.mode, VaultPromptMode::Create));
-        assert!(matches!(prompt.pending, Some(PendingVaultAction::ProtectSave(_))));
-        assert!(app.snippets.is_empty(), "nothing saved before the vault exists");
+        assert!(matches!(
+            prompt.pending,
+            Some(PendingVaultAction::ProtectSave(_))
+        ));
+        assert!(
+            app.snippets.is_empty(),
+            "nothing saved before the vault exists"
+        );
 
         // Password too short: inline error, no vault, nothing persisted.
         let mut prompt = prompt;
@@ -3679,7 +4169,11 @@ mod layout_tests {
         let kept = app
             .handle_vault_prompt(prompt, &ctx, 0.0)
             .expect("a short password keeps the modal open");
-        assert!(kept.error.as_ref().unwrap().contains("at least 8 characters"));
+        assert!(kept
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("at least 8 characters"));
         assert!(app.vault_meta.is_none());
         assert!(app.snippets.is_empty());
 
@@ -3699,7 +4193,16 @@ mod layout_tests {
         prompt.password = "password1".into();
         prompt.confirm = "password1".into();
         prompt.error = None;
-        assert!(app.handle_vault_prompt(prompt, &ctx, 0.0).is_none(), "modal closes on success");
+        let kept = app
+            .handle_vault_prompt(prompt, &ctx, 0.0)
+            .expect("busy after submit");
+        assert!(kept.error.is_none());
+        app.vault_prompt = Some(kept);
+        app.poll_vault_work(&ctx, 0.0);
+        assert!(
+            app.vault_prompt.is_none(),
+            "modal closes on success after poll"
+        );
         assert!(app.vault.is_unlocked());
         assert!(app.vault_meta.is_some());
         assert_eq!(app.snippets.len(), 1);
@@ -3707,7 +4210,7 @@ mod layout_tests {
         assert!(app.snippets[0].body.is_empty());
 
         // `config.json` now carries the vault section.
-        match storage::load_config(&app.store.config_path) {
+        match app.store.load_config() {
             storage::Load::Loaded(config) => {
                 assert!(config.vault.is_some(), "first protect persists the vault");
             }
@@ -3726,5 +4229,395 @@ mod layout_tests {
         // After locking, protected actions prompt again.
         app.dispatch_action(Action::Copy(1), &egui::Context::default(), 0.0);
         assert!(app.vault_prompt.is_some());
+    }
+
+    // ===== Workstream 1: per-file write protection after unrecoverable corruption-backup failure =====
+
+    /// Every class of library mutation (add/edit/delete/reorder) must refuse to touch a
+    /// corrupt snippets.json whose backup rename failed at startup.
+    #[test]
+    fn blocked_snippets_file_survives_every_mutation_class() {
+        let mut app = test_app(
+            "refuse-every-mutation",
+            vec![snippet(1, "Git"), snippet(2, "Git")],
+            vec!["Git".into()],
+        );
+        let original = "original corrupt bytes".to_string();
+        let snippets_path = app.store.snippets_path.clone();
+        std::fs::write(&snippets_path, &original).unwrap();
+        app.refuse_snippets_overwrite = true;
+        let preserved = || {
+            assert_eq!(
+                std::fs::read_to_string(&snippets_path).unwrap(),
+                original,
+                "the corrupt recovery copy must stay byte-for-byte intact"
+            );
+        };
+
+        let mut added = Editor::blank(&app.categories);
+        added.title = "Added while blocked".into();
+        app.apply_save(added);
+        assert_eq!(app.snippets.len(), 3, "mutation applies in memory");
+        preserved();
+
+        let mut edited = Editor::from_snippet(&app.snippets[0], &app.categories);
+        edited.title = "Edited while blocked".into();
+        app.apply_save(edited);
+        preserved();
+
+        app.snippets.retain(|s| s.id != 2);
+        app.snippets_changed();
+        preserved();
+
+        let order: Vec<usize> = (0..app.snippets.len()).collect();
+        app.reorder(app.snippets[order[0]].id, order.len() - 1, &order);
+        preserved();
+
+        assert!(
+            app.save_error
+                .iter()
+                .any(|m| m.contains("snippets.json is corrupt")),
+            "the refusal error stays surfaced"
+        );
+    }
+
+    /// Theme/category/vault operations must not replace a corrupt config.json whose
+    /// backup rename failed at startup.
+    #[test]
+    fn blocked_config_file_survives_settings_changes() {
+        let mut app = test_app(
+            "refuse-config-changes",
+            vec![snippet(1, "Git")],
+            vec!["Git".into()],
+        );
+        let original = "original config recovery bytes";
+        std::fs::write(&app.store.config_path, original).unwrap();
+        app.refuse_config_overwrite = true;
+
+        app.theme_raw = None;
+        let _ = app.save_config();
+        assert_eq!(
+            std::fs::read_to_string(&app.store.config_path).unwrap(),
+            original,
+            "a theme change must preserve the corrupt config"
+        );
+
+        let canonical = app.add_category("prompt");
+        assert_eq!(canonical, "Prompt", "category registers in memory");
+        assert!(app.categories.contains(&"Prompt".to_string()));
+        assert_eq!(
+            std::fs::read_to_string(&app.store.config_path).unwrap(),
+            original,
+            "a category change must preserve the corrupt config"
+        );
+        assert!(
+            app.save_error
+                .iter()
+                .any(|m| m.contains("config.json is corrupt")),
+            "the refusal error stays surfaced"
+        );
+    }
+
+    /// With both files blocked simultaneously, neither file's protection is lifted or
+    /// hidden by the other file's save outcomes.
+    #[test]
+    fn both_files_blocked_stay_independently_blocked() {
+        let mut app = test_app(
+            "refuse-both-files",
+            vec![snippet(1, "Git")],
+            vec!["Git".into()],
+        );
+        let corrupt_snippets = "snippets recovery copy";
+        let corrupt_config = "config recovery copy";
+        std::fs::write(&app.store.snippets_path, corrupt_snippets).unwrap();
+        std::fs::write(&app.store.config_path, corrupt_config).unwrap();
+        app.refuse_snippets_overwrite = true;
+        app.refuse_config_overwrite = true;
+
+        app.save_snippets();
+        let _ = app.save_config();
+        assert!(app.refuse_snippets_overwrite && app.refuse_config_overwrite);
+        assert!(
+            app.save_error
+                .iter()
+                .any(|m| m.contains("snippets.json is corrupt")),
+            "snippets refusal stays surfaced"
+        );
+        assert!(
+            app.save_error
+                .iter()
+                .any(|m| m.contains("config.json is corrupt")),
+            "config refusal stays surfaced"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&app.store.snippets_path).unwrap(),
+            corrupt_snippets
+        );
+        assert_eq!(
+            std::fs::read_to_string(&app.store.config_path).unwrap(),
+            corrupt_config
+        );
+    }
+
+    // ===== Workstream 2: settings persistence failures are non-silent =====
+
+    /// A failed settings write must produce a visible warning (the in-memory change
+    /// stays active but is not durable), never a silent discard.
+    #[test]
+    fn config_save_failures_are_surfaced_not_swallowed() {
+        let mut app = test_app(
+            "config-failure-visible",
+            vec![snippet(1, "Git")],
+            vec!["Git".into()],
+        );
+        app.refuse_config_overwrite = true;
+
+        app.theme_raw = None;
+        let _ = app.save_config();
+        assert!(
+            app.save_error
+                .iter()
+                .any(|m| m.starts_with(CONFIG_SAVE_ERROR)),
+            "a failed theme write must be surfaced"
+        );
+
+        let canonical = app.add_category("prompt");
+        assert_eq!(canonical, "Prompt");
+        assert!(
+            app.save_error
+                .iter()
+                .any(|m| m.starts_with(CONFIG_SAVE_ERROR)),
+            "a failed category write must be surfaced"
+        );
+    }
+
+    /// Repeated failures must not grow duplicate copies of the same warning in the
+    /// banner: every refused save re-raises its error, but identical text is deduped.
+    #[test]
+    fn repeated_save_failures_dont_duplicate_banner_entries() {
+        let mut app = test_app("banner-dedup", vec![snippet(1, "Git")], vec!["Git".into()]);
+        app.refuse_snippets_overwrite = true;
+        app.refuse_config_overwrite = true;
+
+        for _ in 0..3 {
+            app.save_snippets();
+            let _ = app.save_config();
+        }
+        let snips = app
+            .save_error
+            .iter()
+            .filter(|m| m.contains("snippets.json is corrupt"))
+            .count();
+        let cfg = app
+            .save_error
+            .iter()
+            .filter(|m| m.contains("config.json is corrupt"))
+            .count();
+        assert_eq!(snips, 1, "snippets refusal shown once, got {snips}");
+        assert_eq!(cfg, 1, "config refusal shown once, got {cfg}");
+    }
+
+    /// A later successful save retires only its own class of error: a successful config
+    /// write must not clear snippet-save errors or recovery notices.
+    #[test]
+    fn successful_config_save_retires_only_its_own_error() {
+        let mut app = test_app(
+            "retire-config-only",
+            vec![snippet(1, "Git")],
+            vec!["Git".into()],
+        );
+        app.save_error
+            .push(format!("{CONFIG_SAVE_ERROR}: disk full"));
+        app.save_error
+            .push(format!("{SNIPPETS_SAVE_ERROR}: disk full"));
+        app.save_error
+            .push("snippets.json couldn't be read (recovered)".to_string());
+
+        let _ = app.save_config();
+        assert!(
+            !app.save_error
+                .iter()
+                .any(|m| m.starts_with(CONFIG_SAVE_ERROR)),
+            "config error retired"
+        );
+        assert!(
+            app.save_error
+                .iter()
+                .any(|m| m.starts_with(SNIPPETS_SAVE_ERROR)),
+            "snippet error retained"
+        );
+        assert!(
+            app.save_error
+                .iter()
+                .any(|m| m.contains("couldn't be read")),
+            "recovery notice retained"
+        );
+    }
+
+    // ===== Workstream 4: explicit migration / directory-init outcomes =====
+
+    /// A known failed legacy migration must be reported at startup instead of
+    /// masquerading as a clean first launch; a clean migration stays silent.
+    #[test]
+    fn failed_migration_is_reported_not_hidden() {
+        let mut app = test_app("migration-report", vec![], vec![]);
+        assert!(app.save_error.is_empty());
+
+        let blocked = LegacyMigration {
+            snippets: MigrationOutcome::Blocked {
+                source: std::path::PathBuf::from("legacy").join("snippets.json"),
+                reason: "access is denied".into(),
+            },
+            config: MigrationOutcome::NoSource,
+        };
+        app.note_startup_problems(None, &blocked);
+        assert_eq!(app.save_error.len(), 1, "clean outcomes stay silent");
+        assert!(app.save_error[0].contains("snippets.json"));
+        assert!(app.save_error[0].contains("left untouched"));
+
+        let init_error = std::io::Error::other("the parameter is incorrect");
+        let clean = LegacyMigration {
+            snippets: MigrationOutcome::NoSource,
+            config: MigrationOutcome::NoSource,
+        };
+        app.note_startup_problems(Some(&init_error), &clean);
+        assert!(
+            app.save_error
+                .iter()
+                .any(|m| m.contains("Couldn't create the data folder") && m.contains("snippets")),
+            "init error names the data folder"
+        );
+    }
+
+    // ===== Workstream 5: protected clipboard bounded lifetime =====
+
+    /// A protected copy is placed immediately; its scheduled clear fires only if the
+    /// clipboard still holds CopyIt's own copy (sequence unchanged).
+    #[test]
+    fn protected_copy_expiry_clears_only_its_own_content() {
+        let (mut app, _, key) = protected_test_app("clip-expire", "super secret value");
+        let handle = with_sim_clipboard(&mut app);
+        app.vault.unlock_with_key(key);
+
+        let ctx = egui::Context::default();
+        let _output = ctx.run(input_frame(), |ctx| {
+            app.dispatch_action(Action::Copy(1), ctx, 0.0);
+        });
+        assert_eq!(handle.text(), "super secret value");
+        assert!(
+            app.protected_copy.is_some(),
+            "a timed clear should be scheduled"
+        );
+
+        // Before expiry nothing is cleared.
+        app.tick_clipboard(0.0);
+        assert_eq!(handle.text(), "super secret value");
+
+        // At expiry, still our copy -> cleared.
+        let expires = app.protected_copy.unwrap().expires_at + 1.0;
+        app.tick_clipboard(expires);
+        assert!(handle.text().is_empty(), "our copy is cleared at expiry");
+        assert!(app.protected_copy.is_none());
+    }
+
+    /// If the user or another app copies something new before the window elapses, the
+    /// scheduled clear does nothing - newer content is never clobbered.
+    #[test]
+    fn clipboard_overwritten_before_expiry_is_left_alone() {
+        let (mut app, _, key) = protected_test_app("clip-overwrite", "super secret value");
+        let handle = with_sim_clipboard(&mut app);
+        app.vault.unlock_with_key(key);
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(input_frame(), |ctx| {
+            app.dispatch_action(Action::Copy(1), ctx, 0.0);
+        });
+        assert_eq!(handle.text(), "super secret value");
+
+        handle.overwrite("user pasted something else");
+        let expires = app.protected_copy.unwrap().expires_at + 1.0;
+        app.tick_clipboard(expires);
+        assert_eq!(
+            handle.text(),
+            "user pasted something else",
+            "newer content kept"
+        );
+    }
+
+    /// Locking the vault clears a still-current protected copy early.
+    #[test]
+    fn locking_the_vault_clears_the_current_protected_copy() {
+        let (mut app, _, key) = protected_test_app("clip-lock", "super secret value");
+        let handle = with_sim_clipboard(&mut app);
+        app.vault.unlock_with_key(key);
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(input_frame(), |ctx| {
+            app.dispatch_action(Action::Copy(1), ctx, 0.0);
+        });
+        assert_eq!(handle.text(), "super secret value");
+        assert!(app.protected_copy.is_some());
+
+        app.lock_vault();
+        assert!(
+            handle.text().is_empty(),
+            "lock clears the still-current copy"
+        );
+        assert!(app.protected_copy.is_none());
+    }
+
+    /// An ordinary (unprotected) copy is placed and is never scheduled for auto-clear.
+    /// (In tests, all copies route through the deterministic backend, so the
+    /// expectation mirrors production's persistent-clipboard behavior.)
+    #[test]
+    fn unprotected_copy_has_no_security_timeout() {
+        let mut app = test_app(
+            "clip-unprotected",
+            vec![snippet(1, "Git")],
+            vec!["Git".into()],
+        );
+        let handle = with_sim_clipboard(&mut app);
+        let ctx = egui::Context::default();
+        let output = ctx.run(input_frame(), |ctx| {
+            app.dispatch_action(Action::Copy(1), ctx, 0.0);
+        });
+        assert_eq!(
+            handle.text(),
+            "body 1",
+            "the copy is placed on the clipboard"
+        );
+        assert!(
+            app.protected_copy.is_none(),
+            "no security timeout scheduled"
+        );
+        let _ = output;
+    }
+
+    /// A clipboard backend failure is surfaced once and never fatal.
+    #[test]
+    fn clipboard_failure_is_surfaced_non_fatal() {
+        let (mut app, _, key) = protected_test_app("clip-fail", "super secret value");
+        let handle = with_sim_clipboard(&mut app);
+        handle.set_fail_writes(true);
+        app.vault.unlock_with_key(key);
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(input_frame(), |ctx| {
+            app.dispatch_action(Action::Copy(1), ctx, 0.0);
+        });
+        assert!(
+            handle.text().is_empty(),
+            "nothing was placed on the clipboard"
+        );
+        assert!(
+            app.protected_copy.is_none(),
+            "no clear scheduled on failure"
+        );
+        assert!(
+            app.save_error
+                .iter()
+                .any(|m| m.contains("protected copy on the clipboard")),
+            "backend failure is surfaced"
+        );
     }
 }

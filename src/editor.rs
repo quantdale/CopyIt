@@ -180,6 +180,7 @@ mod tests {
         let s = Snippet {
             id: 7,
             title: "Stash".into(),
+            description: String::new(),
             category: "pRoMpT".into(),
             body: "git stash".into(),
             protection: None,
@@ -191,6 +192,7 @@ mod tests {
         let unknown = Snippet {
             id: 8,
             title: "X".into(),
+            description: String::new(),
             category: "Uncategorized".into(),
             body: "y".into(),
             protection: None,
@@ -206,12 +208,16 @@ mod tests {
         let s = Snippet {
             id: 9,
             title: "Café".into(),
+            description: String::new(),
             category: "CAFÉ".into(),
             body: "x".into(),
             protection: None,
         };
         let ed = Editor::from_snippet(&s, &["Café".to_string()]);
-        assert_eq!(ed.category, "Café", "must match using full Unicode case folding");
+        assert_eq!(
+            ed.category, "Café",
+            "must match using full Unicode case folding"
+        );
     }
 
     #[test]
@@ -220,11 +226,14 @@ mod tests {
         let s = Snippet {
             id: 5,
             title: "T".into(),
+            description: String::new(),
             category: "Git".into(),
             body: "b".into(),
             protection: None,
         };
-        assert!(Editor::from_snippet(&s, &categories()).category_error.is_none());
+        assert!(Editor::from_snippet(&s, &categories())
+            .category_error
+            .is_none());
     }
 
     #[test]
@@ -289,6 +298,7 @@ mod tests {
         let plain = Snippet {
             id: 1,
             title: "T".into(),
+            description: String::new(),
             category: "Git".into(),
             body: "plain".into(),
             protection: None,
@@ -298,6 +308,7 @@ mod tests {
         let protected = Snippet {
             id: 2,
             title: "T".into(),
+            description: String::new(),
             category: "Git".into(),
             body: String::new(), // empty on disk for protected snippets
             protection: Some(crate::model::Protection {

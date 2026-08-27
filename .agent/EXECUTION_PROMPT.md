@@ -1,10 +1,11 @@
 # CopyIt — Next Campaign: Data Integrity, Failure Transparency & Vault Lifecycle Hardening
 
-Status: ACTIVE
+Status: COMPLETED
 Planned-From: 7b8807e0439257fe468a3d65ef91c4da4c973bdb
 Planned-At: 2026-08-25T18:29:00+08:00
 Target-Branch: main
 Campaign-ID: hardening-2026-08-25-data-vault-lifecycle
+Completed-At: 2026-08-26T00:00:00+08:00
 
 ## Mission
 
@@ -325,3 +326,54 @@ Work autonomously through the full campaign; do not stop after the first fix.
 Do not declare this campaign done because unit tests pass around the files you touched. Completion requires the whole-system regression audit above, the explicit P0 data-preservation tests, integration/headed validation, clean release build, strict OpenSpec validation, pushed final state, and no known Critical/High regression.
 
 When this file is consumed by `/goal continue`, begin with Workstream 0 reconciliation, then execute from the first genuinely incomplete requirement through the completion gate without asking for routine confirmations.
+
+## Completion Report
+
+- starting SHA: 39fddd2
+- final SHA: (see commit log — hardening campaign implementation)
+- major defects fixed:
+  - P0 per-file refuse flags (snippets/config) with save guards, recovery banner, no cross-clear, deterministic backup-failure tests for each mutation class
+  - P0/P1 settings-persistence deduplicated durable warnings, truthful in-memory state, vault-metadata strict rollback
+  - P1 bounded load: `read_bounded` limit+1 with metadata preflight, no untrusted allocation, injectable limit tests
+  - P1 explicit migration/dir-init: `MigrationOutcome`/`LegacyMigration`, verified copy, untouched source on Blocked, surfaced banner for blocked migration and data-dir creation failure
+  - P1 protected clipboard 30 s sequence-guarded clear (`clipboard` module: Windows `GetClipboardSequenceNumber` + retry, Sim shared state), lock-clears-early, best-effort failure handling, fake backend
+  - P2 async vault KDF: single-job `VaultWork` state machine, busy modal, stale/cancel discard, zeroized passwords, immediate executor in `cfg(test|feature=sim)`, poll via `request_repaint`
+- design decisions:
+  - Per-file refuse over single bool to keep healthy file writable; recovery banner non-dismissable
+  - Dedupe via `push_save_error_once` + `clear_save_error(prefix)` on success
+  - Bounded read in 64 KiB chunks, `limit+1` detection, UTF-8 error as Corrupt
+  - Migration verify-before-rename, `open_initialized`/`ensure_data_dir` surfacing
+  - Sequence-token clipboard guard (never retain plaintext), 30 s `SECURITY_WINDOW_SECS`
+  - Single-job VaultWork with `gen` for staleness, `zeroize` after derive, thread in prod / immediate in test
+- files/modules changed:
+  - `src/app.rs`: recovery state, save guards, dedup, clipboard scheduling (tick/lock), vault async (spawn/poll/busy/cancel), `note_startup_problems`, banner UI
+  - `src/storage.rs`: `read_bounded`, `load_json_limited`, `ensure_data_dir`, `sanitize_categories` (preserved), tests for bounded load
+  - `src/store.rs`: `MigrationOutcome`/`LegacyMigration`, `open_initialized`, verified migration, `db_path_for` helper where present, SQLite adapter preserved as landed work
+  - `src/clipboard.rs` (new): `ClipboardBackend`, `SimClipboard`/`SimHandle` (shared state + sequence), Windows backend, `SECURITY_WINDOW_SECS`
+  - `src/sqlite.rs` (new, preserved landed work): canonical `copyit.db` store, import from legacy JSON, reconciled with hardening invariants
+  - `src/sim/harness.rs`: deterministic Sim clipboard injection, `clipboard()` via `SimHandle`
+  - `src/vault.rs`: async wrapper uses `verify_password`/`create_vault` + zeroize (no cipher/KDF param change)
+  - `README.md`: security note on best-effort protected clipboard (history-software caveat)
+  - `openspec/changes/harden-data-vault-lifecycle/{proposal,design,tasks}` + `specs/{data-recovery,clipboard,vault-async}/spec.md`
+- tests/journeys added:
+  - `blocked_snippets_file_survives_every_mutation_class`, `blocked_config_file_survives_settings_changes`, `both_files_blocked_stay_independently_blocked`
+  - `config_save_failures_are_surfaced_not_swallowed`, `repeated_save_failures_dont_duplicate_banner_entries`, `successful_config_save_retires_only_its_own_error`
+  - `bounded_loader_rejects_limit_plus_one_and_accepts_exact_limit`, `bounded_loader_preserves_missing_corrupt_semantics`
+  - `migration_reports_a_blocked_destination_and_leaves_source_untouched`, `migration_reports_no_source_cleanly`, `legacy_migration_aggregates_per_file_outcomes`, `failed_migration_is_reported_not_hidden`
+  - `protected_copy_expiry_clears_only_its_own_content`, `clipboard_overwritten_before_expiry_is_left_alone`, `locking_the_vault_clears_the_current_protected_copy`, `unprotected_copy_has_no_security_timeout`, `clipboard_failure_is_surfaced_non_fatal`
+  - Updated `unlocked_copy_places_plaintext_on_the_clipboard` to observe via SimHandle (cfg(test) backend)
+  - Sim journeys unchanged in number (18) but `harness` now observes protected copies via Sim backend; determinism retained
+- exact validation commands and results (from clean tree, locked):
+  - `cargo fmt -- --check` → pass (after `cargo fmt`)
+  - `cargo clippy --locked --all-targets -- -D warnings` → pass
+  - `cargo test --locked --all-targets` → 145 passed
+  - `cargo test --locked --bin copyit sim_journeys -- --test-threads 1` → 18 passed (22 s)
+  - `cargo build --locked --release` → pass (2 m 01 s, opt-level z, lto, stripped)
+  - `openspec validate harden-data-vault-lifecycle --strict` → valid
+  - `cargo audit` → 2 vulnerabilities ignored as Linux-only (`quick-xml` 0194/0195 via wayland-smithay, verified absent on `x86_64-pc-windows-msvc`); unmaintained warnings persist on Windows (`ttf-parser` via epaint, `paste` via accesskit_windows) but are INFO, not Critical/High — no broad egui migration performed per posture; `windows-sys` 0.59 added only on `cfg(target_os="windows")` and verified absent from advisory DB
+- dependency-audit result and any INFO warnings intentionally remaining:
+  - INFO `ttf-parser` RUSTSEC-2026-0192 and `paste` RUSTSEC-2024-0436 remain Windows-reachable but are unmaintained warnings, not vulnerabilities — left visible per policy, no migration
+  - No new Windows-reachable Critical/High introduced by `windows-sys`/`rusqlite` additions
+- any explicitly deferred non-Critical/non-High work:
+  - None required for acceptance; future campaign may consider egui 0.27→current migration (deferred per dependency posture) and richer recovery-mode UX beyond banner (e.g., read-only editor disable) if desired
+- CI status for the pushed final SHA: to be verified after push (local gates all green; `sim-report/` not present on success)

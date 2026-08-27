@@ -16,7 +16,7 @@ use crate::model::Snippet;
 use crate::sim::harness::run_dir_for;
 use crate::sim::harness::SimApp;
 use crate::sim::persona::{
-    ERROR_HANDLER, FIRST_RUN_EXPLORER, POWER_ORGANIZER, THEME_HOPPER, Persona,
+    Persona, ERROR_HANDLER, FIRST_RUN_EXPLORER, POWER_ORGANIZER, THEME_HOPPER,
 };
 #[cfg(test)]
 use crate::sim::report::Report;
@@ -90,9 +90,7 @@ impl Intent {
         match self {
             Intent::ClickText(label) => ("click_text".into(), label.to_string()),
             Intent::ClickFirstText(label) => ("click_first_text".into(), label.to_string()),
-            Intent::TypeInto(field, text) => {
-                ("type_into".into(), format!("{field} <- {text}"))
-            }
+            Intent::TypeInto(field, text) => ("type_into".into(), format!("{field} <- {text}")),
             Intent::ReplaceField(field, text) => {
                 ("replace_field".into(), format!("{field} <- {text}"))
             }
@@ -239,15 +237,21 @@ pub fn materialize(run_dir: &Path, fixtures: &Fixtures) -> Result<Store, String>
             .map_err(|e| format!("write fixture snippets: {e}"))?;
     }
     if let Some(config) = &fixtures.config {
-        store.save_config(config).map_err(|e| format!("write fixture config: {e}"))?;
+        store
+            .save_config(config)
+            .map_err(|e| format!("write fixture config: {e}"))?;
     }
     if fixtures.block_save {
-        // `write_atomic` writes to `snippets.json.<pid>.tmp`; a directory with
-        // that exact name makes the write fail cleanly on every platform.
-        let tmp = store
-            .snippets_path
-            .with_file_name(format!("snippets.json.{}.tmp", std::process::id()));
-        std::fs::create_dir_all(&tmp).map_err(|e| format!("block save: {e}"))?;
+        // Make the canonical db file read-only: the app opens it read-only for
+        // loads (so the library still loads), but any save attempt opens it
+        // read-write and fails cleanly — the portable stand-in for a read-only
+        // data directory.
+        let db = crate::sqlite::db_path_for(run_dir);
+        let mut perms = std::fs::metadata(&db)
+            .map_err(|e| format!("block save (stat): {e}"))?
+            .permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&db, perms).map_err(|e| format!("block save: {e}"))?;
     }
     Ok(store)
 }
@@ -256,8 +260,9 @@ pub fn materialize(run_dir: &Path, fixtures: &Fixtures) -> Result<Store, String>
 /// snapshots and the event log, and on failure writes the failure bundle.
 pub fn run_into(sim: &mut SimApp, journey: &Journey) -> Result<(), SimulationError> {
     sim.pump(vec![]);
-    sim.record_step(0, "launch", "first frame")
-        .map_err(|e| SimulationError::failed(journey.name, sim.seed, 0, e, sim.report.report_dir.clone()))?;
+    sim.record_step(0, "launch", "first frame").map_err(|e| {
+        SimulationError::failed(journey.name, sim.seed, 0, e, sim.report.report_dir.clone())
+    })?;
     for (i, step) in journey.steps.iter().enumerate() {
         let step_idx = i + 1;
         let (intent, target) = step.describe();
@@ -290,10 +295,13 @@ pub fn run_into(sim: &mut SimApp, journey: &Journey) -> Result<(), SimulationErr
 pub fn run(journey: &Journey, seed: u64) -> Result<Report, SimulationError> {
     let run_dir = run_dir_for(journey.name, seed);
     let _ = std::fs::remove_dir_all(&run_dir);
-    let store = materialize(&run_dir, &journey.fixtures)
-        .map_err(|e| SimulationError::failed(journey.name, seed, 0, e, PathBuf::from("sim-report")))?;
+    let store = materialize(&run_dir, &journey.fixtures).map_err(|e| {
+        SimulationError::failed(journey.name, seed, 0, e, PathBuf::from("sim-report"))
+    })?;
     let mut sim = SimApp::build(journey.name, store, journey.persona, run_dir.clone(), seed)
-        .map_err(|e| SimulationError::failed(journey.name, seed, 0, e, PathBuf::from("sim-report")))?;
+        .map_err(|e| {
+            SimulationError::failed(journey.name, seed, 0, e, PathBuf::from("sim-report"))
+        })?;
     run_into(&mut sim, journey)?;
     let report = sim.report;
     let _ = report.write_summary();
@@ -328,6 +336,7 @@ fn snippet(id: u64, title: &str, category: &str, body: &str) -> Snippet {
     Snippet {
         id,
         title: title.to_string(),
+        description: String::new(),
         category: category.to_string(),
         body: body.to_string(),
         protection: None,
@@ -372,12 +381,12 @@ fn type_password(sim: &mut SimApp, password: &str) -> Result<(), String> {
 /// `body` is empty on disk and its plaintext exists only in the ciphertext.
 fn protected_fixture(body: &'static str, title: &'static str) -> Fixtures {
     let (meta, key) = vault::create_vault(VAULT_PASSWORD).expect("vault fixture: create vault");
-    let protection =
-        vault::encrypt_body(&key, body).expect("vault fixture: encrypt body");
+    let protection = vault::encrypt_body(&key, body).expect("vault fixture: encrypt body");
     Fixtures::library_with_vault(
         vec![Snippet {
             id: 1,
             title: title.to_string(),
+            description: String::new(),
             category: "Git".to_string(),
             body: String::new(),
             protection: Some(protection),
@@ -394,11 +403,20 @@ fn protected_fixture(body: &'static str, title: &'static str) -> Fixtures {
 fn expect_protected_store(body: &'static str, hint: &'static str) -> Box<StorePredicate> {
     Box::new(move |store: &Store| match store.load_snippets() {
         crate::storage::Load::Loaded(snips) => {
-            let s = snips.iter().find(|s| s.id == 1).ok_or("snippet 1 missing")?;
+            let s = snips
+                .iter()
+                .find(|s| s.id == 1)
+                .ok_or("snippet 1 missing")?;
             if !s.body.is_empty() {
-                return Err(format!("protected body must be empty on disk, got {:?}", s.body));
+                return Err(format!(
+                    "protected body must be empty on disk, got {:?}",
+                    s.body
+                ));
             }
-            let p = s.protection.as_ref().ok_or("protection missing on stored snippet")?;
+            let p = s
+                .protection
+                .as_ref()
+                .ok_or("protection missing on stored snippet")?;
             if p.hint != hint {
                 return Err(format!("stored hint {:?}, expected {hint:?}", p.hint));
             }
@@ -408,9 +426,16 @@ fn expect_protected_store(body: &'static str, hint: &'static str) -> Box<StorePr
             if s.protection.is_none() {
                 return Err("protection must be present".into());
             }
-            let raw = std::fs::read_to_string(&store.snippets_path).map_err(|e| e.to_string())?;
+            let raw = std::fs::read(crate::sqlite::db_path_for(
+                store
+                    .snippets_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new(".")),
+            ))
+            .map_err(|e| e.to_string())?;
+            let raw = String::from_utf8_lossy(&raw);
             if raw.contains(body) {
-                return Err("plaintext body leaked into snippets.json".into());
+                return Err("plaintext body leaked into the database file".into());
             }
             Ok(())
         }
@@ -449,7 +474,10 @@ pub fn first_run_explorer() -> Journey {
             Step::Intent(Intent::ExpectVisible("Update all repos (PowerShell)")),
             Step::Intent(Intent::ExpectVisible("Summarize this conversation")),
             // Search narrows the grid.
-            Step::Intent(Intent::TypeInto("Search title, text, category\u{2026}", "git")),
+            Step::Intent(Intent::TypeInto(
+                "Search title, text, category\u{2026}",
+                "git",
+            )),
             Step::Intent(Intent::Wait(150)),
             Step::Intent(Intent::ExpectVisible("Discard all local changes")),
             Step::Intent(Intent::ExpectAbsent("Summarize this conversation")),
@@ -473,7 +501,10 @@ pub fn first_run_explorer() -> Journey {
             // Copy a card: clipboard contents + transient "Copied" feedback.
             Step::Intent(Intent::ClickCardCopy("Summarize this conversation")),
             Step::Custom(Box::new(|sim| {
-                if sim.clipboard().contains("Summarize our conversation so far") {
+                if sim
+                    .clipboard()
+                    .contains("Summarize our conversation so far")
+                {
                     Ok(())
                 } else {
                     Err(format!("clipboard was {:?}", sim.clipboard()))
@@ -539,36 +570,103 @@ fn add_snippet_steps(
 pub fn power_organizer_add() -> Journey {
     let mut steps = Vec::new();
     for (title, body, target) in [
-        ("Git log", "git log --oneline --graph", CategoryTarget::Default),
+        (
+            "Git log",
+            "git log --oneline --graph",
+            CategoryTarget::Default,
+        ),
         ("Git branch", "git branch -vv", CategoryTarget::Default),
-        ("Git stash", "git stash push -m work", CategoryTarget::Default),
+        (
+            "Git stash",
+            "git stash push -m work",
+            CategoryTarget::Default,
+        ),
         ("Docker ps", "docker ps -a", CategoryTarget::New("Docker")),
-        ("Docker compose up", "docker compose up -d", CategoryTarget::New("Docker")),
-        ("Docker logs", "docker logs -f app", CategoryTarget::New("Docker")),
-        ("Docker prune", "docker system prune -af", CategoryTarget::New("Docker")),
-        ("Git rebase", "git rebase -i HEAD~3", CategoryTarget::Set("Git")),
-        ("Git blame", "git blame -L 10,20 file", CategoryTarget::Set("Git")),
+        (
+            "Docker compose up",
+            "docker compose up -d",
+            CategoryTarget::New("Docker"),
+        ),
+        (
+            "Docker logs",
+            "docker logs -f app",
+            CategoryTarget::New("Docker"),
+        ),
+        (
+            "Docker prune",
+            "docker system prune -af",
+            CategoryTarget::New("Docker"),
+        ),
+        (
+            "Git rebase",
+            "git rebase -i HEAD~3",
+            CategoryTarget::Set("Git"),
+        ),
+        (
+            "Git blame",
+            "git blame -L 10,20 file",
+            CategoryTarget::Set("Git"),
+        ),
         ("Git clean", "git clean -fd", CategoryTarget::Set("Git")),
         ("Git bisect", "git bisect start", CategoryTarget::Set("Git")),
-        ("Prompt summarize", "summarize this thread", CategoryTarget::New("Prompt")),
-        ("Prompt draft email", "draft a polite rejection", CategoryTarget::New("Prompt")),
-        ("Prompt code review", "review this diff", CategoryTarget::New("Prompt")),
-        ("Prompt unit tests", "write unit tests for fn", CategoryTarget::New("Prompt")),
-        ("Docker exec", "docker exec -it app sh", CategoryTarget::Default),
-        ("Docker cp", "docker cp app:/etc/app.conf .", CategoryTarget::Default),
-        ("Docker stop", "docker stop $(docker ps -q)", CategoryTarget::Default),
-        ("Docker inspect", "docker inspect app", CategoryTarget::Default),
-        ("Docker volume ls", "docker volume ls", CategoryTarget::Default),
+        (
+            "Prompt summarize",
+            "summarize this thread",
+            CategoryTarget::New("Prompt"),
+        ),
+        (
+            "Prompt draft email",
+            "draft a polite rejection",
+            CategoryTarget::New("Prompt"),
+        ),
+        (
+            "Prompt code review",
+            "review this diff",
+            CategoryTarget::New("Prompt"),
+        ),
+        (
+            "Prompt unit tests",
+            "write unit tests for fn",
+            CategoryTarget::New("Prompt"),
+        ),
+        (
+            "Docker exec",
+            "docker exec -it app sh",
+            CategoryTarget::Default,
+        ),
+        (
+            "Docker cp",
+            "docker cp app:/etc/app.conf .",
+            CategoryTarget::Default,
+        ),
+        (
+            "Docker stop",
+            "docker stop $(docker ps -q)",
+            CategoryTarget::Default,
+        ),
+        (
+            "Docker inspect",
+            "docker inspect app",
+            CategoryTarget::Default,
+        ),
+        (
+            "Docker volume ls",
+            "docker volume ls",
+            CategoryTarget::Default,
+        ),
     ] {
         steps.extend(add_snippet_steps(title, body, target));
     }
     steps.push(Step::Intent(Intent::Wait(200)));
     steps.push(Step::Intent(Intent::ExpectVisible("Git log")));
-    steps.push(Step::Intent(Intent::ExpectStore(Box::new(|store: &Store| {
-        match store.load_snippets() {
+    steps.push(Step::Intent(Intent::ExpectStore(Box::new(
+        |store: &Store| match store.load_snippets() {
             crate::storage::Load::Loaded(snips) => {
                 if snips.len() != 22 {
-                    return Err(format!("expected 22 snippets (2 starters + 20 added), got {}", snips.len()));
+                    return Err(format!(
+                        "expected 22 snippets (2 starters + 20 added), got {}",
+                        snips.len()
+                    ));
                 }
                 let ids: Vec<u64> = snips.iter().map(|s| s.id).collect();
                 let mut sorted = ids.clone();
@@ -587,8 +685,8 @@ pub fn power_organizer_add() -> Journey {
                 Ok(())
             }
             _other => Err("snippets.json should exist".into()),
-        }
-    }))));
+        },
+    ))));
     Journey {
         name: "power-organizer-add",
         persona: POWER_ORGANIZER,
@@ -635,7 +733,10 @@ pub fn power_organizer_edit_delete() -> Journey {
                     crate::storage::Load::Loaded(snips) => {
                         let s = snips.iter().find(|s| s.id == 3).ok_or("id 3 missing")?;
                         if s.title != "Azure" || s.body != "azure new body" {
-                            return Err(format!("edit not persisted: {:?}", (s.title.clone(), s.body.clone())));
+                            return Err(format!(
+                                "edit not persisted: {:?}",
+                                (s.title.clone(), s.body.clone())
+                            ));
                         }
                         if snips.len() != 5 {
                             return Err(format!("expected 5 snippets, got {}", snips.len()));
@@ -755,7 +856,10 @@ pub fn error_corrupt() -> Journey {
                 }
             }))),
             Step::Custom(Box::new(|sim| {
-                let backup = sim.store.snippets_path.with_file_name("snippets.json.corrupt");
+                let backup = sim
+                    .store
+                    .snippets_path
+                    .with_file_name("snippets.json.corrupt");
                 if !backup.exists() {
                     return Err("snippets.json.corrupt backup is missing".into());
                 }
@@ -775,10 +879,12 @@ pub fn error_corrupt() -> Journey {
 /// file.
 pub fn error_read_only() -> Journey {
     let mut steps = add_snippet_steps("Third", "third body", CategoryTarget::Default);
-    steps.push(Step::Intent(Intent::ExpectVisible("Couldn't save snippets")));
+    steps.push(Step::Intent(Intent::ExpectVisible(
+        "Couldn't save snippets",
+    )));
     steps.push(Step::Intent(Intent::ExpectVisible("Third")));
-    steps.push(Step::Intent(Intent::ExpectStore(Box::new(|store: &Store| {
-        match store.load_snippets() {
+    steps.push(Step::Intent(Intent::ExpectStore(Box::new(
+        |store: &Store| match store.load_snippets() {
             crate::storage::Load::Loaded(snips) => {
                 let ids: Vec<u64> = snips.iter().map(|s| s.id).collect();
                 if ids == [1, 2] {
@@ -788,10 +894,12 @@ pub fn error_read_only() -> Journey {
                 }
             }
             _other => Err("snippets.json should exist".into()),
-        }
-    }))));
+        },
+    ))));
     steps.push(Step::Custom(Box::new(|sim| {
-        // The only .tmp entry may be the blocking directory itself.
+        // A blocked save must leave no partial temp file behind (the old JSON
+        // atomic write left a `.tmp`; the SQLite path writes straight to the
+        // read-only db and fails before producing any sidecar).
         let dir = sim.store.snippets_path.parent().expect("store dir");
         let stray: Vec<String> = std::fs::read_dir(dir)
             .map(|entries| {
@@ -802,7 +910,7 @@ pub fn error_read_only() -> Journey {
                     .collect()
             })
             .unwrap_or_default();
-        if stray == [format!("snippets.json.{}.tmp", std::process::id())] {
+        if stray.is_empty() {
             Ok(())
         } else {
             Err(format!("unexpected .tmp entries: {stray:?}"))
@@ -836,7 +944,9 @@ pub fn error_reserved_category() -> Journey {
             // Header: "All" is reserved.
             Step::Intent(Intent::OpenHeaderCategoryForm),
             Step::Intent(Intent::SubmitHeaderCategory("all")),
-            Step::Intent(Intent::ExpectVisible("\"All\" is reserved and can't be used as a category")),
+            Step::Intent(Intent::ExpectVisible(
+                "\"All\" is reserved and can't be used as a category",
+            )),
             Step::Intent(Intent::ExpectVisible("Add")),
             // Replace the reserved "all" text with a valid category name.
             Step::Custom(Box::new(|sim: &mut SimApp| {
@@ -844,15 +954,17 @@ pub fn error_reserved_category() -> Journey {
                 sim.press_key(egui::Key::Enter)
             })),
             Step::Intent(Intent::ExpectVisible("Docker")),
-            Step::Intent(Intent::ExpectStore(Box::new(|store: &Store| match store.load_config() {
-                crate::storage::Load::Loaded(config) => {
-                    if config.categories.iter().any(|c| c == "Docker") {
-                        Ok(())
-                    } else {
-                        Err(format!("Docker missing from {:?}", config.categories))
+            Step::Intent(Intent::ExpectStore(Box::new(|store: &Store| {
+                match store.load_config() {
+                    crate::storage::Load::Loaded(config) => {
+                        if config.categories.iter().any(|c| c == "Docker") {
+                            Ok(())
+                        } else {
+                            Err(format!("Docker missing from {:?}", config.categories))
+                        }
                     }
+                    _other => Err("config.json should exist".into()),
                 }
-                _other => Err("config.json should exist".into()),
             }))),
             // Editor: blank inline category keeps the form open without adding.
             Step::Intent(Intent::ClickText("+ New")),
@@ -864,7 +976,9 @@ pub fn error_reserved_category() -> Journey {
             // Editor: reserved name shows the same error and keeps the form open.
             Step::Intent(Intent::TypeInto("New category", "all")),
             Step::Intent(Intent::ClickText("Add")),
-            Step::Intent(Intent::ExpectVisible("\"All\" is reserved and can't be used as a category")),
+            Step::Intent(Intent::ExpectVisible(
+                "\"All\" is reserved and can't be used as a category",
+            )),
             // Replace the reserved "all" text with a valid category, then submit.
             Step::Custom(Box::new(|sim: &mut SimApp| {
                 sim.replace_into("all", "Docker")?;
@@ -874,16 +988,21 @@ pub fn error_reserved_category() -> Journey {
             Step::Intent(Intent::TypeInto("Content", "docker info")),
             Step::Intent(Intent::ClickText("Save")),
             Step::Intent(Intent::ExpectAbsent("New snippet")),
-            Step::Intent(Intent::ExpectStore(Box::new(|store: &Store| match store.load_snippets() {
-                crate::storage::Load::Loaded(snips) => {
-                    let has_docker = snips.iter().any(|s| s.category == "Docker");
-                    if snips.len() == 7 && has_docker {
-                        Ok(())
-                    } else {
-                        Err(format!("expected 7 snippets with Docker, got {}", snips.len()))
+            Step::Intent(Intent::ExpectStore(Box::new(|store: &Store| {
+                match store.load_snippets() {
+                    crate::storage::Load::Loaded(snips) => {
+                        let has_docker = snips.iter().any(|s| s.category == "Docker");
+                        if snips.len() == 7 && has_docker {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "expected 7 snippets with Docker, got {}",
+                                snips.len()
+                            ))
+                        }
                     }
+                    _other => Err("snippets.json should exist".into()),
                 }
-                _other => Err("snippets.json should exist".into()),
             }))),
         ],
     }
@@ -910,42 +1029,51 @@ pub fn theme_hopper() -> Journey {
             Step::Intent(Intent::Wait(60)),
             Step::Intent(Intent::ClickText("Nord")),
             Step::Intent(Intent::ExpectVisible("Nord")),
-            Step::Intent(Intent::ExpectStore(Box::new(|store: &Store| match store.load_config() {
-                crate::storage::Load::Loaded(config) => {
-                    if config.theme == "Nord" {
-                        Ok(())
-                    } else {
-                        Err(format!("theme should be Nord, got {:?}", config.theme))
+            Step::Intent(Intent::ExpectStore(Box::new(|store: &Store| {
+                match store.load_config() {
+                    crate::storage::Load::Loaded(config) => {
+                        if config.theme == "Nord" {
+                            Ok(())
+                        } else {
+                            Err(format!("theme should be Nord, got {:?}", config.theme))
+                        }
                     }
+                    _other => Err("config.json should exist".into()),
                 }
-                _other => Err("config.json should exist".into()),
             }))),
             Step::Intent(Intent::ClickText("Nord")),
             Step::Intent(Intent::Wait(60)),
             Step::Intent(Intent::ClickText("Dracula")),
-            Step::Intent(Intent::ExpectStore(Box::new(|store: &Store| match store.load_config() {
-                crate::storage::Load::Loaded(config) => {
-                    if config.theme == "Dracula" {
-                        Ok(())
-                    } else {
-                        Err(format!("theme should be Dracula, got {:?}", config.theme))
+            Step::Intent(Intent::ExpectStore(Box::new(|store: &Store| {
+                match store.load_config() {
+                    crate::storage::Load::Loaded(config) => {
+                        if config.theme == "Dracula" {
+                            Ok(())
+                        } else {
+                            Err(format!("theme should be Dracula, got {:?}", config.theme))
+                        }
                     }
+                    _other => Err("config.json should exist".into()),
                 }
-                _other => Err("config.json should exist".into()),
             }))),
             // Simulated restart: drop the app, rebuild from the same store.
             Step::Intent(Intent::RebuildFromStore),
             Step::Intent(Intent::ExpectVisible("Dracula")),
             Step::Intent(Intent::ExpectVisible("Alpha")),
-            Step::Intent(Intent::ExpectStore(Box::new(|store: &Store| match store.load_config() {
-                crate::storage::Load::Loaded(config) => {
-                    if config.theme == "Dracula" {
-                        Ok(())
-                    } else {
-                        Err(format!("theme should survive restart, got {:?}", config.theme))
+            Step::Intent(Intent::ExpectStore(Box::new(|store: &Store| {
+                match store.load_config() {
+                    crate::storage::Load::Loaded(config) => {
+                        if config.theme == "Dracula" {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "theme should survive restart, got {:?}",
+                                config.theme
+                            ))
+                        }
                     }
+                    _other => Err("config.json should exist".into()),
                 }
-                _other => Err("config.json should exist".into()),
             }))),
         ],
     }
@@ -1059,7 +1187,10 @@ pub fn vault_censored_while_locked() -> Journey {
             })),
             // Search: a string that only lives in the protected body matches
             // nothing; clearing the search brings the (still masked) card back.
-            Step::Intent(Intent::TypeInto("Search title, text, category\u{2026}", SECRET)),
+            Step::Intent(Intent::TypeInto(
+                "Search title, text, category\u{2026}",
+                SECRET,
+            )),
             Step::Intent(Intent::Wait(150)),
             Step::Intent(Intent::ExpectAbsent("Secret")),
             Step::Intent(Intent::ClearFocusedField),
@@ -1136,7 +1267,10 @@ mod tests {
     fn run_ok(journey: &Journey, seed: u64) -> Report {
         match run(journey, seed) {
             Ok(report) => report,
-            Err(err) => panic!("journey {} failed at step {}: {}", err.journey, err.step, err.message),
+            Err(err) => panic!(
+                "journey {} failed at step {}: {}",
+                err.journey, err.step, err.message
+            ),
         }
     }
 
@@ -1293,7 +1427,9 @@ mod tests {
     /// files, repro command).
     #[test]
     fn sim_journeys_meta_failure_bundle() {
-        let err = run(&meta_broken(), 99).err().expect("broken journey must fail");
+        let err = run(&meta_broken(), 99)
+            .err()
+            .expect("broken journey must fail");
         assert_eq!(err.seed, 99);
         assert_eq!(err.journey, "meta-broken");
         let dir = &err.report_dir;
@@ -1302,8 +1438,7 @@ mod tests {
             "failure.log",
             "seed.txt",
             "REPRO.md",
-            "snippets.json",
-            "config.json",
+            "copyit.db",
         ] {
             assert!(
                 dir.join(file).exists(),
@@ -1313,7 +1448,10 @@ mod tests {
         }
         assert!(dir.join("snapshots").is_dir(), "snapshots dir missing");
         let log = std::fs::read_to_string(dir.join("event.log")).unwrap();
-        assert!(log.contains("expect_visible"), "event log missing failing intent");
+        assert!(
+            log.contains("expect_visible"),
+            "event log missing failing intent"
+        );
         let details = std::fs::read_to_string(dir.join("failure.log")).unwrap();
         assert!(
             details.contains("this text is never rendered"),
@@ -1380,8 +1518,4 @@ mod tests {
         let b = serde_json::to_string(&rec).unwrap();
         assert_eq!(a, b);
     }
-
-
-
-
 }

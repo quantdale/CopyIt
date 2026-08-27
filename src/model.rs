@@ -4,10 +4,14 @@ use serde::{Deserialize, Serialize};
 /// The `id` field is stable across edits/saves (never reassigned) and is used as a unique key
 /// for the Editor modal and drag-and-drop operations. Snippets are serialized to JSON in
 /// insertion order (they remain in self.snippets in whatever order the user drags them to).
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Snippet {
-    pub id: u64,          // Stable unique identifier; unique among currently stored snippets
-    pub title: String,    // Display name of the snippet
+    pub id: u64,       // Stable unique identifier; unique among currently stored snippets
+    pub title: String, // Display name of the snippet
+    /// Optional free-text note. Tooltip-only in the browser extension; never
+    /// shown as a card body. `#[serde(default)]` keeps older files loading.
+    #[serde(default)]
+    pub description: String,
     pub category: String, // User-defined category (normalized to title-case)
     pub body: String,     // The actual content to copy to clipboard
     /// When `Some`, the snippet is password-protected: `body` is empty on disk and the
@@ -21,7 +25,7 @@ pub struct Snippet {
 /// chars, fixed at protect time), plus the base64 nonce and ciphertext of the
 /// XChaCha20-Poly1305 encryption of the body under the vault key. The plaintext never
 /// lives here.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Protection {
     /// First 5 characters of the body at protect time when it was >= 12 chars long,
     /// else empty. Never recomputed from the ciphertext.

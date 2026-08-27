@@ -1,0 +1,21 @@
+{
+  "algorithm": {
+    "cipher": "xchacha20poly1305",
+    "encoding": "base64 standard with padding",
+    "kdf": "argon2id m=19456 t=2 p=1 keyLen=32"
+  },
+  "description": "Synthetic non-secret cross-compatibility vector. The desktop CopyIt app must produce byte-identical outputs for these fixed inputs, proving the native host can decrypt desktop-protected snippets (and vice versa).",
+  "expected": {
+    "canaryCiphertextB64": "aE3OSjvVWE/fFx+Q/hDV1pcCuV6TToqzWK+4hhgu/nNyeXHd4No=",
+    "ciphertextB64": "E38mikfH6UZix2kZfP7qa2jqxC7qy96FDpOTPQmkcuZw/5lTOa+KC8IFXVKosdTCtqmXQKt/BgeCk3GP87/l18Shpi0daHDTIf8jrN5bVvXejOWmWLQRaghLV+8=",
+    "keyHex": "818259b6310026a8e0dbac5d2e6927abcfdb07b32258fac4f61b18b80f929085"
+  },
+  "inputs": {
+    "canaryNonceB64": "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw",
+    "canaryPlaintext": "copyit-vault-canary-v1",
+    "nonceB64": "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIz",
+    "plaintextBody": "This is a synthetic test prompt body for CopyIt cross-compatibility testing.",
+    "saltB64": "AAECAwQFBgcICQoLDA0ODw=="
+  },
+  "password": "correct horse battery staple"
+}

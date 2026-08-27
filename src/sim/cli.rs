@@ -67,9 +67,7 @@ pub fn run_headed(journey_name: String, seed: u64) -> eframe::Result<()> {
     eframe::run_native(
         "CopyIt — simulation",
         native_options,
-        Box::new(move |cc| {
-            Box::new(SimDriver::new(journey, seed, &cc.egui_ctx))
-        }),
+        Box::new(move |cc| Box::new(SimDriver::new(journey, seed, &cc.egui_ctx))),
     )
 }
 
@@ -109,18 +107,11 @@ impl eframe::App for SimDriver {
             self.started = true;
             // Execute the whole journey headlessly through the same harness the
             // tests use; the window then shows the final app state.
-            self.journey_result = Some(
-                journey::run_into(&mut self.sim, &self.journey)
-                    .map_err(|e| e.to_string()),
-            );
+            self.journey_result =
+                Some(journey::run_into(&mut self.sim, &self.journey).map_err(|e| e.to_string()));
             self.sim.app.ui(ctx);
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
-            self.screenshot_path = Some(
-                self.sim
-                    .report
-                    .report_dir
-                    .join("screenshot-final.png"),
-            );
+            self.screenshot_path = Some(self.sim.report.report_dir.join("screenshot-final.png"));
             ctx.request_repaint();
         } else {
             self.sim.app.ui(ctx);

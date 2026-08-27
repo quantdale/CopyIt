@@ -12,7 +12,6 @@
 //! virtual time, and a state digest — so two runs with the same seed produce
 //! byte-identical normalized logs (the determinism test relies on that).
 
-use crate::storage;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
@@ -91,17 +90,18 @@ impl Report {
     /// Computes the state digest of the run's store: snippets count + file sizes.
     /// Deterministic for a given store content.
     pub fn state_digest(&self) -> String {
-        let snippets = match storage::load(&self.store.snippets_path) {
-            storage::Load::Loaded(s) => s.len(),
+        let snippets = match self.store.load_snippets() {
+            crate::storage::Load::Loaded(s) => s.len(),
             _ => 0,
         };
-        let snip_len = fs::metadata(&self.store.snippets_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let cfg_len = fs::metadata(&self.store.config_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        format!("{snippets} snippets, snippets.json {snip_len}B, config.json {cfg_len}B")
+        let db = crate::sqlite::db_path_for(
+            self.store
+                .snippets_path
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+        );
+        let snip_len = fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+        format!("{snippets} snippets, copyit.db {snip_len}B")
     }
 
     /// Appends an event to the log and writes the log line to disk.
@@ -115,7 +115,12 @@ impl Report {
     /// Writes a per-step snapshot file and keeps the last one in memory.
     pub fn write_snapshot(&mut self, snapshot: Snapshot) -> io::Result<()> {
         let rendered = snapshot.render();
-        fs::write(self.report_dir.join("snapshots").join(format!("step-{:03}.txt", snapshot.step)), rendered)?;
+        fs::write(
+            self.report_dir
+                .join("snapshots")
+                .join(format!("step-{:03}.txt", snapshot.step)),
+            rendered,
+        )?;
         self.last_snapshot = Some(snapshot);
         Ok(())
     }
@@ -149,15 +154,28 @@ impl Report {
         if let Some(snap) = &self.last_snapshot {
             let _ = write!(detail, "{}", snap.render());
         }
-        let _ = writeln!(detail, "repro: cargo run --features sim -- --simulate {} --seed {}", self.journey, self.seed);
+        let _ = writeln!(
+            detail,
+            "repro: cargo run --features sim -- --simulate {} --seed {}",
+            self.journey, self.seed
+        );
         let _ = writeln!(detail, "data dir: {}", self.run_dir.display());
         fs::write(dir.join("failure.log"), detail)?;
         fs::write(dir.join("seed.txt"), self.seed.to_string())?;
-        fs::write(dir.join("REPRO.md"), repro_command(&self.journey, self.seed))?;
+        fs::write(
+            dir.join("REPRO.md"),
+            repro_command(&self.journey, self.seed),
+        )?;
 
-        // Copy the run's data files so the failure can be inspected (or replayed)
-        // without needing the temp store.
-        copy_if_exists(&self.store.snippets_path, &dir.join("snippets.json"))?;
+        // Copy the run's data file so the failure can be inspected (or replayed)
+        // without needing the temp store. The canonical store is now copyit.db.
+        let db = crate::sqlite::db_path_for(
+            self.store
+                .snippets_path
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+        );
+        copy_if_exists(&db, &dir.join("copyit.db"))?;
         copy_if_exists(&self.store.config_path, &dir.join("config.json"))?;
         // Any `.corrupt` / `.corrupt.1` / `.corrupt.2` backups made by the app
         // also ship, so the failure bundle includes every backup variant.
@@ -166,10 +184,7 @@ impl Report {
                 for entry in entries.flatten() {
                     if let Some(fname) = entry.file_name().to_str() {
                         if fname.starts_with("snippets.json.corrupt") {
-                            copy_if_exists(
-                                &entry.path(),
-                                &dir.join(fname),
-                            )?;
+                            copy_if_exists(&entry.path(), &dir.join(fname))?;
                         }
                     }
                 }
@@ -181,7 +196,10 @@ impl Report {
 
 fn append(path: &Path, contents: &str) -> io::Result<()> {
     use std::io::Write;
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     f.write_all(contents.as_bytes())
 }
 
@@ -274,7 +292,11 @@ const CRC_TABLE: [u32; 256] = {
         let mut c = n as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xedb8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         table[n] = c;

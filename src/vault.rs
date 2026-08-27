@@ -139,6 +139,7 @@ impl VaultState {
     /// Verifies `password` against the canary described by `meta`; on success
     /// caches the derived key and marks the vault unlocked. A wrong password (or
     /// any verification failure) leaves the state unchanged — still `Locked`.
+    #[allow(dead_code)]
     pub fn unlock(&mut self, password: &str, meta: &VaultMeta) -> Result<(), VaultError> {
         let key = verify_password(password, meta)?;
         self.key_from_verified(key)
@@ -150,6 +151,7 @@ impl VaultState {
         *self = VaultState::Unlocked(key);
     }
 
+    #[allow(dead_code)]
     fn key_from_verified(&mut self, key: [u8; KEY_LEN]) -> Result<(), VaultError> {
         *self = VaultState::Unlocked(key);
         Ok(())
@@ -173,8 +175,8 @@ fn random_bytes<const N: usize>() -> Result<[u8; N], VaultError> {
 /// Derives the 32-byte vault key from `password` and `salt` with Argon2id
 /// (RFC 9106's moderate parameters: m = 19 MiB, t = 2, p = 1).
 pub fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN], VaultError> {
-    let params = Params::new(19 * 1024, 2, 1, None)
-        .map_err(|e| VaultError::KeyDerivation(e.to_string()))?;
+    let params =
+        Params::new(19 * 1024, 2, 1, None).map_err(|e| VaultError::KeyDerivation(e.to_string()))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = [0u8; KEY_LEN];
     argon
@@ -187,8 +189,7 @@ pub fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN], VaultErr
 /// `(nonce_base64, ciphertext_base64)`.
 pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<(String, String), VaultError> {
     let nonce_bytes = random_bytes::<NONCE_LEN>()?;
-    let cipher =
-        XChaCha20Poly1305::new(Key::<XChaCha20Poly1305>::from_slice(key));
+    let cipher = XChaCha20Poly1305::new(Key::<XChaCha20Poly1305>::from_slice(key));
     let ciphertext = cipher
         .encrypt(
             Nonce::<XChaCha20Poly1305>::from_slice(&nonce_bytes),
@@ -213,8 +214,7 @@ pub fn decrypt(
         )));
     }
     let ciphertext = decode(ciphertext_b64)?;
-    let cipher =
-        XChaCha20Poly1305::new(Key::<XChaCha20Poly1305>::from_slice(key));
+    let cipher = XChaCha20Poly1305::new(Key::<XChaCha20Poly1305>::from_slice(key));
     let plaintext = cipher
         .decrypt(
             Nonce::<XChaCha20Poly1305>::from_slice(&nonce),
@@ -318,7 +318,11 @@ mod tests {
     fn encrypt_decrypt_round_trips() {
         let key = [7u8; KEY_LEN];
         let (nonce, ciphertext) = encrypt(&key, b"hello vault").unwrap();
-        assert_ne!(ciphertext, encode(b"hello vault"), "must not be plaintext in base64");
+        assert_ne!(
+            ciphertext,
+            encode(b"hello vault"),
+            "must not be plaintext in base64"
+        );
         let plaintext = decrypt(&key, &nonce, &ciphertext).unwrap();
         assert_eq!(plaintext, b"hello vault");
     }
@@ -368,7 +372,10 @@ mod tests {
         assert_eq!(verify_password("hunter2x", &meta).unwrap(), key);
         let protection = encrypt_body(&key, "a body long enough to have a hint").unwrap();
         assert_eq!(protection.hint, "a bod");
-        assert_eq!(decrypt_body(&key, &protection).unwrap(), "a body long enough to have a hint");
+        assert_eq!(
+            decrypt_body(&key, &protection).unwrap(),
+            "a body long enough to have a hint"
+        );
     }
 
     #[test]
@@ -378,7 +385,10 @@ mod tests {
         let k2 = derive_key("pw", &[1u8; SALT_LEN]).unwrap();
         assert_eq!(k1, k1_again);
         assert_ne!(k1, k2);
-        assert_ne!(derive_key("pw", &[0u8; SALT_LEN]).unwrap(), derive_key("other", &[0u8; SALT_LEN]).unwrap());
+        assert_ne!(
+            derive_key("pw", &[0u8; SALT_LEN]).unwrap(),
+            derive_key("other", &[0u8; SALT_LEN]).unwrap()
+        );
     }
 
     #[test]
@@ -448,9 +458,18 @@ mod tests {
 
     #[test]
     fn masked_preview_follows_the_hint_rule() {
-        assert_eq!(masked_preview("ghp_x"), "ghp_x\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}");
-        assert_eq!(masked_preview(""), "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}");
-        assert!(!masked_preview("ghp_x").contains("ghp_x1"), "must never add body content");
+        assert_eq!(
+            masked_preview("ghp_x"),
+            "ghp_x\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}"
+        );
+        assert_eq!(
+            masked_preview(""),
+            "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}"
+        );
+        assert!(
+            !masked_preview("ghp_x").contains("ghp_x1"),
+            "must never add body content"
+        );
     }
 
     #[test]
@@ -462,7 +481,10 @@ mod tests {
         assert!(state.key().is_none());
 
         assert!(state.unlock("nope", &meta).is_err());
-        assert!(state.is_locked(), "wrong password must not change the state");
+        assert!(
+            state.is_locked(),
+            "wrong password must not change the state"
+        );
         assert!(state.key().is_none());
 
         assert!(state.unlock("password1", &meta).is_ok());
@@ -499,5 +521,49 @@ mod tests {
         assert_eq!(back.nonce, meta.nonce);
         assert_eq!(back.canary, meta.canary);
         assert_eq!(verify_password("password1", &back).unwrap(), key);
+    }
+
+    /// Cross-compatibility with the browser-extension native host.
+    ///
+    /// `test-vectors/vault-vector.json` was generated by the host's crypto; the
+    /// desktop must derive the *identical* key and decrypt the host's canary and
+    /// body, proving the two codebases share one vault contract (Argon2id
+    /// m=19*1024 t=2 p=1 out=32, XChaCha20-Poly1305, base64 STANDARD, canary
+    /// "copyit-vault-canary-v1"). That is what lets a snippet protected in the
+    /// desktop be unlocked by the extension, and vice versa.
+    #[test]
+    fn desktop_vault_matches_native_host_test_vector() {
+        let json = include_str!("../test-vectors/vault-vector.json");
+        let v: serde_json::Value = serde_json::from_str(json).expect("valid vector json");
+        let password = v["password"].as_str().unwrap();
+        let salt_b64 = v["inputs"]["saltB64"].as_str().unwrap();
+        let canary_nonce_b64 = v["inputs"]["canaryNonceB64"].as_str().unwrap();
+        let canary_cipher_b64 = v["expected"]["canaryCiphertextB64"].as_str().unwrap();
+        let body_nonce_b64 = v["inputs"]["nonceB64"].as_str().unwrap();
+        let plaintext_body = v["inputs"]["plaintextBody"].as_str().unwrap();
+        let body_cipher_b64 = v["expected"]["ciphertextB64"].as_str().unwrap();
+        let key_hex = v["expected"]["keyHex"].as_str().unwrap();
+
+        // The host's stored vault metadata: salt + canary (nonce + ciphertext).
+        let meta = VaultMeta {
+            salt: salt_b64.to_string(),
+            nonce: canary_nonce_b64.to_string(),
+            canary: canary_cipher_b64.to_string(),
+        };
+        // Desktop derives the same key and decrypts the host's canary iff its
+        // Argon2id params + XChaCha20-Poly1305 + base64 match the host's.
+        let key = verify_password(password, &meta)
+            .expect("desktop must derive the host's key and decrypt its canary");
+        let expected_key = hex::decode(key_hex).expect("valid keyHex");
+        assert_eq!(
+            key.to_vec(),
+            expected_key,
+            "derived key must match the host vector"
+        );
+
+        // Desktop can decrypt a body the host encrypted.
+        let body = decrypt(&key, body_nonce_b64, body_cipher_b64)
+            .expect("desktop must decrypt the host-encrypted body");
+        assert_eq!(String::from_utf8(body).unwrap(), plaintext_body);
     }
 }

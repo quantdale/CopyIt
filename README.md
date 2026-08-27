@@ -68,6 +68,7 @@ editing a protected card asks for the vault password once per session; the top b
 - **No password recovery.** Forget the vault password and protected bodies are unrecoverable. Titles and categories stay visible, and a protected card shows its first 5 body characters as a hint (bodies under 12 characters show none) — keep secrets out of titles.
 - **Vault passwords must be at least 8 characters.** Shorter passwords are rejected at creation time.
 - **Single instance.** Only one CopyIt window can run at a time — a second launch exits immediately.
+- **Protected clipboard is best-effort (30 s).** Copying a protected snippet places plaintext on the clipboard immediately and CopyIt attempts to clear it after ~30 seconds — but only if the clipboard still holds CopyIt's own copy (proved by a sequence token, so newer clipboard content from you or another app is never clobbered). Clearing is best-effort: it can be delayed by clipboard contention and it cannot revoke copies already captured by third-party clipboard-history software.
 - Unprotected snippets remain plaintext JSON, so the "don't store credentials" rule applies to *unprotected* cards. An older version of CopyIt reading a file with protected cards sees empty bodies — don't downgrade after protecting.
 
 ## For contributors

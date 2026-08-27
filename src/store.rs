@@ -1,28 +1,41 @@
 //! The snippet library's persistence seam.
 //!
-//! Everything about *where* data lives and *how* it is loaded, migrated,
-//! and saved lives behind [`Store`]'s interface, so `app.rs` never touches
-//! paths or migration rules. Low-level JSON IO stays in `storage.rs`.
+//! Everything about *where* data lives and *how* it is loaded, migrated, and
+//! saved lives behind [`Store`]'s interface, so `app.rs` never opens a database
+//! or touches migration rules directly. Since Phase D the canonical store is the
+//! shared SQLite database (`copyit.db`); this module is a thin adapter over
+//! `sqlite.rs` that preserves the legacy JSON `Load`/`Missing`/`Corrupt`
+//! semantics the rest of the app already understands.
 
 use crate::model::Snippet;
-use crate::storage::{self, Config};
+use crate::sqlite;
+use crate::storage::{self, Config, Load};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Owns the on-disk location of the snippet library and its config.
+/// Owns the on-disk location of the snippet library.
+///
+/// `snippets_path` / `config_path` point at the *legacy* JSON filenames only so
+/// that existing users' `snippets.json` / `config.json` can be discovered and
+/// imported; the live store is the sibling `copyit.db` SQLite file.
 pub struct Store {
     pub snippets_path: PathBuf,
     pub config_path: PathBuf,
 }
 
 impl Store {
-    /// Opens the stable per-user data directory (created if needed).
-    pub fn open() -> Self {
-        Self::at(storage::data_dir())
+    /// Opens the stable per-user data directory and reports whether it could be
+    /// initialized. The store still points at the intended location even when
+    /// creation failed, so the caller can surface the exact path in the UI.
+    #[allow(dead_code)] // called by `CopyIt::new` (the production entry; not compiled into the test target)
+    pub fn open_initialized() -> (Self, Option<io::Error>) {
+        let (dir, init_error) = storage::ensure_data_dir();
+        (Self::at(dir), init_error)
     }
 
-    /// A store rooted at an explicit directory. Does not create the
-    /// directory; saving into a missing directory returns an `io::Error`.
+    /// A store rooted at an explicit directory. Does not create the directory;
+    /// saving into a missing directory returns an `io::Error`.
     pub fn at(dir: PathBuf) -> Self {
         Self {
             snippets_path: dir.join("snippets.json"),
@@ -30,81 +43,230 @@ impl Store {
         }
     }
 
+    /// The canonical SQLite database path (beside the legacy JSON files).
+    fn db_path(&self) -> PathBuf {
+        let dir = self
+            .snippets_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        sqlite::db_path_for(&dir)
+    }
+
     /// One-time recovery for users upgrading from earlier versions that stored
-    /// `snippets.json`/`config.json` next to the .exe: if the stable location
-    /// doesn't have a file yet, pull in the first non-empty copy found in a
-    /// legacy location (next to the exe, `target/debug`, `target/release`, cwd).
-    /// Runs once per file per session; after that the stable location owns the
-    /// data and legacy locations are ignored.
-    pub fn migrate_legacy(&self) {
-        migrate_path(&self.snippets_path, "snippets.json");
-        migrate_path(&self.config_path, "config.json");
+    /// `snippets.json`/`config.json`: if the SQLite store doesn't exist yet,
+    /// import the first non-empty copy found. Runs at most once per process;
+    /// after the SQLite db exists it is authoritative and the JSON is ignored.
+    /// Returns per-file outcomes so a blocked migration cannot masquerade as a
+    /// clean first launch.
+    pub fn migrate_legacy(&self) -> LegacyMigration {
+        if self.db_path().exists() {
+            return LegacyMigration {
+                snippets: MigrationOutcome::NotNeeded,
+                config: MigrationOutcome::NotNeeded,
+            };
+        }
+        match self.import_legacy_json() {
+            ImportResult::Imported => LegacyMigration {
+                snippets: MigrationOutcome::Migrated {
+                    source: self.snippets_path.clone(),
+                },
+                config: MigrationOutcome::Migrated {
+                    source: self.config_path.clone(),
+                },
+            },
+            ImportResult::NoSource => LegacyMigration {
+                snippets: MigrationOutcome::NoSource,
+                config: MigrationOutcome::NoSource,
+            },
+            ImportResult::Corrupt(reason) => LegacyMigration {
+                snippets: MigrationOutcome::Blocked {
+                    source: self.snippets_path.clone(),
+                    reason: reason.clone(),
+                },
+                config: MigrationOutcome::Blocked {
+                    source: self.config_path.clone(),
+                    reason,
+                },
+            },
+        }
     }
 
     /// Loads the snippet library, distinguishing `Missing` (first launch, seed
     /// the defaults) from `Corrupt` (there *is* user data that failed to parse).
-    pub fn load_snippets(&self) -> storage::Load<Vec<Snippet>> {
-        storage::load(&self.snippets_path)
-    }
-
-    /// Loads the config (canonical categories and theme).
-    pub fn load_config(&self) -> storage::Load<Config> {
-        storage::load_config(&self.config_path)
-    }
-
-    /// Persists the snippet library, atomically.
-    pub fn save_snippets(&self, snippets: &[Snippet]) -> io::Result<()> {
-        storage::save(&self.snippets_path, snippets)
-    }
-
-    /// Persists the config, atomically.
-    pub fn save_config(&self, config: &Config) -> io::Result<()> {
-        storage::save_config(&self.config_path, config)
-    }
-}
-
-/// Moves the first non-empty legacy `filename` into `new_path` if the stable
-/// location doesn't have one yet, searching the standard legacy locations.
-fn migrate_path(new_path: &Path, filename: &str) {
-    migrate_path_from(new_path, filename, &storage::legacy_candidate_dirs());
-}
-
-/// Moves the first non-empty legacy `filename` found in an explicit `candidates`
-/// list into `new_path` if the stable location doesn't have one yet. Extracted
-/// from [`migrate_path`] as a pure function so migration can be tested with an
-/// explicit candidate list instead of the hard-coded legacy scan locations.
-fn migrate_path_from(new_path: &Path, filename: &str, candidates: &[PathBuf]) {
-    if new_path.exists() {
-        return; // Already migrated or was created fresh; don't search legacy locations
-    }
-    for dir in candidates {
-        let candidate = dir.join(filename);
-        if candidate == new_path {
-            continue; // Skip the new location itself (shouldn't happen, but be safe)
+    /// A missing SQLite db is auto-imported from legacy JSON on this call.
+    pub fn load_snippets(&self) -> Load<Vec<Snippet>> {
+        let db = self.db_path();
+        if db.exists() {
+            return match sqlite::open_read_only(&db).and_then(|c| sqlite::load_all_snippets(&c)) {
+                Ok(v) => Load::Loaded(v),
+                Err(e) => Load::Corrupt(e.to_string()),
+            };
         }
-        if let Ok(data) = std::fs::read_to_string(&candidate) {
-            let trimmed = data.trim();
-            // Skip zero-byte / whitespace-only files (nothing to lose). A valid
-            // empty array "[]" or object "{}" is real data and gets migrated.
-            if trimmed.is_empty() {
-                continue;
-            }
-            // Write atomically so a crash mid-migration can't leave a truncated
-            // stable file. On write failure, continue to the next candidate: the
-            // legacy source stays intact for the next launch to retry.
-            if storage::write_atomic(new_path, &data).is_ok() {
-                // Best-effort: rename the legacy source so it isn't re-migrated
-                // on the next launch. Failure is harmless — the data is already
-                // safely in the stable location.
-                if let Some(name) = candidate.file_name() {
-                    let mut new_name = name.to_owned();
-                    new_name.push(".migrated");
-                    let _ = std::fs::rename(&candidate, candidate.with_file_name(new_name));
+        match self.import_legacy_json() {
+            ImportResult::Imported => {
+                match sqlite::open_db(&db).and_then(|c| sqlite::load_all_snippets(&c)) {
+                    Ok(v) => Load::Loaded(v),
+                    Err(e) => Load::Corrupt(e.to_string()),
                 }
-                return; // Success: migrate and stop searching
             }
+            ImportResult::Corrupt(reason) => Load::Corrupt(reason),
+            ImportResult::NoSource => Load::Missing,
         }
     }
+
+    /// Loads the config (canonical categories, theme, vault metadata).
+    pub fn load_config(&self) -> Load<Config> {
+        let db = self.db_path();
+        if db.exists() {
+            return match sqlite::open_read_only(&db).and_then(|c| sqlite::load_config(&c)) {
+                Ok(Some(c)) => Load::Loaded(c),
+                Ok(None) => Load::Missing,
+                Err(e) => Load::Corrupt(e.to_string()),
+            };
+        }
+        match self.import_legacy_json() {
+            ImportResult::Imported => {
+                match sqlite::open_db(&db).and_then(|c| sqlite::load_config(&c)) {
+                    Ok(Some(c)) => Load::Loaded(c),
+                    Ok(None) => Load::Missing,
+                    Err(e) => Load::Corrupt(e.to_string()),
+                }
+            }
+            ImportResult::Corrupt(reason) => Load::Corrupt(reason),
+            ImportResult::NoSource => Load::Missing,
+        }
+    }
+
+    /// Persists the snippet library (full reconcile: upsert all, delete removed,
+    /// keep sort order aligned with the in-memory list).
+    pub fn save_snippets(&self, snippets: &[Snippet]) -> io::Result<()> {
+        let db = self.db_path();
+        let conn = sqlite::open_db(&db).map_err(to_io)?;
+        sqlite::reconcile_snippets(&conn, snippets).map_err(to_io)
+    }
+
+    /// Persists the config (theme, canonical categories, vault triple).
+    pub fn save_config(&self, config: &Config) -> io::Result<()> {
+        let db = self.db_path();
+        let conn = sqlite::open_db(&db).map_err(to_io)?;
+        sqlite::set_theme(&conn, &config.theme).map_err(to_io)?;
+        sqlite::set_categories(&conn, &config.categories).map_err(to_io)?;
+        sqlite::set_vault_meta(&conn, config.vault.as_ref()).map_err(to_io)?;
+        Ok(())
+    }
+
+    /// Imports legacy JSON into the SQLite store exactly once. Never deletes the
+    /// originals; on success they are renamed aside as `<name>.legacy-backup-<ts>`.
+    fn import_legacy_json(&self) -> ImportResult {
+        if self.db_path().exists() {
+            return ImportResult::Imported;
+        }
+        let snippets_src = storage::load(&self.snippets_path);
+        let config_src = storage::load_config(&self.config_path);
+
+        let any_loaded =
+            matches!(snippets_src, Load::Loaded(_)) || matches!(config_src, Load::Loaded(_));
+        let any_corrupt =
+            matches!(snippets_src, Load::Corrupt(_)) || matches!(config_src, Load::Corrupt(_));
+
+        // A corrupt legacy source must not be overwritten: refuse to create a db.
+        if any_corrupt && !any_loaded {
+            let reason = match (&snippets_src, &config_src) {
+                (Load::Corrupt(e), _) => e.clone(),
+                (_, Load::Corrupt(e)) => e.clone(),
+                _ => "corrupt legacy data".to_string(),
+            };
+            return ImportResult::Corrupt(reason);
+        }
+        if !any_loaded {
+            return ImportResult::NoSource;
+        }
+
+        let db = self.db_path();
+        let conn = match sqlite::open_db(&db) {
+            Ok(c) => c,
+            Err(e) => return ImportResult::Corrupt(e.to_string()),
+        };
+        let snips: Vec<Snippet> = match snippets_src {
+            Load::Loaded(v) => v,
+            _ => Vec::new(),
+        };
+        if let Err(e) = sqlite::reconcile_snippets(&conn, &snips) {
+            return ImportResult::Corrupt(e.to_string());
+        }
+        let cfg: Config = match config_src {
+            Load::Loaded(c) => c,
+            _ => Config::from_snippets(&snips),
+        };
+        let _ = sqlite::set_theme(&conn, &cfg.theme);
+        let _ = sqlite::set_categories(&conn, &cfg.categories);
+        let _ = sqlite::set_vault_meta(&conn, cfg.vault.as_ref());
+
+        backup_legacy(&self.snippets_path);
+        backup_legacy(&self.config_path);
+        ImportResult::Imported
+    }
+}
+
+fn to_io(e: rusqlite::Error) -> io::Error {
+    io::Error::other(e)
+}
+
+/// Renames `path` aside as a timestamped backup, leaving its contents fully
+/// recoverable. Failures are ignored: the import has already succeeded and a
+/// missing original simply means there is nothing to preserve.
+fn backup_legacy(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let backup = path.with_file_name(format!(
+        "{}.legacy-backup-{}",
+        path.file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        nanos
+    ));
+    let _ = std::fs::rename(path, backup);
+}
+
+/// Outcome of migrating one legacy data file into the SQLite store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationOutcome {
+    NotNeeded,
+    NoSource,
+    Migrated { source: PathBuf },
+    Blocked { source: PathBuf, reason: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct LegacyMigration {
+    pub snippets: MigrationOutcome,
+    pub config: MigrationOutcome,
+}
+
+impl LegacyMigration {
+    #[allow(dead_code)] // diagnostic helper; surfaced through `note_startup_problems` in some builds
+    pub fn all_clean(&self) -> bool {
+        matches!(
+            self.snippets,
+            MigrationOutcome::NotNeeded | MigrationOutcome::NoSource
+        ) && matches!(
+            self.config,
+            MigrationOutcome::NotNeeded | MigrationOutcome::NoSource
+        )
+    }
+}
+
+/// Internal result of a single legacy-JSON import attempt.
+enum ImportResult {
+    Imported,
+    NoSource,
+    Corrupt(String),
 }
 
 #[cfg(test)]
@@ -122,6 +284,7 @@ mod tests {
         Snippet {
             id,
             title: format!("Snippet {id}"),
+            description: String::new(),
             category: category.to_string(),
             body: "body".to_string(),
             protection: None,
@@ -138,12 +301,12 @@ mod tests {
     #[test]
     fn first_load_in_an_empty_dir_is_missing() {
         let store = Store::at(temp_dir("empty"));
-        assert!(matches!(store.load_snippets(), storage::Load::Missing));
-        assert!(matches!(store.load_config(), storage::Load::Missing));
+        assert!(matches!(store.load_snippets(), Load::Missing));
+        assert!(matches!(store.load_config(), Load::Missing));
     }
 
     #[test]
-    fn save_and_load_round_trips() {
+    fn save_and_load_round_trips_through_sqlite() {
         let dir = temp_dir("roundtrip");
         let store = Store::at(dir);
         store
@@ -158,7 +321,7 @@ mod tests {
             .unwrap();
 
         match store.load_snippets() {
-            storage::Load::Loaded(snippets) => {
+            Load::Loaded(snippets) => {
                 assert_eq!(
                     snippets.iter().map(|s| s.id).collect::<Vec<_>>(),
                     vec![1, 2]
@@ -167,7 +330,7 @@ mod tests {
             _ => panic!("saved snippets should load back"),
         }
         match store.load_config() {
-            storage::Load::Loaded(config) => {
+            Load::Loaded(config) => {
                 assert_eq!(
                     config.categories,
                     vec!["Git".to_string(), "Prompt".to_string()]
@@ -179,99 +342,46 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_file_is_not_reported_as_missing() {
-        let dir = temp_dir("corrupt");
+    fn legacy_json_is_imported_once_and_backed_up() {
+        let dir = temp_dir("import");
         let store = Store::at(dir.clone());
+        let legacy_snips = vec![snippet(1, "Git")];
+        std::fs::write(
+            store.snippets_path.clone(),
+            serde_json::to_string(&legacy_snips).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            store.config_path.clone(),
+            serde_json::to_string(&Config {
+                categories: vec!["Git".into()],
+                theme: "Dark".into(),
+                vault: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(store.load_snippets(), Load::Loaded(_)));
+        // The SQLite db now owns the data and the JSON was renamed aside.
+        assert!(store.db_path().exists());
+        assert!(!store.snippets_path.exists());
+        assert!(!store.config_path.exists());
+
+        // A second load reads from the db, not the (now gone) JSON.
+        assert!(matches!(store.load_snippets(), Load::Loaded(_)));
+    }
+
+    #[test]
+    fn corrupt_legacy_json_is_not_overwritten() {
+        let dir = temp_dir("corrupt-import");
+        let store = Store::at(dir);
         std::fs::write(store.snippets_path.clone(), "not json").unwrap();
-        assert!(matches!(store.load_snippets(), storage::Load::Corrupt(_)));
-        // The bytes are left in place; the caller decides how to preserve them.
-        assert_eq!(
-            std::fs::read_to_string(store.snippets_path).unwrap(),
-            "not json"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn migrate_copies_first_non_empty_legacy_file_verbatim() {
-        let dir = temp_dir("migrate_copy");
-        let new_path = dir.join("new").join("snippets.json");
-        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
-        let legacy = dir.join("legacy");
-        std::fs::create_dir_all(&legacy).unwrap();
-        let data = r#"[{"id":1,"title":"X","category":"Git","body":"y"}]"#;
-        std::fs::write(legacy.join("snippets.json"), data).unwrap();
-
-        migrate_path_from(&new_path, "snippets.json", std::slice::from_ref(&legacy));
-        assert_eq!(std::fs::read_to_string(&new_path).unwrap(), data);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn migrate_skips_empty_files_but_migrates_empty_json() {
-        let dir = temp_dir("migrate_skip");
-        // Empty / whitespace-only files are truly empty and skipped.
-        // Valid-but-empty JSON ("[]", "{}") is real data and gets migrated.
-        let empty = dir.join("empty");
-        let array = dir.join("array");
-        let object = dir.join("object");
-        for d in [&empty, &array, &object] {
-            std::fs::create_dir_all(d).unwrap();
+        match store.load_snippets() {
+            Load::Corrupt(_) => {}
+            other => panic!("expected Corrupt, got {other:?}"),
         }
-        std::fs::write(empty.join("snippets.json"), "").unwrap();
-        std::fs::write(array.join("snippets.json"), "[]").unwrap();
-        std::fs::write(object.join("snippets.json"), "{}").unwrap();
-
-        let new_path = dir.join("new").join("snippets.json");
-        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
-        migrate_path_from(
-            &new_path,
-            "snippets.json",
-            &[empty.clone(), array.clone(), object.clone()],
-        );
-        // The first non-empty candidate ("[]") should have been migrated,
-        // and its legacy source renamed to .migrated.
-        assert!(new_path.exists());
-        assert_eq!(std::fs::read_to_string(&new_path).unwrap(), "[]");
-        assert!(
-            array.join("snippets.json.migrated").exists(),
-            "legacy source renamed after migration"
-        );
-        // The empty candidate was skipped (not migrated, not renamed).
-        assert!(empty.join("snippets.json").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn migrate_skips_a_candidate_that_resolves_to_new_path() {
-        let dir = temp_dir("migrate_self");
-        let new_path = dir.join("new").join("snippets.json");
-        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
-        std::fs::write(&new_path, "data").unwrap();
-        // The candidate dir is new_path's parent, so candidate.join(filename) ==
-        // new_path. The file must not be treated as a legacy source or copied
-        // over itself.
-        migrate_path_from(
-            &new_path,
-            "snippets.json",
-            &[new_path.parent().unwrap().to_path_buf()],
-        );
-        assert_eq!(std::fs::read_to_string(&new_path).unwrap(), "data");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn migrate_does_nothing_when_new_path_already_exists() {
-        let dir = temp_dir("migrate_exists");
-        let new_path = dir.join("new").join("snippets.json");
-        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
-        std::fs::write(&new_path, "stable data").unwrap();
-        let legacy = dir.join("legacy");
-        std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("snippets.json"), "legacy data").unwrap();
-
-        migrate_path_from(&new_path, "snippets.json", std::slice::from_ref(&legacy));
-        assert_eq!(std::fs::read_to_string(&new_path).unwrap(), "stable data");
-        let _ = std::fs::remove_dir_all(&dir);
+        // No db was created over the corrupt source.
+        assert!(!store.db_path().exists());
     }
 }

@@ -44,6 +44,7 @@ pub fn defaults() -> Vec<Snippet> {
         .map(|(i, (title, category, body))| Snippet {
             id: (i as u64) + 1,
             title: (*title).to_string(),
+            description: String::new(),
             category: (*category).to_string(),
             body: (*body).to_string(),
             protection: None,

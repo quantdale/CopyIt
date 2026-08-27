@@ -17,9 +17,7 @@ use crate::app::CopyIt;
 use crate::grid::{CARD_H, CARD_W};
 use crate::store::Store;
 use eframe::egui;
-use eframe::egui::{
-    Event, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, Vec2,
-};
+use eframe::egui::{Event, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, Vec2};
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
@@ -49,6 +47,10 @@ pub struct SimApp {
     /// `PlatformOutput` is per-frame output, so the harness captures it
     /// persistently — the system clipboard does not clear when a frame ends.
     last_clipboard: String,
+    /// Shared observer for the deterministic Sim clipboard backend installed at
+    /// `build` time, so protected copies (which bypass `copied_text`) are
+    /// inspectable by journey assertions.
+    clipboard_handle: crate::clipboard::SimHandle,
     pub report: Report,
 }
 
@@ -61,7 +63,13 @@ pub fn sim_root() -> PathBuf {
 pub fn run_dir_for(name: &str, seed: u64) -> PathBuf {
     let safe_name: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     sim_root()
         .join(std::process::id().to_string())
@@ -105,13 +113,17 @@ impl SimApp {
             snippets_path: store.snippets_path.clone(),
             config_path: store.config_path.clone(),
         };
-        let app = CopyIt::from_store(store, &ctx);
+        let mut app = CopyIt::from_store(store, &ctx);
         let rng = StdRng::seed_from_u64(seed);
         let report = Report::new(journey, seed, run_dir.clone(), harness_store);
         let store_for_report = Store {
             snippets_path: report.store.snippets_path.clone(),
             config_path: report.store.config_path.clone(),
         };
+        // Install a deterministic Sim clipboard so protected copies (which bypass egui's
+        // `copied_text`) are observable by the journey assertions.
+        let (clipboard, clipboard_handle) = crate::clipboard::SimClipboard::new();
+        app.clipboard = Box::new(clipboard);
         Ok(SimApp {
             app,
             ctx,
@@ -122,6 +134,7 @@ impl SimApp {
             persona,
             last_output: None,
             last_clipboard: String::new(),
+            clipboard_handle,
             report,
         })
     }
@@ -137,7 +150,10 @@ impl SimApp {
     /// frame state here.
     pub fn pump_with_modifiers(&mut self, events: Vec<Event>, modifiers: Modifiers) {
         let raw = RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(SCREEN_W, SCREEN_H))),
+            screen_rect: Some(Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(SCREEN_W, SCREEN_H),
+            )),
             time: Some(self.time_ms as f64 / 1000.0),
             modifiers,
             events,
@@ -208,7 +224,10 @@ impl SimApp {
                 return Ok(*rect);
             }
         }
-        Err(format!("label `{label}` not visible; on screen: {}", self.on_screen()))
+        Err(format!(
+            "label `{label}` not visible; on screen: {}",
+            self.on_screen()
+        ))
     }
 
     /// Locates the first (earliest-rendered, usually topmost-in-panels) match —
@@ -226,7 +245,10 @@ impl SimApp {
                 return Ok(*rect);
             }
         }
-        Err(format!("label `{label}` not visible; on screen: {}", self.on_screen()))
+        Err(format!(
+            "label `{label}` not visible; on screen: {}",
+            self.on_screen()
+        ))
     }
 
     /// Clicks the center of a located label.
@@ -394,7 +416,10 @@ impl SimApp {
         if found {
             Ok(())
         } else {
-            Err(format!("expected `{text}` visible; on screen: {}", self.on_screen()))
+            Err(format!(
+                "expected `{text}` visible; on screen: {}",
+                self.on_screen()
+            ))
         }
     }
 
@@ -413,26 +438,24 @@ impl SimApp {
 
     /// Asserts the clipboard now holds exactly `text`.
     pub fn expect_clipboard(&self, text: &str) -> Result<(), String> {
-        if self.last_clipboard == text {
+        let current = self.clipboard_handle.text();
+        if current == text {
             Ok(())
         } else {
-            Err(format!(
-                "expected clipboard `{text}`, got `{}`",
-                self.last_clipboard
-            ))
+            Err(format!("expected clipboard `{text}`, got `{current}`"))
         }
     }
 
-    /// The current clipboard contents (the last text the app copied).
+    /// The current clipboard contents (the last text the app copied). In the sim harness
+    /// every copy routes through the deterministic Sim backend, so this reflects what a
+    /// real system clipboard would hold — including protected copies that bypass egui's
+    /// `copied_text` field.
     pub fn clipboard(&self) -> String {
-        self.last_clipboard.clone()
+        self.clipboard_handle.text()
     }
 
     /// Asserts something about the persisted store, reloading from disk.
-    pub fn expect_store(
-        &self,
-        pred: &dyn Fn(&Store) -> Result<(), String>,
-    ) -> Result<(), String> {
+    pub fn expect_store(&self, pred: &dyn Fn(&Store) -> Result<(), String>) -> Result<(), String> {
         pred(&self.store)
     }
 
@@ -496,7 +519,11 @@ impl SimApp {
         let target = texts
             .iter()
             .find(|(t, r)| t.trim() == "Copy" && card.intersects(*r))
-            .or_else(|| texts.iter().find(|(t, r)| t.contains("Copy") && card.intersects(*r)))
+            .or_else(|| {
+                texts
+                    .iter()
+                    .find(|(t, r)| t.contains("Copy") && card.intersects(*r))
+            })
             .map(|(_, r)| r.center())
             .unwrap_or_else(|| Pos2::new(card.right() - 40.0, card.top() + 22.0));
         self.think();
@@ -513,7 +540,11 @@ impl SimApp {
         let target = texts
             .iter()
             .find(|(t, r)| t.trim() == "Edit" && card.intersects(*r))
-            .or_else(|| texts.iter().find(|(t, r)| t.contains("Edit") && card.intersects(*r)))
+            .or_else(|| {
+                texts
+                    .iter()
+                    .find(|(t, r)| t.contains("Edit") && card.intersects(*r))
+            })
             .map(|(_, r)| r.center())
             .unwrap_or_else(|| Pos2::new(card.left() + 40.0, card.bottom() - 30.0));
         self.think();

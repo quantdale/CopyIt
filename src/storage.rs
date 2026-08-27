@@ -8,18 +8,13 @@ use std::path::{Path, PathBuf};
 /// (blank, or the reserved "All" filter label).
 pub const UNCATEGORIZED: &str = "Uncategorized";
 
-/// Resolves the stable per-user directory where snippets.json and config.json live.
-/// Uses `%APPDATA%\CopyIt` on Windows (preferred: survives git checkouts, cargo clean, etc.),
-/// falling back to the directory containing the running .exe on non-Windows or when APPDATA
-/// is unset or empty (e.g., in dev/CI environments). This strategy decouples data persistence
-/// from build artifacts: users can freely update/rebuild the application without losing their
-/// saved snippets. The directory is created on first access if it doesn't exist.
+/// Resolves the preferred stable per-user directory where snippets.json and config.json
+/// live, WITHOUT creating it: `%APPDATA%\CopyIt` on Windows, falling back to the directory
+/// containing the running .exe on non-Windows or when APPDATA is unset/empty.
 pub fn data_dir() -> PathBuf {
     if let Ok(appdata) = std::env::var("APPDATA") {
         if !appdata.is_empty() {
-            let dir = PathBuf::from(appdata).join("CopyIt");
-            let _ = std::fs::create_dir_all(&dir);
-            return dir;
+            return PathBuf::from(appdata).join("CopyIt");
         }
     }
     if let Ok(exe) = std::env::current_exe() {
@@ -30,24 +25,21 @@ pub fn data_dir() -> PathBuf {
     PathBuf::from(".") // Last-resort fallback: current working directory
 }
 
+/// Resolves the data directory and makes sure it exists, returning the path plus any
+/// creation failure for the caller to surface. A failure here means saves will fail
+/// later anyway — reporting it at startup is clearer than letting the first write
+/// discover it (or silently falling back to an unexpected location).
+pub fn ensure_data_dir() -> (PathBuf, Option<std::io::Error>) {
+    let dir = data_dir();
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => (dir, None),
+        Err(e) => (dir, Some(e)),
+    }
+}
+
 /// Legacy locations `snippets.json`/`config.json` may have been left in by
 /// earlier versions that stored data next to the .exe. Used for one-time
 /// migration into the new stable `data_dir()`.
-pub fn legacy_candidate_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            dirs.push(dir.to_path_buf());
-            if let Some(target) = dir.parent() {
-                dirs.push(target.join("debug"));
-                dirs.push(target.join("release"));
-            }
-        }
-    }
-    dirs.push(PathBuf::from("."));
-    dirs
-}
-
 /// Outcome of reading one of the JSON data files.
 ///
 /// The three cases must stay distinct: `Missing` means "first launch, seed the
@@ -55,6 +47,7 @@ pub fn legacy_candidate_dirs() -> Vec<PathBuf> {
 /// here that we failed to understand". Collapsing the two (as an
 /// `Option`-returning loader does) makes the app silently seed defaults over a
 /// file it couldn't parse, destroying the user's library on the next save.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Load<T> {
     /// The file was read and parsed successfully.
     Loaded(T),
@@ -71,19 +64,44 @@ pub enum Load<T> {
 /// is reported as corrupt rather than slurped into memory.
 const MAX_DATA_FILE_BYTES: usize = 256 * 1024 * 1024;
 
-fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Load<T> {
-    let data = match std::fs::read_to_string(path) {
-        Ok(data) => data,
+/// Reads at most `limit + 1` bytes from `path`. Returns `Ok(Some(data))` when the
+/// whole file fit within `limit`, `Ok(None)` when anything exists beyond it, and an
+/// error for open/read/UTF-8 failures.
+fn read_bounded(path: &Path, limit: usize) -> io::Result<Option<String>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > limit.saturating_add(1) {
+            return Ok(None);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn load_json_limited<T: serde::de::DeserializeOwned>(path: &Path, limit: usize) -> Load<T> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > limit as u64 {
+            return Load::Corrupt(format!(
+                "file is too large ({} bytes, limit {limit})",
+                meta.len()
+            ));
+        }
+    }
+    let data = match read_bounded(path, limit) {
+        Ok(Some(data)) => data,
+        Ok(None) => return Load::Corrupt(format!("file is too large (limit {limit})")),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Load::Missing,
         Err(e) => return Load::Corrupt(e.to_string()),
     };
-    if data.len() > MAX_DATA_FILE_BYTES {
-        return Load::Corrupt(format!(
-            "file is too large ({} bytes, limit {})",
-            data.len(),
-            MAX_DATA_FILE_BYTES,
-        ));
-    }
     if data.trim().is_empty() {
         return Load::Missing;
     }
@@ -91,6 +109,10 @@ fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Load<T> {
         Ok(value) => Load::Loaded(value),
         Err(e) => Load::Corrupt(e.to_string()),
     }
+}
+
+fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Load<T> {
+    load_json_limited(path, MAX_DATA_FILE_BYTES)
 }
 
 /// Loads the snippet library from a JSON file.
@@ -158,8 +180,35 @@ pub fn sweep_stale_tmp(dir: &Path) {
 /// Writes `contents` to `path` atomically: the bytes go to a temporary file in the
 /// same directory, get flushed to disk, and only then replace `path` via a rename.
 /// A crash, power loss, or full disk partway through a save can therefore never
-/// leave a truncated `snippets.json` behind — the old file survives intact instead.
-/// The temporary name includes the process id so two running copies can't collide.
+/// Normalizes a category name for canonical storage: trims whitespace, collapses multiple
+/// spaces into single spaces, and converts to title-case word-by-word. This ensures
+/// "  git ", "GIT", "Git", and "gIt" all round-trip to the same canonical "Git".
+/// Used during config initialization and category creation to prevent duplicates
+/// that differ only in whitespace or casing.
+pub fn normalize_category(s: &str) -> String {
+    let s = s.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    s.split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => {
+                    // Title-case: capitalize first letter, lowercase the rest
+                    first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Legacy JSON persistence helpers. The desktop now stores data in the shared
+/// SQLite `copyit.db` (see `store.rs` / `sqlite.rs`); these remain only to keep the
+/// JSON round-trip unit tests meaningful and are not used by the running app.
+#[allow(dead_code)]
 pub(crate) fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
     let Some(name) = path.file_name() else {
         return Err(io::Error::new(
@@ -194,47 +243,19 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
 }
 
 /// Persists the snippet library to a JSON file (pretty-printed for human readability).
+#[allow(dead_code)]
 pub fn save(path: &Path, snippets: &[Snippet]) -> io::Result<()> {
     let json = serde_json::to_string_pretty(snippets).map_err(io::Error::other)?;
     write_atomic(path, &json)
 }
 
 /// Persists user config (categories and theme) to a JSON file (pretty-printed).
+#[allow(dead_code)]
 pub fn save_config(path: &Path, config: &Config) -> io::Result<()> {
     let json = serde_json::to_string_pretty(config).map_err(io::Error::other)?;
     write_atomic(path, &json)
 }
 
-/// Normalizes a category name for canonical storage: trims whitespace, collapses multiple
-/// spaces into single spaces, and converts to title-case word-by-word. This ensures
-/// "  git ", "GIT", "Git", and "gIt" all round-trip to the same canonical "Git".
-/// Used during config initialization and category creation to prevent duplicates
-/// that differ only in whitespace or casing.
-pub fn normalize_category(s: &str) -> String {
-    let s = s.trim();
-    if s.is_empty() {
-        return String::new();
-    }
-    s.split_whitespace()
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                None => String::new(),
-                Some(first) => {
-                    // Title-case: capitalize first letter, lowercase the rest
-                    first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
-                }
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// True when two category names denote the same category, ignoring case.
-/// Uses full Unicode lowercasing (not `eq_ignore_ascii_case`) so accented
-/// categories don't sneak in as near-duplicates.
-///
-/// Category names are almost always plain ASCII, and this runs once per known
 /// category on every lookup, so that case is answered without allocating; anything
 /// non-ASCII still goes through full Unicode lowercasing, which for ASCII input
 /// produces exactly the same result.
@@ -336,6 +357,7 @@ mod tests {
         Snippet {
             id,
             title: format!("Snippet {id}"),
+            description: String::new(),
             category: category.to_string(),
             body: "body".to_string(),
             protection: None,
@@ -464,7 +486,10 @@ mod tests {
         assert_eq!(second.file_name().unwrap(), "snippets.json.corrupt.1");
 
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "first corruption");
-        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second corruption");
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "second corruption"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -603,7 +628,10 @@ mod tests {
         for input in inputs {
             let once = normalize_category(input);
             let twice = normalize_category(&once);
-            assert_eq!(once, twice, "double-normalize changed '{input}': '{once}' -> '{twice}'");
+            assert_eq!(
+                once, twice,
+                "double-normalize changed '{input}': '{once}' -> '{twice}'"
+            );
         }
     }
 
@@ -618,6 +646,51 @@ mod tests {
     }
 
     #[test]
+    fn bounded_loader_rejects_limit_plus_one_and_accepts_exact_limit() {
+        let dir = tmp_dir("bounded-loader");
+        let path = dir.join("snippets.json");
+        std::fs::write(&path, "[]").unwrap();
+        let exact: Load<Vec<Snippet>> = load_json_limited(&path, 2);
+        match exact {
+            Load::Loaded(snippets) => assert!(snippets.is_empty()),
+            _ => panic!("a file exactly at the limit should load"),
+        }
+        std::fs::write(&path, "[] ").unwrap();
+        let over: Load<Vec<Snippet>> = load_json_limited(&path, 2);
+        match over {
+            Load::Corrupt(message) => assert!(message.contains("too large"), "got: {message}"),
+            _ => panic!("limit+1 must be rejected"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bounded_loader_preserves_missing_corrupt_semantics() {
+        let dir = tmp_dir("bounded-semantics");
+        let path = dir.join("snippets.json");
+        const LIMIT: usize = 4096;
+        std::fs::write(&path, "").unwrap();
+        let result: Load<Vec<Snippet>> = load_json_limited(&path, LIMIT);
+        assert!(matches!(result, Load::Missing));
+        std::fs::write(&path, "   \n\t ").unwrap();
+        let result: Load<Vec<Snippet>> = load_json_limited(&path, LIMIT);
+        assert!(matches!(result, Load::Missing));
+        std::fs::write(&path, [0xff_u8, 0xfe, 0xfd]).unwrap();
+        let result: Load<Vec<Snippet>> = load_json_limited(&path, LIMIT);
+        assert!(matches!(result, Load::Corrupt(_)));
+        std::fs::write(&path, "[{not json").unwrap();
+        let result: Load<Vec<Snippet>> = load_json_limited(&path, LIMIT);
+        assert!(matches!(result, Load::Corrupt(_)));
+        save(&path, &[snippet(9, "Git")]).unwrap();
+        let round_trip: Load<Vec<Snippet>> = load_json_limited(&path, LIMIT);
+        match round_trip {
+            Load::Loaded(snippets) => assert_eq!(snippets[0].id, 9),
+            _ => panic!("valid file should round-trip"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn protected_snippet_round_trips_with_empty_body_on_disk() {
         // A protected snippet is stored with ciphertext + nonce + hint and an empty
         // `body`, and loads back with the same protection (so the app can decrypt it
@@ -628,6 +701,7 @@ mod tests {
         let snippet = Snippet {
             id: 1,
             title: "KEY".into(),
+            description: String::new(),
             category: "Git".into(),
             body: String::new(),
             protection: Some(protection.clone()),
@@ -635,9 +709,14 @@ mod tests {
 
         let store = crate::store::Store::at(dir.clone());
         store.save_snippets(&[snippet]).unwrap();
-        let raw = std::fs::read_to_string(store.snippets_path.clone()).unwrap();
+        // The secret must never be written to disk in plaintext: for protected
+        // snippets the SQLite `body` column is empty and the secret exists only
+        // as base64 ciphertext, never as the raw string.
+        let db = crate::sqlite::db_path_for(&dir);
+        let raw = std::fs::read(&db).unwrap();
+        let raw_str = String::from_utf8_lossy(&raw);
         assert!(
-            !raw.contains("a secret body long enough"),
+            !raw_str.contains("a secret body long enough"),
             "the secret must never be written to disk"
         );
 
@@ -645,7 +724,10 @@ mod tests {
             Load::Loaded(loaded) => {
                 assert_eq!(loaded.len(), 1);
                 assert!(loaded[0].body.is_empty());
-                let p = loaded[0].protection.as_ref().expect("protection round-trips");
+                let p = loaded[0]
+                    .protection
+                    .as_ref()
+                    .expect("protection round-trips");
                 assert_eq!(p.hint, protection.hint);
                 assert_eq!(p.nonce, protection.nonce);
                 assert_eq!(p.ciphertext, protection.ciphertext);
