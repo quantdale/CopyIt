@@ -5,8 +5,8 @@
 //!
 //! Everything here is pure and returns `Result` — no `unwrap`, no panics, no I/O.
 //! The encrypted bytes and the KDF salt are transported as base64 strings so the
-//! data model (`VaultMeta` in `config.json`, `Protection` in `snippets.json`)
-//! stays plain JSON.
+//! data model (`VaultMeta` and `Protection`) is stored in SQLite text columns;
+//! the same values can be read from legacy JSON during migration.
 //!
 //! Security model: the derived key exists only while the state is `Unlocked` and
 //! is securely zeroized by `Drop` (and by `lock()`) using the `zeroize` crate.
@@ -28,7 +28,7 @@ use zeroize::Zeroize;
 /// an old build has to decode with the current one, or every unlock would fail.
 pub const CANARY_PLAINTEXT: &[u8] = b"copyit-vault-canary-v1";
 
-/// KDF salt length (16 random bytes, stored in `config.json`).
+/// KDF salt length (16 random bytes, stored in the SQLite app_config row).
 pub const SALT_LEN: usize = 16;
 /// Fresh per-encryption nonce length for XChaCha20.
 pub const NONCE_LEN: usize = 24;

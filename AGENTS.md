@@ -2,9 +2,11 @@
 
 This file is a quick reference for AI agents working on the CopyIt project. It covers the project layout, build process, conventions, and anything else you need to know before modifying code.
 
+> **Current coordinated implementation (2026-08-28):** The browser-extension integration uses the canonical SQLite database at `%APPDATA%\CopyIt\copyit.db`, shared byte-for-byte with `quantdale/CopyIt-brwsr-ext/native-host`. JSON references below are limited to legacy migration and corruption-recovery behavior. Do not add JSON/SQLite dual writes, do not treat legacy JSON as the live store, and read the extension repository's `IMPLEMENTATION_PLAN.md` plus `docs/implementation/NEXT_CAMPAIGN_2026-08-28.md` before changing persistence or vault behavior.
+
 ## Project overview
 
-CopyIt is a small Windows desktop app for storing scripts and AI prompts as copyable tiles. It is a native GUI application written in Rust using `egui`/`eframe`. It compiles to a single `.exe` with no installer, no WebView, and no runtime dependencies. User data lives in `snippets.json` and `config.json` files in a stable per-user directory (`%APPDATA%\CopyIt`), independent of wherever the `.exe` itself is run from. Snippets are stored as plain JSON; password-protected cards keep their body only as ciphertext (see `src/vault.rs`).
+CopyIt is a small Windows desktop app for storing scripts and AI prompts as copyable tiles. It is a native GUI application written in Rust using `egui`/`eframe`. It compiles to a single `.exe` with no WebView or runtime dependencies. The current coordinated release stores live data in the canonical SQLite database `%APPDATA%\CopyIt\copyit.db`, independent of wherever the `.exe` itself is run from. `snippets.json` and `config.json` are legacy migration inputs only; the desktop and browser native host do not maintain a live JSON/SQLite dual-write path.
 
 ## Technology stack
 
@@ -28,8 +30,9 @@ CopyIt is a small Windows desktop app for storing scripts and AI prompts as copy
     ├── editor.rs       # Add/edit modal: state, constructors, and the transition decision
     ├── grid.rs         # Card grid geometry, virtualization, insertion lines, drag machine
     ├── model.rs        # Core data type: `Snippet`
-    ├── storage.rs      # Low-level JSON IO (`snippets.json` / `config.json`), category helpers
-    ├── store.rs        # Persistence seam: paths, legacy migration, load/save
+    ├── storage.rs      # Legacy JSON parsing, data-dir resolution, category helpers
+    ├── store.rs        # Persistence seam: SQLite load/save and legacy migration
+    ├── sqlite.rs       # Canonical shared SQLite schema, queries, and reconciliation
     ├── seed.rs         # Default snippet library shown on first launch
     ├── vault.rs        # Protected snippets: vault state, Argon2id KDF, XChaCha20-Poly1305
     ├── sim/            # In-process user simulation: harness, personas, journeys (test/sim)
@@ -50,10 +53,11 @@ CopyIt is a small Windows desktop app for storing scripts and AI prompts as copy
 - `src/editor.rs` — The snippet add/edit modal's state (`Editor`, including the `protect` checkbox), the button clicks it can produce (`EditorResult`), the pure `decide()` that turns a click plus the window's open/close flag into an `EditorOutcome`, and `card_action_requires_vault()` — the gate that decides whether a protected card's copy/edit must wait behind the vault prompt. All editor transitions are testable without a UI context.
 - `src/grid.rs` — Everything a maintainer must touch to change the grid: the `CARD_*` / `CARD_SPACING` / `ROW_PITCH` / `GRID_TOP_SPACE` / `GRID_MARGIN_X` constants, `cols_for()`, `grid_card_rect()`, `visible_rows()`, the gap/insertion-line math (`gap_point`, `nearest_gap`, `draw_insertion_line`), and the `DragMachine` state machine (armed on press, dragging past the 4px threshold, consumed by `release()` against a `DragContext`).
 - `src/model.rs` — Defines `Snippet { id, title, category, body, protection }`; `Protection { hint, nonce, ciphertext }` is the on-disk form of a protected body (see `crate::vault`).
-- `src/storage.rs` — Low-level JSON IO: `data_dir()` resolves the stable `%APPDATA%\CopyIt` directory (falling back to next-to-the-exe if `APPDATA` isn't set, e.g. non-Windows dev/test), plus the category helpers `normalize_category()` (title-cases), `same_category()` (case-insensitive comparison), `is_reserved_category()` (rejects blank and the reserved `All`), `canonical_category()` (maps unusable names to `UNCATEGORIZED`), and `Config` (canonical categories, selected theme, and the optional `vault` metadata — the KDF salt and canary). Path construction is `store.rs`'s job, not this file's.
+- `src/storage.rs` — Legacy JSON parsing and data-dir resolution: `data_dir()` resolves the stable `%APPDATA%\CopyIt` directory (falling back to next-to-the-exe if `APPDATA` isn't set, e.g. non-Windows dev/test), plus the category helpers `normalize_category()` (title-cases), `same_category()` (case-insensitive comparison), `is_reserved_category()` (rejects blank and the reserved `All`), `canonical_category()` (maps unusable names to `UNCATEGORIZED`), and `Config` (canonical categories, selected theme, and optional vault metadata). It is used for one-time migration and corruption-safe legacy handling; the live store is `sqlite.rs`.
   - Both loaders return `Load<T>` — `Loaded` / `Missing` / `Corrupt` — rather than an `Option`. Keep those three cases distinct: collapsing `Corrupt` into `Missing` makes the app seed defaults over a file it merely failed to parse and destroy the user's library on the next save.
   - Both savers write through `write_atomic()` (temp file in the same directory → `sync_all` → rename). Never write a data file with a plain `fs::write`; a crash mid-write would truncate it.
-- `src/store.rs` — The persistence seam: owns `snippets_path` / `config_path` (`Store::at` / `Store::open`), the one-time legacy migration (`migrate_legacy()`), and the load/save calls (`load_snippets`, `load_config`, `save_snippets`, `save_config`). `app.rs` never touches paths or migration rules.
+- `src/store.rs` — The persistence seam: owns the data directory and legacy source paths (`Store::at` / `Store::open`), the one-time JSON-to-SQLite migration (`migrate_legacy()`), and the canonical load/save calls (`load_snippets`, `load_config`, `save_snippets`, `save_config`). `app.rs` never opens SQLite or touches migration rules.
+- `src/sqlite.rs` — The desktop implementation of the shared V1 SQLite schema and queries. Keep its schema, protection constraints, ordering, vault metadata, and reconciliation behavior byte-for-byte compatible with `quantdale/CopyIt-brwsr-ext/native-host`.
 - `src/seed.rs` — Initial default snippets (Git helpers and reusable AI prompts).
 - `src/vault.rs` — Pure crypto + vault state behind protected snippets, testable without a UI: Argon2id key derivation (m = 19 MiB, t = 2, p = 1), XChaCha20-Poly1305 AEAD encrypt/decrypt with fresh nonces, the canary that verifies a candidate password, `VaultState` session lock/unlock (the derived key is memory-only and starts `Locked` on every launch), `encrypt_body` / `decrypt_body`, and the hint / masked-preview helpers. Everything returns `Result` — no panics, no I/O.
 - `src/sim/` — The in-process user simulation, compiled only under `cfg(any(test, feature = "sim"))` (a default or release build contains none of it):
@@ -107,7 +111,7 @@ cargo test
 
 Unit tests live in the relevant `src/*.rs` file under `#[cfg(test)] mod tests` (`mod layout_tests` in `app.rs`). Coverage today: grid/gap geometry and the scroll-area coordinate space (in `grid.rs` and `layout_tests`), grid virtualization (visible-row range, computed-vs-rendered card rects, and that a ten-times-larger library emits roughly the same paint work), the drag state machine (`grid.rs`), the memoized filter (matching a fresh scan, and invalidating on query/category/library changes), editor transition decisions (`editor.rs`), store round-trips and corrupt-file reporting (`store.rs`), preview collapsing and truncation, drag-and-drop reordering (including filtered views and a snippet that vanishes mid-drag), save-error reporting, atomic writes, corrupt-file recovery, category normalization, theme name round-trips, and the simulation journeys (`sim_journeys_*` in `src/sim/journey.rs`; see the User simulation section).
 
-Tests that touch the save paths must point the app's data files at a throwaway temp directory — use the `test_app()` helper in `app.rs`, which builds a `Store::at(temp_dir)` instead of the real `%APPDATA%` location. A test that leaves them as bare relative filenames writes `snippets.json` into the repository root.
+Tests that touch the save paths must point the app's SQLite data directory at a throwaway temp directory — use the `test_app()` helper in `app.rs`, which builds a `Store::at(temp_dir)` instead of the real `%APPDATA%` location. Tests that intentionally exercise legacy migration may create JSON fixtures under that same temp directory; never leave them at repository-root paths.
 
 `CI` runs `cargo clippy --all-targets -- -D warnings`, so any new clippy warning fails the build.
 
@@ -123,29 +127,16 @@ The app drives its own UI headlessly: `src/sim/` wraps the real `CopyIt` UI behi
 
 ## Data and storage behavior
 
-- Data files live in a stable per-user directory, `%APPDATA%\CopyIt\`, not next to the executable:
-  - `snippets.json` stores the snippet library.
-  - `config.json` stores the canonical category list, the selected theme, and the vault metadata (base64 KDF salt + canary) once any snippet has been protected.
-- This is deliberate: resolving storage relative to the running `.exe` meant `cargo run` (debug) and `cargo build --release` read/write different files, and `cargo clean` / git checkouts of the build folder could reset or destroy real data. `%APPDATA%\CopyIt` is immune to all of that.
-- If `APPDATA` isn't set (non-Windows dev/test environments), the app falls back to the previous next-to-the-exe behavior.
-- On first launch (or first launch after upgrading from an older version), the app checks legacy locations (next to the exe, `target/debug/`, `target/release/`, cwd) and migrates the first non-empty `snippets.json`/`config.json` it finds into the new location before falling back to the seeded defaults from `src/seed.rs`. The migration write is atomic (same temp-file-then-rename path as every other data write), so a crash mid-migration can't leave a truncated stable file behind.
-- Both files are plain, hand-editable JSON:
-
-  ```json
-  [
-    { "id": 1, "title": "...", "category": "Git", "body": "..." }
-  ]
-  ```
-
-- A protected snippet stores an empty `body` plus a `protection` block (`hint`, `nonce`, `ciphertext`, base64) instead; the vault's salt and canary live in `config.json` under `vault`. Both new fields are optional, so files written by older versions load unchanged — but an older CopyIt reading a file with protected cards sees empty bodies. Don't downgrade after protecting.
-- Saves are automatic after every add, edit, delete, or drag-and-drop reorder, and are atomic: the JSON is written to a temporary file in the same directory, flushed, and only then renamed over the real one. A crash, power loss, or full disk part-way through a save leaves the previous file intact instead of a truncated one.
-- A data file that exists but doesn't parse is **not** treated as a first launch. It is renamed aside as `<name>.corrupt` (or `.corrupt.1`, `.corrupt.2`, … if a previous backup already exists, so an old backup is never overwritten) preserving the bytes for hand-recovery, the defaults are loaded, and the warning banner tells the user where the original went. If the backup rename fails (e.g. the file is locked), the corrupt file is left **in place** and the defaults are **not** written over it — the app refuses to destroy the only remaining copy of the user's data. An empty (zero-byte) file counts as absent, since it holds nothing to lose.
-- Categories are normalized to title-case (e.g., `git` and `GIT` both become `Git`) and stored as a sorted, deduplicated list in `config.json`. On load the stored list is sanitized (normalized, deduplicated case-insensitively, reserved names dropped), so a hand-edited `config.json` can't smuggle an entry that collides with the reserved `All` filter sentinel. Blank categories and the reserved `All` are mapped to `Uncategorized` on load, so a hand-edited `"category": ""` can't produce a badge that no filter entry selects. Snippet ids are deduplicated on load (later duplicates get fresh ids) and the "next id" counter is overflow-safe, hardening the app against hand-edited JSON.
+- The live data file is `%APPDATA%\CopyIt\copyit.db`. It is the single source of truth shared with the browser native host. The database uses the V1 schema (`schema_migrations`, `snippets`, `categories`, `app_config`, and `migration_meta`) with WAL, foreign keys, a 3-second busy timeout, and protection constraints that keep protected bodies out of the plaintext `body` column.
+- This stable per-user location is deliberate: resolving storage relative to the running `.exe` meant debug and release builds could read different files. `%APPDATA%\CopyIt` survives recompiles, moving the executable, and replacing the desktop build.
+- On first launch after an older JSON release, `store.rs` checks the documented legacy locations for non-empty `snippets.json` and `config.json`, distinguishes missing from corrupt input, verifies the imported SQLite database, and only then renames the source files to unique `*.legacy-backup-*` files. A corrupt non-empty source is never treated as missing and is never overwritten.
+- Once `copyit.db` exists, JSON is not reread and is not written alongside SQLite. Desktop mutations reconcile the canonical SQLite tables transactionally, including deleting every row when the library becomes empty, so the browser host observes the same library.
+- Categories, ordering, IDs, protection metadata, vault metadata, and migration audit metadata are stored in SQLite. The vault cryptography remains the existing Argon2id/XChaCha20-Poly1305 contract; protected ciphertext is preserved byte-for-byte during migration and is decrypted only for an authorized copy/edit operation.
 
 ## Security considerations
 
 - No network access and no secrets sent anywhere. Protected snippets are encrypted at rest: XChaCha20-Poly1305 AEAD under a key derived from the vault password with Argon2id. The password is never stored — a candidate password either decrypts the canary or fails, so a wrong guess (or a corrupt canary) can't unlock anything.
-- Unprotected snippets remain plaintext JSON in `%APPDATA%\CopyIt\`. The old warning still applies to them: do not store sensitive credentials in *unprotected* cards — tick "Protect this snippet" instead.
+- Unprotected snippets remain plaintext in the canonical SQLite database. The warning still applies: do not store sensitive credentials in *unprotected* cards — tick "Protect this snippet" instead.
 - **No password recovery.** A forgotten vault password means the protected bodies are unrecoverable, by design.
 - Documented leaks: the hint (a card's first 5 body characters, only when the body is ≥ 12 chars long) and the cleartext metadata (title/category) are visible without unlocking — keep secrets out of titles.
 - Downgrade caveat: an older CopyIt reading a file with protected cards sees empty bodies (see Data and storage behavior).
@@ -157,14 +148,14 @@ The app drives its own UI headlessly: `src/sim/` wraps the real `CopyIt` UI behi
 
 ## Deployment / distribution
 
-- The recommended distribution artifact is the single `target\release\copyit.exe`.
+- The recommended desktop distribution artifact is the single `target\release\copyit.exe`; the companion browser extension/native host has its own build and per-user install process documented in `quantdale/CopyIt-brwsr-ext/docs/installation.md`.
 - The release profile is tuned for size and fast startup:
   - `opt-level = "z"`
   - `lto = true`
   - `codegen-units = 1`
   - `panic = "abort"`
   - `strip = true`
-- No installer or packaging step is currently provided. Distribute the `.exe` along with a note that `snippets.json` and `config.json` will be created on first run.
+- The desktop binary has no MSI installer. Distribute `copyit.exe` with the browser extension separately when browser integration is wanted; first launch creates or migrates `%APPDATA%\CopyIt\copyit.db`.
 
 ## Release console behavior
 

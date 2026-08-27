@@ -1,94 +1,68 @@
-# Dependency audit notes: Windows-target verdict
+# Dependency audit notes
 
-`cargo audit` reads `Cargo.lock`, which lists the **all-platform** dependency
-graph. CopyIt is Windows-only (`#![windows_subsystem = "windows"]`,
-`%APPDATA%` paths), so an advisory that only reaches the graph through a
-Linux/Wayland- or Unix-only dependency chain is not actually present in the
-shipped binary. This note records, crate by crate, whether each known
-advisory's dependency actually survives when the graph is filtered to the
-real target (`cargo tree --target x86_64-pc-windows-msvc -i <crate>`).
+**Reviewed:** 2026-08-28 on Windows, Rust 1.93.1, `cargo-audit 0.22.1`
 
-An earlier pass assumed all six known advisories were Linux-only and thus
-irrelevant to the Windows build. That assumption was wrong for two of them
-(`ttf-parser`, `paste`) — see the verdict below.
+The desktop application is a Windows-only release. The lockfile still contains
+all-platform dependency metadata, so the audit is recorded both unfiltered and
+against `x86_64-pc-windows-msvc` where the tool permits target filtering.
 
-## Per-crate results
+## Commands and results
 
-| Crate | Advisory | Kind | Windows target? |
-|---|---|---|---|
-| `quick-xml` 0.39.4 | RUSTSEC-2026-0194 | vulnerability (7.5 high) | drops out |
-| `quick-xml` 0.39.4 | RUSTSEC-2026-0195 | vulnerability (7.5 high) | drops out |
-| `derivative` 2.2.0 | RUSTSEC-2024-0388 | unmaintained (warning) | drops out |
-| `instant` 0.1.13 | RUSTSEC-2024-0384 | unmaintained (warning) | drops out |
-| `ttf-parser` 0.25.1 | RUSTSEC-2026-0192 | unmaintained (warning) | **persists** |
-| `paste` 1.0.15 | RUSTSEC-2024-0436 | unmaintained (warning) | **persists** |
+| Command | Result |
+| --- | --- |
+| `cargo audit` in `quantdale/CopyIt-brwsr-ext/native-host` | PASS; no findings |
+| `cargo audit` in this repository before justified ignore | one vulnerability plus five unmaintained/unsound warnings; details below |
+| `cargo audit --target-os windows` before justified ignore | same webbrowser finding; cargo-audit does not remove that crate from the target graph |
+| `cargo tree --target x86_64-pc-windows-msvc -i event-listener@5.4.1` | empty; the unsound event-listener chain is not in the Windows graph |
+| `npm audit` and `npm audit --omit=dev` in the extension repository | PASS; zero vulnerabilities |
 
-Raw output, `cargo tree --target x86_64-pc-windows-msvc -i <crate>`:
+`cargo audit 0.22.1` does not accept Cargo's `--locked` flag. All build/test
+gates use the committed `Cargo.lock`; the audit command is read-only and scans
+that lockfile.
 
-```
-$ cargo tree --target x86_64-pc-windows-msvc -i quick-xml
-warning: nothing to print.
+## Desktop findings and decisions
 
-$ cargo tree --target x86_64-pc-windows-msvc -i derivative
-warning: nothing to print.
+### RUSTSEC-2026-0257 — webbrowser 0.8.15
 
-$ cargo tree --target x86_64-pc-windows-msvc -i instant
-warning: nothing to print.
+The advisory concerns Unix `BROWSER` environment-variable argument handling.
+The crate reaches the desktop lockfile through `eframe 0.27.2` →
+`egui-winit`, but CopyIt ships the Windows target only and does not use the
+Unix browser-launch implementation. This is therefore not an exploitable path
+in the shipped Windows binary.
 
-$ cargo tree --target x86_64-pc-windows-msvc -i ttf-parser
-ttf-parser v0.25.1
-└── owned_ttf_parser v0.25.1
-    └── ab_glyph v0.2.32
-        └── epaint v0.27.2
-            └── egui v0.27.2
-                ├── copyit v0.1.0 (D:\Documents\tryPython\CopyIt)
-                ├── eframe v0.27.2
-                │   └── copyit v0.1.0 (D:\Documents\tryPython\CopyIt)
-                ├── egui-winit v0.27.2
-                │   └── eframe v0.27.2 (*)
-                └── egui_glow v0.27.2
-                    └── eframe v0.27.2 (*)
+The advisory is explicitly listed in `.cargo/audit.toml` with this rationale,
+so the CI audit remains visible and reproducible without pretending the
+unfiltered lockfile is clean. Revisit the exception when `eframe` upgrades its
+`webbrowser` dependency; do not expand the ignore list without a target-tree
+and source-path review.
 
-$ cargo tree --target x86_64-pc-windows-msvc -i paste
-paste v1.0.15 (proc-macro)
-└── accesskit_windows v0.15.1
-    └── accesskit_winit v0.16.1
-        └── egui-winit v0.27.2
-            └── eframe v0.27.2
-                └── copyit v0.1.0 (D:\Documents\tryPython\CopyIt)
-```
+### RUSTSEC-2026-0221 — event-listener 5.4.1
 
-## Verdict
+This is an unsoundness warning reached through the Unix accessibility chain
+(`zbus`/`accesskit_unix`). The Windows-target tree is empty for
+`event-listener@5.4.1`, and the default audit command reports it as an allowed
+warning rather than an active vulnerability. It is not ignored silently.
 
-`quick-xml`, `derivative`, and `instant` are only reachable through
-Linux/Wayland-only (`wayland-scanner`, `smithay-client-toolkit`) or Unix-only
-(`zbus` → `accesskit_unix`) dependency chains, and correctly drop out when
-the graph is filtered to `x86_64-pc-windows-msvc`. CopyIt's own `src/` also
-parses no XML, so the two `quick-xml` vulnerabilities carry no exposure here
-regardless of platform.
+### Unmaintained dependency warnings
 
-**`ttf-parser` (RUSTSEC-2026-0192) and `paste` (RUSTSEC-2024-0436) do reach
-the real Windows dependency graph**, correcting the original audit's
-Linux-only assumption: `ttf-parser` comes in through the core egui text
-rendering path (`epaint → ab_glyph → owned_ttf_parser → ttf-parser`), and
-`paste` comes in through Windows accessibility support
-(`eframe → egui-winit → accesskit_winit → accesskit_windows → paste`).
+The audit also reports `derivative 2.2.0`, `instant 0.1.13`, `paste 1.0.15`,
+and `ttf-parser 0.25.1` as unmaintained. `derivative`, `instant`, and the
+event-listener chain are Unix-only for the desktop target. `paste` and
+`ttf-parser` remain in the Windows graph through the pinned egui/eframe stack,
+but have no active vulnerability in this audit. They remain visible as
+warnings and are candidates for removal when the desktop UI dependencies are
+upgraded; no unrelated UI-major upgrade was folded into this campaign.
 
-Both are *unmaintained-crate* warnings, not active vulnerabilities — a
-maintenance-risk signal, not an exploitable issue today. They aren't ignored
-in `.cargo/audit.toml` (see policy there); they stay visible in `cargo audit`
-output, and no action is needed beyond that visibility. Both chains run
-through `egui`/`eframe`/`accesskit`, so they're expected to clear naturally
-whenever those upstream crates bump their own dependencies.
+## Extension findings and decisions
 
-## A second finding: the ignore-list file was in the wrong place
+The original npm audit reported six development-tool vulnerabilities through
+Vite/esbuild, Vitest/vite-node, and `vite-plugin-static-copy`. The unused
+static-copy plugin was removed; Vite, Vitest, and the coverage provider were
+upgraded to patched exact versions. A fresh `npm ci`, `npm audit`, and
+`npm audit --omit=dev` now report zero vulnerabilities.
 
-Separately from the persistence question above: a `.cargo/audit.toml` written
-at the **repo root** (as plain `audit.toml`) is silently never read by
-`cargo-audit` — it only auto-discovers `.cargo/audit.toml`. This was caught
-by actually running `cargo audit` against the file (rather than trusting it
-unverified): with the ignore list at the repo root, `cargo audit` still
-reported `error: 2 vulnerabilities found!` for the two quick-xml IDs despite
-them being listed; moved to `.cargo/audit.toml`, the same list correctly
-suppressed them and `cargo audit` exited 0. See `.cargo/audit.toml` for the
-corrected file and policy.
+The extension workflows use `.node-version` (`24.3.0`), the desktop and host
+repositories use `rust-toolchain.toml` (`1.93.1`), and GitHub Actions references
+are pinned to immutable commit SHAs. The coordinated desktop compatibility
+commit is pinned in the extension CI workflow after the final desktop commit
+is created.

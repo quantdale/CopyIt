@@ -14,10 +14,10 @@ use std::path::Path;
 use std::sync::mpsc;
 use zeroize::Zeroize;
 
-/// Prefix of the banner message for a failed `snippets.json` write. Shared so a later
+/// Prefix of the banner message for a failed SQLite snippet write. Shared so a later
 /// successful snippet save can retire exactly its own error and nothing else.
 const SNIPPETS_SAVE_ERROR: &str = "Couldn't save snippets";
-/// Prefix of the banner message for a failed `config.json` write.
+/// Prefix of the banner message for a failed SQLite settings write.
 const CONFIG_SAVE_ERROR: &str = "Couldn't save settings";
 /// Red used for the warning banner and the delete-confirmation button.
 const WARNING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xef, 0x44, 0x44);
@@ -610,10 +610,10 @@ impl CopyIt {
         self.filter.valid = true;
     }
 
-    /// Persists the full snippet library to snippets.json in the stable data directory.
+    /// Persists the full snippet library to the canonical SQLite database in the stable data directory.
     /// Updates save_error if an I/O error occurs; the error is shown in the top bar.
-    /// If a corrupt snippets.json could not be backed up, never writes over the only
-    /// remaining original: refuse and surface the recovery error instead.
+    /// If a corrupt legacy snippets.json could not be backed up, never writes over the
+    /// only remaining original: refuse and surface the recovery error instead.
     fn save_snippets(&mut self) {
         if self.refuse_snippets_overwrite {
             let e = refuse_overwrite_error("snippets.json");
@@ -626,11 +626,11 @@ impl CopyIt {
         }
     }
 
-    /// Persists the config (categories and theme selection) to config.json.
-    /// Separated from snippets.json so snippet data stays backward-compatible.
+    /// Persists the config (categories, theme selection, and vault metadata) to
+    /// the canonical SQLite database.
     /// Returns an error if the write fails; the caller decides how to surface it.
-    /// If a corrupt config.json could not be backed up, never writes over the only
-    /// remaining original: refuse and surface the recovery error instead.
+    /// If a corrupt legacy config.json could not be backed up, never writes over
+    /// the only remaining original: refuse and surface the recovery error instead.
     fn save_config(&mut self) -> std::io::Result<()> {
         if self.refuse_config_overwrite {
             let e = refuse_overwrite_error("config.json");
@@ -1001,7 +1001,7 @@ impl CopyIt {
     }
 
     /// Creates the vault from a validated password: derives the key, keeps the
-    /// metadata in memory, and persists `config.json` atomically. Returns an error
+    /// metadata in memory, and persists the SQLite config transactionally. Returns an error
     /// (and rolls the in-memory state back) if the config write fails — protecting a
     /// card under a vault that would vanish on relaunch would destroy the secret.
     #[allow(dead_code)]

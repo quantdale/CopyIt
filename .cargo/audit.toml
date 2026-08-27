@@ -22,6 +22,11 @@ ignore = [
     # `cargo tree --target x86_64-pc-windows-msvc -i quick-xml` (empty output).
     "RUSTSEC-2026-0194", # quick-xml: quadratic runtime on duplicate attribute names (vulnerability, 7.5 high)
     "RUSTSEC-2026-0195", # quick-xml: unbounded namespace-declaration allocation / DoS (vulnerability, 7.5 high)
+    # webbrowser's advisory concerns Unix BROWSER environment-variable
+    # handling. CopyIt ships only the Windows target, whose implementation
+    # does not use that Unix launch path. The crate remains visible in the
+    # unfiltered lockfile audit and is tracked in docs/dependency-audit-notes.md.
+    "RUSTSEC-2026-0257",
 ]
 # Deliberately NOT ignored (all unmaintained-crate *warnings*, not
 # vulnerabilities, so none of these fail the build under cargo-audit's

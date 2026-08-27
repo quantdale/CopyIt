@@ -264,7 +264,12 @@ pub fn reconcile_snippets(conn: &Connection, snips: &[Snippet]) -> rusqlite::Res
                 params![s.category, 0],
             )?;
         }
-        if !snips.is_empty() {
+        if snips.is_empty() {
+            // An empty in-memory library is a real user state after deleting
+            // the final snippet. Reconciliation must remove every stale row,
+            // while remaining inside the same transaction as normal updates.
+            conn.execute("DELETE FROM snippets", [])?;
+        } else {
             let ids: Vec<i64> = snips.iter().map(|s| s.id as i64).collect();
             let placeholders = vec!["?"; ids.len()].join(",");
             let sql = format!("DELETE FROM snippets WHERE id NOT IN ({placeholders})");
@@ -446,6 +451,36 @@ mod tests {
         let loaded = load_all_snippets(&conn).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, 1);
+    }
+
+    #[test]
+    fn empty_reconcile_removes_every_snippet() {
+        let conn = memory();
+        let snips = vec![
+            Snippet {
+                id: 10,
+                title: "First".into(),
+                description: String::new(),
+                category: "Prompt".into(),
+                body: "first".into(),
+                protection: None,
+            },
+            Snippet {
+                id: 11,
+                title: "Second".into(),
+                description: String::new(),
+                category: "Prompt".into(),
+                body: "second".into(),
+                protection: None,
+            },
+        ];
+
+        reconcile_snippets(&conn, &snips).unwrap();
+        assert_eq!(load_all_snippets(&conn).unwrap().len(), 2);
+
+        reconcile_snippets(&conn, &[]).unwrap();
+
+        assert!(load_all_snippets(&conn).unwrap().is_empty());
     }
 
     #[test]
