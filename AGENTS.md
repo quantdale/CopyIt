@@ -189,3 +189,9 @@ The UI is repainted on every mouse move, so anything done inside `update()` runs
 - **Widget rects collected inside a `ScrollArea` are already absolute screen coordinates**, with the scroll offset baked in — `ScrollArea` places its content `Ui` at `inner_rect.min - state.offset`, so everything below inherits that origin. Do **not** translate them by `inner_rect.min - state.offset` to "convert them to screen space": that double-counts the origin and shifts all drop geometry by the height of the top bar, drifting further with every pixel scrolled. Compare them against `ctx.input(|i| i.pointer.interact_pos())` directly. `layout_tests::scroll_area_card_rects_are_already_in_screen_space` pins this down.
 - The drag state (`grid::DragMachine`) stores only the dragged snippet's stable `id`, never the index its card had at drag start. `reorder()` resolves the index by id at drop time, so a library that changed mid-drag reorders the right card or nothing at all instead of moving the wrong one (or panicking in `Vec::remove`).
 - **Running CopyIt locks the release executable on Windows.** A release build hardlinks `target\release\deps\copyit.exe` to `target\release\copyit.exe`. While CopyIt is running, Windows keeps that executable image locked, so `cargo clean` or `cargo build --release` may fail with `Access is denied. (os error 5)` or `LINK : fatal error LNK1104: cannot open file '...\target\release\deps\copyit.exe'`. Close any running CopyIt window before rebuilding. If the window is hidden or minimized, find the process in Task Manager or with `Get-Process copyit | Stop-Process` in PowerShell, then retry the build.
+
+## Cross-project UX, DX, and AX principles
+
+Cut taglines, helper text and secondary labels. If a screen needs them to make sense, fix the layout.
+
+Make the best decision that will elevate all three: the user experience (UX), developer experience (DX), and agent experience (AX) always, without breaking anything.
